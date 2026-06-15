@@ -554,7 +554,7 @@ cJSON* ota_fetch_json_from_url(){
 
         }else {
                             
-            // read the JSON file from gitlab
+            // read the release manifest from the RTKdata OTA channel
             char *response = malloc(content_length + 1);
 
             if (response == NULL) {

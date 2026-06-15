@@ -1,263 +1,174 @@
+/*
+ * RTKdata reference firmware - UM980 GNSS configuration (SOTA, ACK-gated).
+ *
+ * The UM980 echoes every command: "$command,<cmd>,response: OK*<crc>" on success,
+ * "...response: PARSING FAILD NO MATCHING FUNC <cmd>*<crc>" on failure. We capture
+ * the receiver's UART output via a registered read handler and gate each command on
+ * its ACK with retries - replacing the stock blind vTaskDelay(500ms) open loop.
+ *
+ * Reference-base message set (see docs/UM980-config-research.md):
+ *   MSM7 1077/1087/1097/1117/1127/1137 @1Hz  (full-resolution observables)
+ *   1005 @10s  - ARP identity anchor (Lighthouse rewrites this to the catalog ECEF)
+ *   1033 @10s  - receiver/antenna descriptor
+ *   1230 @10s  - GLONASS code-phase biases (missing in stock OnoLink; needed for
+ *                cross-brand GLONASS RTK)
+ * Position is provisional survey-in here; the precise fixed coordinate is pushed by
+ * the IE via gnss_set_fixed_base().
+ *
+ * License: GPLv3 (see LICENSE).
+ */
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
-#include <math.h>
-#include<ctype.h>
-#include <esp_ota_ops.h>
-#include "driver/gpio.h"
-#include "esp_log.h"
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_log.h>
+#include <esp_event.h>
+#include <driver/gpio.h>
+
 #include "gnss.h"
-#include "config.h"
-#include "util.h"
 #include "uart.h"
 
-#define LOG_TAG "GNSS"
+#define TAG "GNSS"
 
-/*default command for um980*/
-//unlog
-#define GNSS_UM980_DISABLE_COM1 "unlog com1\r\n"
-#define GNSS_UM980_DISABLE_COM2 "unlog com2\r\n"
-#define GNSS_UM980_DISABLE_COM3 "unlog com3\r\n"
-#define GNSS_UM980_UNMAKS_ALL   "UNMASK ALL\r\n"
-#define GNSS_UM980_CUTANGLE_10d "MASK 10.0\r\n"
-#define GNSS_UM980_SAVE         "saveconfig\r\n"
-#define GNSS_UM980_LOGLIST      "LOG LOGLISTA ONCE\r\n"
-#define GNSS_UM980_VERSION      "VERSIONA\r\n"
+#define GPIO_GNSS_RESET    GPIO_NUM_22
+#define GNSS_RESET_MS      500
+#define ACK_TIMEOUT_MS     900   // UM980 usually replies within ~100-300 ms
+#define ACK_POLL_MS        20
+#define ACK_RETRIES        3
 
-/*for ntrip server config*/
-#define GNSS_UM980_MODE_BASE "mode,base\r\n"
+/* ---- UM980 command response capture -----------------------------------
+ * A registered UART_EVENT_READ handler appends the receiver's bytes to a small
+ * buffer while we are configuring. Coexists with the NTRIP forward handler (the
+ * ESP event loop supports multiple handlers on the same event).
+ */
+#define CAP_SZ 1024
+static char s_cap[CAP_SZ];
+static volatile size_t s_cap_len = 0;
+static volatile bool s_capturing = false;
+static portMUX_TYPE s_cap_mux = portMUX_INITIALIZER_UNLOCKED;
 
-#define GNSS_UM980_ENABLE_1074 "rtcm1074,com1,1\r\n"
-#define GNSS_UM980_ENABLE_1077 "rtcm1077,com1,1\r\n"
-#define GNSS_UM980_ENABLE_1084 "rtcm1084,com1,1\r\n"
-#define GNSS_UM980_ENABLE_1087 "rtcm1087,com1,1\r\n"
-#define GNSS_UM980_ENABLE_1094 "rtcm1094,com1,1\r\n"
-#define GNSS_UM980_ENABLE_1097 "rtcm1097,com1,1\r\n"
-#define GNSS_UM980_ENABLE_1114 "rtcm1114,com1,1\r\n"
-#define GNSS_UM980_ENABLE_1117 "rtcm1117,com1,1\r\n"
-#define GNSS_UM980_ENABLE_1124 "rtcm1124,com1,1\r\n"
-#define GNSS_UM980_ENABLE_1127 "rtcm1127,com1,1\r\n"
-#define GNSS_UM980_ENABLE_1137 "rtcm1137,com1,1\r\n"
-#define GNSS_UM980_ENABLE_1005 "rtcm1005,com1,10\r\n"
-#define GNSS_UM980_ENABLE_1019 "rtcm1019,com1,30\r\n"
-#define GNSS_UM980_ENABLE_1020 "rtcm1020,com1,30\r\n"
-#define GNSS_UM980_ENABLE_1042 "rtcm1042,com1,30\r\n"
-#define GNSS_UM980_ENABLE_1046 "rtcm1046,com1,30\r\n"
-
-// #define GNSS_UM980_ENABLE_4076 "rtcm4076,com1,onchanged\r\n"
-#define GNSS_UM980_RTCM1033      "log com1 rtcm1033 ontime 30\r\n"
-#define GNSS_UM980_ENABLE_B2a    "CONFIG RTCMB1CB2a ENABLE\r\n"
-#define GNSS_UM980_CMD_BASE_AUTO "mode base 1008 time 60  10\r\n"
-#define GNSS_UM980_MMP           "CONFIG MMP ENABLE\r\n"
-#define GNSS_UM980_ENABLE_G2     "CONFIG SIGNALGROUP 2\r\n"
-#define GNSS_UM980_ANTIJAM       "CONFIG ANTIJAM FORCE\r\n"
-#define GNSS_UM980_PPP_E6        "CONFIG PPP ENABLE E6-HAS\r\n"
-#define GNSS_UM980_PPP_DATUM     "CONFIG PPP DATUM WGS84\r\n"
-
-/*for ntrip client config*/
-#define GNSS_UM980_ROVER        "mode rover\r\n"
-#define GNSS_UM980_RTKTIMEOUT   "RTKTIMEOUT 20\r\n"
-#define GNSS_UM980_DGPSTIMEOUT  "DGPSTIMEOUT 60\r\n"
-
-#define GNSS_UM980_GPGGA "log com1 gpgga ontime 1\r\n" // 0.2->1
-// #define GNSS_UM980_GNGGA "log com2 gngga ontime 0.2\r\n"
-// #define GNSS_UM980_GPRMC "log com3 gprmc ontime 0.2\r\n"
-#define GNSS_UM980_GPGST "log com1 gpgst ontime 1\r\n" // 
-#define GNSS_UM980_GPGSA "log com1 gpgsa ontime 5\r\n"
-#define GNSS_UM980_GPGSV "log com1 gpgsv ontime 10\r\n"
-#define GNSS_UM980_GPVTG "log com1 gpvtg ontime 1\r\n" //1
-#define GNSS_UM980_GPRMC "log com1 gprmc ontime 1\r\n" //1
-#define GNSS_UM980_GPGLL "log com1 gpgll ontime 1\r\n" //1
-// #define GNSS_UM980_GPSGGA "log com2 gpsgga ontime 1\r\n"
-// #define GNSS_UM980_BDSGGA "log com2 bdsgga ontime 1\r\n"
-// #define GNSS_UM980_GLOGGA "log com2 glogga ontime 1\r\n"
-// #define GNSS_UM980_GALGGA "log com2 galgga ontime 1\r\n"
-
-#define GNSS_UM980_GPGGA_DISABLE "unlog com1 gpgga\r\n"
-#define GNSS_UM980_GNGGA_DISABLE "unlog com1 gngga\r\n"
-#define GNSS_UM980_GPGSA_DISABLE "unlog com1 gpgsa\r\n"
-#define GNSS_UM980_GPGSV_DISABLE "unlog com1 gpgsv\r\n"
-#define GNSS_UM980_GPRMC_DISABLE "unlog com1 gprmc\r\n"
-#define GNSS_UM980_GPVTG_DISABLE "unlog com1 gpvtg\r\n"
-#define GNSS_UM980_GPGLL_DISABLE "unlog com1 gpgll\r\n"
-#define GNSS_UM980_GPZDA_DISABLE "unlog com1 gpzda\r\n"
-#define GNSS_UM980_GPGST_DISABLE "unlog com1 gpgst\r\n"
-
-#define GNSS_UM980_GPGGA_CONFIG "log com1 gpgga ontime %lf\r\n"
-#define GNSS_UM980_GNGGA_CONFIG "log com1 gngga ontime %lf\r\n"
-#define GNSS_UM980_GPRMC_CONFIG "log com1 gprmc ontime %lf\r\n"
-#define GNSS_UM980_GPGST_CONFIG "log com1 gpgst ontime %lf\r\n"
-#define GNSS_UM980_GPGSV_CONFIG "log com1 gpgsv ontime %lf\r\n"
-#define GNSS_UM980_GPVTG_CONFIG "log com1 gpvtg ontime %lf\r\n"
-#define GNSS_UM980_GPGLL_CONFIG "log com1 gpgll ontime %lf\r\n"
-#define GNSS_UM980_GPZDA_CONFIG "log com1 gpzda ontime %lf\r\n"
-#define GNSS_UM980_GPGSA_CONFIG "log com1 gpgsa ontime %lf\r\n"
-
-#define GPIO_GNSS_RESET  GPIO_NUM_22
-
-#define GNSS_CMD_DELAY_MS 500
-
-void config_gnss_base()
-{
-    ESP_LOGE(LOG_TAG, "config for base");
-    set_gnss_cmd_mode(true);
-    
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_DISABLE_COM1, strlen(GNSS_UM980_DISABLE_COM1));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_DISABLE_COM2, strlen(GNSS_UM980_DISABLE_COM2));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_VERSION, strlen(GNSS_UM980_VERSION));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    //drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1074, strlen(GNSS_UM980_ENABLE_1074));
-    //vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS)); 
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1077, strlen(GNSS_UM980_ENABLE_1077));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));   
-
-    //drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1084, strlen(GNSS_UM980_ENABLE_1084));
-    //vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1087, strlen(GNSS_UM980_ENABLE_1087));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));  
-
-    //drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1094, strlen(GNSS_UM980_ENABLE_1094));
-    //vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1097, strlen(GNSS_UM980_ENABLE_1097));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS)); 
-
-    //drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1114, strlen(GNSS_UM980_ENABLE_1114));
-    //vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-     drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1117, strlen(GNSS_UM980_ENABLE_1117));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    //drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1124, strlen(GNSS_UM980_ENABLE_1124));
-    //vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1127, strlen(GNSS_UM980_ENABLE_1127));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));    
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1137, strlen(GNSS_UM980_ENABLE_1137));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));  
-
-    //drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1005, strlen(GNSS_UM980_ENABLE_1005));
-    //vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    //drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1019, strlen(GNSS_UM980_ENABLE_1019));
-    //vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    //drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1020, strlen(GNSS_UM980_ENABLE_1020));
-    //vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    //drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1042, strlen(GNSS_UM980_ENABLE_1042));
-    //vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    //drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_1046, strlen(GNSS_UM980_ENABLE_1046));
-    //vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_RTCM1033, strlen(GNSS_UM980_RTCM1033));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_CUTANGLE_10d,strlen(GNSS_UM980_CUTANGLE_10d));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_B2a, strlen(GNSS_UM980_ENABLE_B2a));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_ENABLE_G2, strlen(GNSS_UM980_ENABLE_G2));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_PPP_E6, strlen(GNSS_UM980_PPP_E6));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_PPP_DATUM, strlen(GNSS_UM980_PPP_DATUM));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_CMD_BASE_AUTO, strlen(GNSS_UM980_CMD_BASE_AUTO));      
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_SAVE, strlen(GNSS_UM980_SAVE));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_LOGLIST, strlen(GNSS_UM980_LOGLIST));
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    set_gnss_cmd_mode(false);    
+static void gnss_uart_capture(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    (void)arg; (void)base;
+    if (!s_capturing || data == NULL) return;
+    int len = (int)id;                          // uart_task posts len as the event id
+    const uint8_t *d = (const uint8_t *)data;
+    portENTER_CRITICAL(&s_cap_mux);
+    if (s_cap_len + (size_t)len >= CAP_SZ) s_cap_len = 0;   // keep the newest
+    for (int i = 0; i < len && s_cap_len < CAP_SZ - 1; i++) s_cap[s_cap_len++] = (char)d[i];
+    s_cap[s_cap_len] = '\0';
+    portEXIT_CRITICAL(&s_cap_mux);
 }
 
-void gnss_reset_low()
-{
+static void cap_reset(void) {
+    portENTER_CRITICAL(&s_cap_mux);
+    s_cap_len = 0; s_cap[0] = '\0';
+    portEXIT_CRITICAL(&s_cap_mux);
+}
+
+static bool cap_contains(const char *needle) {
+    static char tmp[CAP_SZ];
+    portENTER_CRITICAL(&s_cap_mux);
+    size_t n = s_cap_len;
+    memcpy(tmp, s_cap, n + 1);
+    portEXIT_CRITICAL(&s_cap_mux);
+    return strstr(tmp, needle) != NULL;
+}
+
+/* ---- ACK-gated command send ------------------------------------------- */
+
+static bool send_cmd_acked(const char *cmd, int retries) {
+    int show = (int)strlen(cmd);
+    while (show > 0 && (cmd[show - 1] == '\r' || cmd[show - 1] == '\n')) show--;  // trim CRLF for logs
+
+    for (int attempt = 0; attempt <= retries; attempt++) {
+        cap_reset();
+        drv_uart_gnss_send((uint8_t *)cmd, strlen(cmd));
+
+        for (int waited = 0; waited < ACK_TIMEOUT_MS; waited += ACK_POLL_MS) {
+            vTaskDelay(pdMS_TO_TICKS(ACK_POLL_MS));
+            if (cap_contains("response: OK")) {
+                ESP_LOGI(TAG, "ack: %.*s", show, cmd);
+                return true;
+            }
+            if (cap_contains("PARSING FAIL")) {            // matches the "FAILD" typo too
+                ESP_LOGW(TAG, "rejected: %.*s", show, cmd);
+                return false;                              // won't pass on retry
+            }
+        }
+        ESP_LOGW(TAG, "no ack (attempt %d/%d): %.*s", attempt + 1, retries + 1, show, cmd);
+    }
+    return false;
+}
+
+/* ---- hardware reset --------------------------------------------------- */
+
+static void gnss_reset_pulse(void) {
     gpio_set_direction(GPIO_GNSS_RESET, GPIO_MODE_OUTPUT);
     gpio_pullup_en(GPIO_GNSS_RESET);
-    gpio_set_level(GPIO_GNSS_RESET, 0); 
+    gpio_set_level(GPIO_GNSS_RESET, 0);
+    vTaskDelay(pdMS_TO_TICKS(GNSS_RESET_MS));
+    gpio_set_level(GPIO_GNSS_RESET, 1);
+    vTaskDelay(pdMS_TO_TICKS(GNSS_RESET_MS));
 }
 
-void gnss_reset_high()
-{
-    gpio_set_direction(GPIO_GNSS_RESET, GPIO_MODE_OUTPUT);
-    gpio_pullup_en(GPIO_GNSS_RESET);
-    gpio_set_level(GPIO_GNSS_RESET, 1); 
+/* ---- reference-base configuration ------------------------------------- */
+
+void config_gnss_base(void) {
+    static const char *seq[] = {
+        "unlog com1\r\n",
+        "CONFIG SIGNALGROUP 2\r\n",   // enable all bands incl. Galileo E6
+        "MASK 10\r\n",                // 10 deg elevation cutoff
+        "rtcm1077 com1 1\r\n",        // GPS    MSM7 @1Hz
+        "rtcm1087 com1 1\r\n",        // GLONASS
+        "rtcm1097 com1 1\r\n",        // Galileo
+        "rtcm1117 com1 1\r\n",        // QZSS   (regional)
+        "rtcm1127 com1 1\r\n",        // BeiDou
+        "rtcm1137 com1 1\r\n",        // NavIC  (regional)
+        "rtcm1005 com1 10\r\n",       // ARP identity anchor (LH rewrites this)
+        "rtcm1033 com1 10\r\n",       // receiver/antenna descriptor
+        "rtcm1230 com1 10\r\n",       // GLONASS code-phase biases (cross-brand RTK)
+        "mode base time 300 1.5\r\n", // provisional survey-in (5 min, 1.5 m)
+        "saveconfig\r\n",
+    };
+    ESP_LOGI(TAG, "configuring UM980 reference base (ACK-gated)");
+    s_capturing = true;
+    int ok = 0, total = (int)(sizeof(seq) / sizeof(seq[0]));
+    for (int i = 0; i < total; i++) {
+        if (send_cmd_acked(seq[i], ACK_RETRIES)) ok++;
+    }
+    s_capturing = false;
+    ESP_LOGI(TAG, "UM980 base config: %d/%d commands acked", ok, total);
+    uart_nmea("$PESP,RTK,GNSS,CONFIG,%d,%d", ok, total);
 }
 
-void gnss_clear_config()
-{
-    ESP_LOGI(LOG_TAG, "clearing GNSS UM980 config");
-    set_gnss_cmd_mode(true);
+bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
+    char cmd[96];
+    // UM980: "mode base <lat> <lon> <height>" - degrees / metres, ITRF2020 from the IE
+    snprintf(cmd, sizeof(cmd), "mode base %.9f %.9f %.4f\r\n", lat_deg, lon_deg, height_m);
 
-    // COM-Ports leeren
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_DISABLE_COM1, strlen(GNSS_UM980_DISABLE_COM1));
-    vTaskDelay(pdMS_TO_TICKS(150));
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_DISABLE_COM2, strlen(GNSS_UM980_DISABLE_COM2));
-    vTaskDelay(pdMS_TO_TICKS(150));
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_DISABLE_COM3, strlen(GNSS_UM980_DISABLE_COM3));
-    vTaskDelay(pdMS_TO_TICKS(150));
+    s_capturing = true;
+    bool ok = send_cmd_acked(cmd, ACK_RETRIES);
+    if (ok) ok = send_cmd_acked("saveconfig\r\n", ACK_RETRIES);
+    s_capturing = false;
 
-    // Einzelne NMEA Logs deaktivieren
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_GPGGA_DISABLE, strlen(GNSS_UM980_GPGGA_DISABLE));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_GNGGA_DISABLE, strlen(GNSS_UM980_GNGGA_DISABLE));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_GPGSA_DISABLE, strlen(GNSS_UM980_GPGSA_DISABLE));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_GPGSV_DISABLE, strlen(GNSS_UM980_GPGSV_DISABLE));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_GPRMC_DISABLE, strlen(GNSS_UM980_GPRMC_DISABLE));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_GPVTG_DISABLE, strlen(GNSS_UM980_GPVTG_DISABLE));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_GPGLL_DISABLE, strlen(GNSS_UM980_GPGLL_DISABLE));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_GPZDA_DISABLE, strlen(GNSS_UM980_GPZDA_DISABLE));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_GPGST_DISABLE, strlen(GNSS_UM980_GPGST_DISABLE));
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    // Alle Masken aufheben
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_UNMAKS_ALL, strlen(GNSS_UM980_UNMAKS_ALL));
-    vTaskDelay(pdMS_TO_TICKS(150));
-
-    // Konfiguration abspeichern
-    drv_uart_gnss_send((uint8_t *)GNSS_UM980_SAVE, strlen(GNSS_UM980_SAVE));
-    vTaskDelay(pdMS_TO_TICKS(300));
-
-    set_gnss_cmd_mode(false);
+    ESP_LOGI(TAG, "fixed base %.9f %.9f %.4f -> %s", lat_deg, lon_deg, height_m, ok ? "OK" : "FAILED");
+    uart_nmea("$PESP,RTK,GNSS,FIXEDBASE,%d", ok ? 1 : 0);
+    return ok;
 }
 
-
-void gnss_init()
-{
-    gnss_reset_low();
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    gnss_reset_high();
-    vTaskDelay(pdMS_TO_TICKS(GNSS_CMD_DELAY_MS));
-
-    // UM980 cleanup, before set config
-    gnss_clear_config();
-
+void gnss_recover(void) {
+    ESP_LOGW(TAG, "GNSS recover: hardware reset + reconfigure");
+    uart_nmea("$PESP,RTK,GNSS,RECOVER");
+    gnss_reset_pulse();
     config_gnss_base();
+}
 
+void gnss_init(void) {
+    // Register the response-capture handler once (coexists with the NTRIP forwarder).
+    uart_register_read_handler(gnss_uart_capture);
+
+    gnss_reset_pulse();
+    config_gnss_base();
 }
