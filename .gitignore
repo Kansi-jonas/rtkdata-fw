@@ -1,0 +1,10 @@
+.vscode/*
+.idea/*
+
+managed_components/*
+
+build/
+cmake-build-debug/
+cmake-build-cmakestd/
+sdkconfig
+sdkconfig.old

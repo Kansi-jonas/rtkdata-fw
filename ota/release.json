@@ -1,0 +1,9 @@
+{
+  "version": "1.0.0",
+  "channel": "stable",
+  "notes": "Initial RTKdata reference firmware (UM980/ESP32). Decoupled OTA channel, RTKdata identity, onboarding UI. Stability supervisor + zero-touch provisioning land in subsequent releases.",
+  "update_files_urls": [
+    "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/rtkdata-fw.bin",
+    "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/www.bin"
+  ]
+}
