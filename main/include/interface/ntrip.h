@@ -13,6 +13,7 @@
 #define NEWLINE_LENGTH 2
 
 void ntrip_server_init();
+void ntrip_server_reconnect_all(void);
 
 bool ntrip_response_ok(void *response);
 bool ntrip_response_sourcetable_ok(void *response);

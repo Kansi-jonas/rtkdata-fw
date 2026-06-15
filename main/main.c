@@ -37,6 +37,8 @@
 #include "interface/ntrip.h"
 #include "tasks.h"
 #include "gnss.h"
+#include "supervisor.h"
+#include "provisioning.h"
 #include "update.h"
 #include "iot_button.h"
 
@@ -183,6 +185,11 @@ void app_main()
 
     socket_server_init();
     socket_client_init();
+
+    // RTKdata: data-path health supervisor + zero-touch provisioning
+    supervisor_set_recovery(gnss_recover, ntrip_server_reconnect_all, wifi_driver_restart);
+    supervisor_init();
+    provisioning_init();
 
     uart_nmea("$PESP,INIT,COMPLETE");
 

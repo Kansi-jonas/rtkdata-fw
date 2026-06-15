@@ -587,7 +587,31 @@ const config_item_t CONFIG_ITEMS[] = {
                 .type = CONFIG_ITEM_TYPE_STRING,
                 .secret = true,
                 .def.str = ""
-        }, 
+        },
+
+        // RTKdata provisioning (IE enrollment + state machine)
+        {
+                .key = KEY_RTK_IE_HOST,
+                .type = CONFIG_ITEM_TYPE_STRING,
+                .def.str = "api.rtkdata.com"
+        }, {
+                .key = KEY_RTK_DEVICE_ID,
+                .type = CONFIG_ITEM_TYPE_STRING,
+                .def.str = ""
+        }, {
+                .key = KEY_RTK_STATION_TOK,
+                .type = CONFIG_ITEM_TYPE_STRING,
+                .secret = true,
+                .def.str = ""
+        }, {
+                .key = KEY_RTK_STATE,
+                .type = CONFIG_ITEM_TYPE_UINT8,
+                .def.uint8 = 0
+        }, {
+                .key = KEY_RTK_OTA_BASE,
+                .type = CONFIG_ITEM_TYPE_STRING,
+                .def.str = ""
+        },
 };
 
 const config_item_t *config_items_get(int *count) {

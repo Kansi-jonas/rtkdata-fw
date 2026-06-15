@@ -19,6 +19,7 @@
 #include "config.h"
 #include "util.h"
 #include "uart.h"
+#include "supervisor.h"
 
 static const char *TAG = "NTRIP_SERVER";
 
@@ -46,6 +47,7 @@ typedef struct {
     int                     sock;            // Socket for this instance
     int                     data_keep_alive; // KeepAlive counter
     int                     blocked_sends;   // counter for blocked sends
+    volatile bool           reconnect_req;   // supervisor / send-error -> reconnect
     
 } ntrip_instance_t;
 
@@ -546,8 +548,19 @@ static void ntrip_server_task(void *ctx){
         // Monitoring after connected
         ntrip_server_log_connect_monitoring(inst);
 
-        // Wait until the UART handler reawakens the task after an error.
-        vTaskSuspend(NULL);
+        // Hold the connection up, but actively detect a half-open socket instead of
+        // suspending forever (the stock bug: a GNSS stall meant no send ever failed,
+        // so a dead caster socket was never noticed -> the station went dark).
+        inst->reconnect_req = false;
+        while (!inst->reconnect_req) {
+            char probe;
+            int r = recv(inst->sock, &probe, 1, MSG_DONTWAIT | MSG_PEEK);
+            if (r == 0) { ESP_LOGW(TAG, "[%d] caster closed connection", inst->index); break; }
+            if (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
+                ESP_LOGW(TAG, "[%d] socket probe error %d", inst->index, errno); break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
 
         // Disconnect handling (Bits/LED/Logs)
         ntrip_server_handle_disconnect(inst, host, port, mp);
@@ -584,6 +597,7 @@ static void ntrip_server_send_data(ntrip_instance_t *inst, int32_t length, void 
 
                 ESP_LOGW(TAG, "[%d] too many blocked sends, closing socket/reconnecting", inst->index);
 
+                inst->reconnect_req = true;
                 destroy_socket(&inst->sock);
 
                 if (inst->task_server) {
@@ -597,6 +611,7 @@ static void ntrip_server_send_data(ntrip_instance_t *inst, int32_t length, void 
             ESP_LOGW(TAG,"[%d] send error (%d: %s), closing socket",
                      inst->index, errsv, strerror(errsv));
 
+            inst->reconnect_req = true;
             destroy_socket(&inst->sock);
 
             if (inst->task_server) {
@@ -608,6 +623,7 @@ static void ntrip_server_send_data(ntrip_instance_t *inst, int32_t length, void 
     } else if (sent > 0) {
 
         inst->blocked_sends = 0;
+        supervisor_note_caster_tx(sent);
 
         if (inst->stats) {
             stream_stats_increment(inst->stats, 0, sent);
@@ -798,4 +814,16 @@ void ntrip_server_init() {
             }
         }
     }
+}
+
+// RTKdata: ask every NTRIP instance to drop its socket and reconnect (picks up
+// new credentials from provisioning, and is the supervisor's caster recovery).
+void ntrip_server_reconnect_all(void) {
+    if (!g_instances_mutex) return;
+    xSemaphoreTake(g_instances_mutex, portMAX_DELAY);
+    for (size_t k = 0; k < g_instance_count; ++k) {
+        ntrip_instance_t *inst = g_instances[k];
+        if (inst) inst->reconnect_req = true;
+    }
+    xSemaphoreGive(g_instances_mutex);
 }

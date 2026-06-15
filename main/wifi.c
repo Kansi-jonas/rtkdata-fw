@@ -15,6 +15,7 @@
 #include <lwip/lwip_napt.h>
 #include "wifi.h"
 #include "config.h"
+#include "supervisor.h"
 #include "esp_mac.h"
 
 #define AP_AUTO_OFF_MS    (15U * 60U * 1000U)
@@ -309,6 +310,7 @@ static void handle_sta_disconnected(void *arg, esp_event_base_t base, int32_t id
     sta_connected = false;
 
     xEventGroupClearBits(wifi_event_group, WIFI_STA_GOT_IPV4_BIT);
+    supervisor_note_sta_ip(false);
     xEventGroupClearBits(wifi_event_group, WIFI_STA_GOT_IPV6_BIT);
 
     if (status_led_sta != NULL) 
@@ -418,6 +420,8 @@ static void handle_sta_got_ip(void *arg, esp_event_base_t base, int32_t id, void
               IP2STR(&event->ip_info.gw));
 
     xEventGroupSetBits(wifi_event_group, WIFI_STA_GOT_IPV4_BIT);
+
+    supervisor_note_sta_ip(true);
 }
 
 static void handle_sta_lost_ip(void *arg, esp_event_base_t base, int32_t id, void *event_data){
@@ -427,6 +431,7 @@ static void handle_sta_lost_ip(void *arg, esp_event_base_t base, int32_t id, voi
     uart_nmea("$PESP,WIFI,STA,IP_LOST");
 
     xEventGroupClearBits(wifi_event_group, WIFI_STA_GOT_IPV4_BIT);
+    supervisor_note_sta_ip(false);
 
     // force a disconnect to trigger reconnect flow
     esp_wifi_disconnect();
@@ -911,4 +916,14 @@ const char *wifi_auth_mode_name(wifi_auth_mode_t auth_mode){
 
     }
 
+}
+
+// RTKdata: hard restart of the Wi-Fi driver (supervisor link-recovery action,
+// instead of waiting out the stock 60-attempt / ~5 min reconnect backoff).
+void wifi_driver_restart(void) {
+    ESP_LOGW(TAG, "wifi driver restart requested");
+    uart_nmea("$PESP,RTK,SUPERVISOR,WIFIRESTART");
+    esp_wifi_stop();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_wifi_start();
 }

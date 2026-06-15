@@ -37,6 +37,7 @@
 #include "esp_timer.h" //makeItCompileable
 #include "update.h"
 #include "state.h"
+#include "provisioning.h"
 
 // Max length a file path can have on storage
 #define FILE_PATH_MAX (ESP_VFS_PATH_MAX + CONFIG_SPIFFS_OBJ_NAME_LEN)
@@ -1155,6 +1156,12 @@ static esp_err_t wifi_scan_get_handler(httpd_req_t *req) {
     return json_response(req, root);
 }
 
+static esp_err_t rtk_status_get_handler(httpd_req_t *req) {
+    cJSON *root = cJSON_CreateObject();
+    provisioning_fill_status(root);
+    return json_response(req, root);
+}
+
 static esp_err_t register_uri_handler(httpd_handle_t server, const char *path, httpd_method_t method, esp_err_t (*handler)(httpd_req_t *r)) {
     httpd_uri_t uri_config_get = {
             .uri        = path,
@@ -1210,6 +1217,9 @@ static httpd_handle_t web_server_start(void)
         countWebHandler++;
         
         register_uri_handler(server, "/wifi/scan", HTTP_GET, wifi_scan_get_handler);
+        countWebHandler++;
+
+        register_uri_handler(server, "/rtk/status", HTTP_GET, rtk_status_get_handler);
         countWebHandler++;
 
         register_uri_handler(server, "/adminmodepass", HTTP_POST, adminmodepass_post_handler);

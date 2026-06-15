@@ -26,6 +26,7 @@
 #include <freertos/task.h>
 #include <esp_timer.h>
 #include <esp_system.h>
+#include <esp_attr.h>
 #include <esp_log.h>
 
 #include "supervisor.h"

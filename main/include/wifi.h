@@ -61,6 +61,8 @@ void wifi_sta_status(wifi_sta_status_t *status);
 
 void wait_for_ip();
 
+void wifi_driver_restart(void);
+
 const char * wifi_auth_mode_name(wifi_auth_mode_t auth_mode);
 
 #endif //ESP32_XBEE_WIFI_H

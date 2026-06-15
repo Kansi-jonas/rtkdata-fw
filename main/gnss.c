@@ -29,6 +29,7 @@
 
 #include "gnss.h"
 #include "uart.h"
+#include "supervisor.h"
 
 #define TAG "GNSS"
 
@@ -51,6 +52,7 @@ static portMUX_TYPE s_cap_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void gnss_uart_capture(void *arg, esp_event_base_t base, int32_t id, void *data) {
     (void)arg; (void)base;
+    supervisor_note_gnss_rx();              // any GNSS byte batch = the receiver is alive
     if (!s_capturing || data == NULL) return;
     int len = (int)id;                          // uart_task posts len as the event id
     const uint8_t *d = (const uint8_t *)data;

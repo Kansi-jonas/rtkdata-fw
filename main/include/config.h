@@ -234,6 +234,13 @@ typedef struct config_item {
 #define KEY_CONFIG_MODE_COLOR  "mode_color"
 #define KEY_CONFIG_MODE_PASSWORD "mode_pass"
 
+// RTKdata provisioning (IE enrollment + state machine)
+#define KEY_RTK_IE_HOST "rtk_ie_host"
+#define KEY_RTK_DEVICE_ID "rtk_dev_id"
+#define KEY_RTK_STATION_TOK "rtk_sta_tok"
+#define KEY_RTK_STATE "rtk_state"
+#define KEY_RTK_OTA_BASE "rtk_ota_base"
+
 #define FW_VERSION "1.0.0"
 
 #define UPDATE_SERVER_URL "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/"
