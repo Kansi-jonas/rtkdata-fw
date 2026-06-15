@@ -119,19 +119,22 @@ static void gnss_reset_pulse(void) {
 
 void config_gnss_base(void) {
     static const char *seq[] = {
+        // NOTE: RTCM enables use the comma delimiter (rtcm<type>,com1,<sec>) - the
+        // exact form the stock OnoLink firmware used on these UM980 devices, proven
+        // to stream MSM7. Do NOT switch to the space form without hardware re-test.
         "unlog com1\r\n",
         "CONFIG SIGNALGROUP 2\r\n",   // enable all bands incl. Galileo E6
-        "MASK 10\r\n",                // 10 deg elevation cutoff
-        "rtcm1077 com1 1\r\n",        // GPS    MSM7 @1Hz
-        "rtcm1087 com1 1\r\n",        // GLONASS
-        "rtcm1097 com1 1\r\n",        // Galileo
-        "rtcm1117 com1 1\r\n",        // QZSS   (regional)
-        "rtcm1127 com1 1\r\n",        // BeiDou
-        "rtcm1137 com1 1\r\n",        // NavIC  (regional)
-        "rtcm1005 com1 10\r\n",       // ARP identity anchor (LH rewrites this)
-        "rtcm1033 com1 10\r\n",       // receiver/antenna descriptor
-        "rtcm1230 com1 10\r\n",       // GLONASS code-phase biases (cross-brand RTK)
-        "mode base time 300 1.5\r\n", // provisional survey-in (5 min, 1.5 m)
+        "MASK 10.0\r\n",              // 10 deg elevation cutoff
+        "rtcm1077,com1,1\r\n",        // GPS    MSM7 @1Hz
+        "rtcm1087,com1,1\r\n",        // GLONASS
+        "rtcm1097,com1,1\r\n",        // Galileo
+        "rtcm1117,com1,1\r\n",        // QZSS   (regional)
+        "rtcm1127,com1,1\r\n",        // BeiDou
+        "rtcm1137,com1,1\r\n",        // NavIC  (regional)
+        "rtcm1005,com1,10\r\n",       // ARP identity anchor (LH rewrites this)
+        "rtcm1033,com1,10\r\n",       // receiver/antenna descriptor
+        "rtcm1230,com1,10\r\n",       // GLONASS code-phase biases (cross-brand RTK)
+        "mode base time 300 1.5\r\n", // provisional survey-in (VERIFY syntax on first hw)
         "saveconfig\r\n",
     };
     ESP_LOGI(TAG, "configuring UM980 reference base (ACK-gated)");
