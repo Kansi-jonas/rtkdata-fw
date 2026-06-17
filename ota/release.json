@@ -1,7 +1,7 @@
 {
-  "version": "1.0.1",
+  "version": "1.0.0",
   "channel": "stable",
-  "notes": "Honest device lifecycle: two-gate maturity UI (clean-window + precise-position) with an accurate 'goes live in ~X' ETA and position-phase pills; config-delta churn guard (no more NTRIP bounce every heartbeat); heap-exhaustion supervisor; SoftAP/STA NAPT; RTKdata_ AP identity. Committed sdkconfig.defaults (16MB + custom partitions) so clean/CI builds reproduce.",
+  "notes": "REVERTED to 1.0.0: the v1.0.1 OTA crash-looped on the device (PANIC during the HTTPS download, silent reboot, never completed) -> device stuck re-trying. Holding the channel at 1.0.0 (== running FW_VERSION) so devices stop attempting the update and stay on the stable build. Re-release as 1.0.2 once the OTA download crash is fixed.",
   "update_files_urls": [
     "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/rtkdata-fw.bin",
     "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/www.bin"
