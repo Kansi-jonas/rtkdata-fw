@@ -1,0 +1,30 @@
+# Committed build baseline. sdkconfig itself is gitignored (per-build, machine
+# local), so a clean checkout -- the GitHub ESP-IDF CI or a fresh clone -- must
+# read these defaults to reproduce the validated local build. Without it the CI
+# defaulted to a 4 MB flash and could not place the 16 MB partition table
+# (factory + www + spiffs + app0 + app1), failing with
+# "Failed to create SPIFFS image for partition 'www'".
+#
+# Keep in sync with partitions.csv. Values mirror the local sdkconfig that
+# produced the working build/rtkdata-fw.bin + www.bin.
+
+# 16 MB flash + the custom OTA-capable partition table (the CI breaker)
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# SoftAP <-> STA internet sharing: wifi.c calls ip_napt_enable(), which only
+# exists when lwIP NAPT + IPv4 forwarding are enabled. Missing these is a hard
+# compile error (-Werror=implicit-function-declaration).
+CONFIG_LWIP_IP_FORWARD=y
+CONFIG_LWIP_IPV4_NAPT=y
+
+# App runtime tuning (match the validated local build)
+CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
+CONFIG_FREERTOS_HZ=100
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=3584
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
+CONFIG_HTTPD_MAX_URI_LEN=128
+CONFIG_SPIFFS_OBJ_NAME_LEN=32
