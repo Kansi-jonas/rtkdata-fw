@@ -1,7 +1,7 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.1",
   "channel": "stable",
-  "notes": "Initial RTKdata reference firmware (UM980/ESP32). Decoupled OTA channel, RTKdata identity, onboarding UI. Stability supervisor + zero-touch provisioning land in subsequent releases.",
+  "notes": "Honest device lifecycle: two-gate maturity UI (clean-window + precise-position) with an accurate 'goes live in ~X' ETA and position-phase pills; config-delta churn guard (no more NTRIP bounce every heartbeat); heap-exhaustion supervisor; SoftAP/STA NAPT; RTKdata_ AP identity. Committed sdkconfig.defaults (16MB + custom partitions) so clean/CI builds reproduce.",
   "update_files_urls": [
     "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/rtkdata-fw.bin",
     "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/www.bin"
