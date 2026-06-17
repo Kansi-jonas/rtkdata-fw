@@ -52,6 +52,13 @@
 #define DEB_CASTER_S           15
 #define DEB_LINK_S             30
 
+/* heap-exhaustion guard: if free heap stays below HEAP_FLOOR_B for
+ * HEAP_LOW_S consecutive seconds, reboot cleanly before a hard OOM fault
+ * drops every session uncontrolled. The floor sits well under the ~70 KB
+ * steady-state idle heap, so it only fires on genuine exhaustion. */
+#define HEAP_FLOOR_B           (12 * 1024)
+#define HEAP_LOW_S             15
+
 /* survives a soft reboot (not power loss) so flapping is visible to the IE */
 static RTC_DATA_ATTR uint32_t s_supervised_reboots;
 
@@ -122,12 +129,30 @@ void supervisor_health(supervisor_health_t *out) {
 static void supervisor_task(void *ctx) {
     (void)ctx;
     int64_t last_gnss_act = 0, last_caster_act = 0, last_link_act = 0;
+    int heap_low_streak = 0;
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(TICK_MS));
 
         uint32_t uptime = (uint32_t)(now_us() / 1000000);
         if (uptime < GRACE_S) continue;
+
+        /* Rung 5: heap-exhaustion guard (self-healing against a slow leak or
+         * fragmentation that would otherwise hard-fault). Sustained low heap
+         * -> clean reboot, counted so flapping is visible to the IE. */
+        if (esp_get_free_heap_size() < HEAP_FLOOR_B) {
+            if (++heap_low_streak >= HEAP_LOW_S) {
+                s_supervised_reboots++;
+                ESP_LOGE(TAG, "heap exhausted (free=%u < %u for %ds) -> reboot #%u",
+                         (unsigned)esp_get_free_heap_size(), (unsigned)HEAP_FLOOR_B,
+                         HEAP_LOW_S, (unsigned)s_supervised_reboots);
+                uart_nmea("$PESP,RTK,SUPERVISOR,HEAP,%u", (unsigned)esp_get_free_heap_size());
+                vTaskDelay(pdMS_TO_TICKS(150));
+                esp_restart();
+            }
+        } else {
+            heap_low_streak = 0;
+        }
 
         /* GNSS: silent if never seen after grace, or stale */
         uint32_t gnss_silent = s_gnss_seen ? age_s(s_t_gnss) : uptime;
@@ -147,8 +172,8 @@ static void supervisor_task(void *ctx) {
             (gnss_silent >= TH_WEDGE_S || ip_down >= TH_WEDGE_S)) {
             s_supervised_reboots++;
             ESP_LOGE(TAG, "data path wedged (gnss_silent=%us caster_silent=%us ip_down=%us) "
-                          "-> reboot #%u", gnss_silent, caster_silent, ip_down,
-                          (unsigned)s_supervised_reboots);
+                          "-> reboot #%u", (unsigned)gnss_silent, (unsigned)caster_silent,
+                          (unsigned)ip_down, (unsigned)s_supervised_reboots);
             uart_nmea("$PESP,RTK,SUPERVISOR,REBOOT,%u,%u,%u",
                       gnss_silent, caster_silent, ip_down);
             vTaskDelay(pdMS_TO_TICKS(150)); /* let the NMEA flush */
@@ -157,7 +182,7 @@ static void supervisor_task(void *ctx) {
 
         /* Rung 3: link down -> restart Wi-Fi driver (don't wait stock 5 min) */
         if (link_fault && s_recover_wifi && age_s(last_link_act) >= DEB_LINK_S) {
-            ESP_LOGW(TAG, "STA link down %us -> wifi driver restart", ip_down);
+            ESP_LOGW(TAG, "STA link down %us -> wifi driver restart", (unsigned)ip_down);
             uart_nmea("$PESP,RTK,SUPERVISOR,WIFI,%u", ip_down);
             last_link_act = now_us();
             s_rec_wifi++;
@@ -166,7 +191,7 @@ static void supervisor_task(void *ctx) {
 
         /* Rung 2: caster silent -> force reconnect */
         if (caster_fault && s_recover_caster && age_s(last_caster_act) >= DEB_CASTER_S) {
-            ESP_LOGW(TAG, "no caster send %us -> reconnect", caster_silent);
+            ESP_LOGW(TAG, "no caster send %us -> reconnect", (unsigned)caster_silent);
             uart_nmea("$PESP,RTK,SUPERVISOR,CASTER,%u", caster_silent);
             last_caster_act = now_us();
             s_rec_caster++;
@@ -175,7 +200,7 @@ static void supervisor_task(void *ctx) {
 
         /* Rung 1: no GNSS bytes -> reset + reconfigure the UM980 */
         if (gnss_fault && s_recover_gnss && age_s(last_gnss_act) >= DEB_GNSS_S) {
-            ESP_LOGW(TAG, "no GNSS bytes %us -> UM980 reset+reconfig", gnss_silent);
+            ESP_LOGW(TAG, "no GNSS bytes %us -> UM980 reset+reconfig", (unsigned)gnss_silent);
             uart_nmea("$PESP,RTK,SUPERVISOR,GNSS,%u", gnss_silent);
             last_gnss_act = now_us();
             s_rec_gnss++;

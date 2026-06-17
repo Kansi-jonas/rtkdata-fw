@@ -105,12 +105,27 @@ static char *http_post_json(const char *url, const char *body, int *out_status) 
     if (err == ESP_OK && esp_http_client_write(cli, body, strlen(body)) >= 0) {
         int clen = esp_http_client_fetch_headers(cli);
         if (out_status) *out_status = esp_http_client_get_status_code(cli);
-        if (clen > 0) {
-            resp = malloc(clen + 1);
-            if (resp) {
-                int r = esp_http_client_read_response(cli, resp, clen);
-                resp[r >= 0 ? r : 0] = '\0';
+
+        /* Read the whole body even when the server replies chunked. The IE
+         * (Next.js) sends Transfer-Encoding: chunked with no Content-Length, so
+         * fetch_headers() returns 0 here; grow the buffer as data arrives rather
+         * than trusting clen, or the 200 reply (token + caster creds) is lost. */
+        int cap = clen > 0 ? clen + 1 : 512;
+        int len = 0;
+        resp = malloc(cap);
+        if (resp) {
+            for (;;) {
+                if (len + 1 >= cap) {
+                    char *grown = realloc(resp, cap * 2);
+                    if (!grown) { free(resp); resp = NULL; break; }
+                    resp = grown;
+                    cap *= 2;
+                }
+                int r = esp_http_client_read(cli, resp + len, cap - len - 1);
+                if (r <= 0) break;   /* 0 = body complete, <0 = closed/error */
+                len += r;
             }
+            if (resp) resp[len] = '\0';
         }
     } else {
         ESP_LOGW(TAG, "POST %s failed: %s", url, esp_err_to_name(err));
@@ -141,6 +156,44 @@ static void write_caster_creds(cJSON *caster) {
     config_commit();
 }
 
+/* True if any caster field in the reply differs from what is already stored, so
+ * a repeated config_delta (the IE includes the authoritative caster on every
+ * heartbeat) only rewrites NVS + bounces the NTRIP server on an actual change. */
+static bool caster_creds_differ(cJSON *caster) {
+    char *cur = NULL;
+    bool differ = false;
+
+    cJSON *host = cJSON_GetObjectItem(caster, "host");
+    if (cJSON_IsString(host)) {
+        config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_NTRIP_SERVER_HOST), (void **)&cur);
+        if (!cur || strcmp(cur, host->valuestring) != 0) differ = true;
+        free(cur); cur = NULL;
+    }
+    cJSON *mp = cJSON_GetObjectItem(caster, "mountpoint");
+    if (!differ && cJSON_IsString(mp)) {
+        config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_NTRIP_SERVER_MOUNTPOINT), (void **)&cur);
+        if (!cur || strcmp(cur, mp->valuestring) != 0) differ = true;
+        free(cur); cur = NULL;
+    }
+    cJSON *user = cJSON_GetObjectItem(caster, "username");
+    if (!differ && cJSON_IsString(user)) {
+        config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_NTRIP_SERVER_USERNAME), (void **)&cur);
+        if (!cur || strcmp(cur, user->valuestring) != 0) differ = true;
+        free(cur); cur = NULL;
+    }
+    cJSON *pass = cJSON_GetObjectItem(caster, "password");
+    if (!differ && cJSON_IsString(pass)) {
+        config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_NTRIP_SERVER_PASSWORD), (void **)&cur);
+        if (!cur || strcmp(cur, pass->valuestring) != 0) differ = true;
+        free(cur); cur = NULL;
+    }
+    cJSON *port = cJSON_GetObjectItem(caster, "port");
+    if (!differ && cJSON_IsNumber(port)) {
+        if (config_get_u16(CONF_ITEM(KEY_CONFIG_NTRIP_SERVER_PORT)) != (uint16_t)port->valueint) differ = true;
+    }
+    return differ;
+}
+
 /* ------------------------------------------------------------- identity/cfg */
 
 static void load_identity(void) {
@@ -163,7 +216,7 @@ static void load_identity(void) {
 
     char *host = NULL;
     config_get_str_blob_alloc(CONF_ITEM(KEY_RTK_IE_HOST), (void **)&host);
-    strlcpy(s_ie_host, (host && host[0]) ? host : "api.rtkdata.com", sizeof(s_ie_host));
+    strlcpy(s_ie_host, (host && host[0]) ? host : "integrity-engine.onrender.com", sizeof(s_ie_host));
     free(host);
 
     char *tok = NULL;
@@ -275,10 +328,10 @@ static void apply_reply(cJSON *root) {
     cJSON *delta = cJSON_GetObjectItem(root, "config_delta");
     if (cJSON_IsObject(delta)) {
         cJSON *caster = cJSON_GetObjectItem(delta, "caster");
-        if (cJSON_IsObject(caster)) {
+        if (cJSON_IsObject(caster) && caster_creds_differ(caster)) {
             write_caster_creds(caster);
             ntrip_server_reconnect_all();
-            ESP_LOGI(TAG, "applied IE config_delta (caster)");
+            ESP_LOGI(TAG, "applied IE config_delta (caster re-pointed)");
         }
     }
 
@@ -391,12 +444,24 @@ void provisioning_fill_status(cJSON *root) {
         cJSON_AddBoolToObject(p, "valid", true);
         cJSON_AddNumberToObject(p, "lat", s_st.pos_lat);
         cJSON_AddNumberToObject(p, "lon", s_st.pos_lon);
+        cJSON_AddNumberToObject(p, "h", s_st.pos_h);
     }
     xSemaphoreGive(s_mtx);
 
     /* local liveness the device is sure of */
     cJSON_AddBoolToObject(root, "data_ok", h.caster_ok);
     cJSON_AddNumberToObject(root, "uptime_s", h.uptime_s);
+
+    /* self-healing supervisor state (so the dashboard can show the watchdog
+     * is alive and how often each subsystem has been auto-recovered). */
+    cJSON *sh = cJSON_AddObjectToObject(root, "self_heal");
+    cJSON_AddBoolToObject(sh, "gnss_ok", h.gnss_ok);
+    cJSON_AddBoolToObject(sh, "caster_ok", h.caster_ok);
+    cJSON_AddBoolToObject(sh, "link_ok", h.link_ok);
+    cJSON_AddNumberToObject(sh, "rec_gnss", h.recoveries_gnss);
+    cJSON_AddNumberToObject(sh, "rec_caster", h.recoveries_caster);
+    cJSON_AddNumberToObject(sh, "rec_wifi", h.recoveries_wifi);
+    cJSON_AddNumberToObject(sh, "reboots", h.reboots_supervised);
 }
 
 void provisioning_init(void) {

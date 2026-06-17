@@ -593,7 +593,7 @@ const config_item_t CONFIG_ITEMS[] = {
         {
                 .key = KEY_RTK_IE_HOST,
                 .type = CONFIG_ITEM_TYPE_STRING,
-                .def.str = "api.rtkdata.com"
+                .def.str = "integrity-engine.onrender.com"
         }, {
                 .key = KEY_RTK_DEVICE_ID,
                 .type = CONFIG_ITEM_TYPE_STRING,

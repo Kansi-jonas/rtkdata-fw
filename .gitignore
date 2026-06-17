@@ -8,3 +8,9 @@ cmake-build-debug/
 cmake-build-cmakestd/
 sdkconfig
 sdkconfig.old
+
+# Device NVS partition dumps - contain the per-device station_token + caster
+# credentials. NEVER commit (would leak the device secret into the repo).
+nvs.bin
+nvs2.bin
+*.nvs.bin

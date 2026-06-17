@@ -1127,6 +1127,25 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
         }
     }
 
+    // Which interface did THIS request arrive on: the captive SoftAP (setup)
+    // or the LAN/STA side (dashboard)? The UI serves the onboarding wizard on
+    // the AP and a status dashboard on the LAN IP. Detection is by the request
+    // socket's LOCAL address: a request hitting the SoftAP gateway IP is "ap".
+    {
+        const char *via = "sta";
+        int reqsock = httpd_req_to_sockfd(req);
+        struct sockaddr_in6 la;
+        socklen_t lalen = sizeof(la);
+        if (ap_status.active && reqsock >= 0 &&
+            getsockname(reqsock, (struct sockaddr *)&la, &lalen) == 0) {
+            char apip[40];
+            snprintf(apip, sizeof(apip), IPSTR, IP2STR(&ap_status.ip4_addr));
+            const char *local = sockaddrtostr((struct sockaddr *)&la);
+            if (local != NULL && strstr(local, apip) != NULL) via = "ap";
+        }
+        cJSON_AddStringToObject(root, "via", via);
+    }
+
     return json_response(req, root);
 }
 

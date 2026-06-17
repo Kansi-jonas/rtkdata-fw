@@ -1,259 +1,277 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<meta name="theme-color" content="#0b0f14" />
-<title>RTKdata Station Setup</title>
+<meta name="theme-color" content="#1a1a1a" />
+<title>RTKdata Station</title>
 <style>
-  /* Self-contained: no external fonts/CDN. The setup AP has no internet. */
+  /* Mirrors the RTKdata ops dashboard (shadcn neutral dark): neutral charcoal,
+     near-white text, ring borders, light primary buttons, emerald/amber pills.
+     Self-contained: no external fonts/CDN (the device has no internet on AP). */
   :root{
-    --bg:#0b0f14; --bg2:#0e141b; --card:#141c26; --card2:#18222e;
-    --line:#22303f; --line2:#2c3e51;
-    --txt:#e8eef5; --muted:#8aa0b4; --faint:#5b7185;
-    --accent:#22d3ee; --accent2:#0891b2;
-    --good:#34d399; --warn:#fbbf24; --bad:#f87171;
-    --r:16px;
+    --bg:#1a1a1a; --card:#262626; --raise:#2e2e2e; --input:#1f1f1f;
+    --line:rgba(255,255,255,.10); --line2:rgba(255,255,255,.16);
+    --txt:#fafafa; --muted:#a3a3a3; --faint:#737373;
+    --primary:#ededed; --primary-fg:#1c1c1c;
+    --good:#34d399; --good2:rgba(16,185,129,.12); --good3:rgba(16,185,129,.3);
+    --warn:#fbbf24; --warn2:rgba(245,158,11,.12); --warn3:rgba(245,158,11,.3);
+    --bad:#f87171; --bad2:rgba(239,68,68,.12); --bad3:rgba(239,68,68,.3);
+    --r:10px; --r-sm:8px;
+    --font:'Geist',ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    --mono:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,monospace;
   }
   *{box-sizing:border-box}
   html,body{margin:0;padding:0}
-  body{
-    background:radial-gradient(1200px 600px at 50% -10%, #11202c 0%, var(--bg) 55%) fixed;
-    color:var(--txt);
-    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-    -webkit-font-smoothing:antialiased;
-    min-height:100vh;
-    padding:max(env(safe-area-inset-top),18px) 16px 40px;
-  }
-  .wrap{max-width:460px;margin:0 auto}
+  body{background:var(--bg);color:var(--txt);font:14px/1.5 var(--font);
+    -webkit-font-smoothing:antialiased;min-height:100vh;
+    padding:max(env(safe-area-inset-top),16px) 16px 36px}
+  .wrap{max-width:520px;margin:0 auto}
+  .hidden{display:none!important}
+  .mono{font-family:var(--mono)}
 
   /* Header */
-  header{display:flex;align-items:center;gap:12px;margin:6px 2px 22px}
-  .logo{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.2px;font-size:18px}
-  .logo .mark{width:26px;height:26px;flex:0 0 auto}
-  .logo b{color:var(--accent)}
+  header{display:flex;align-items:center;gap:11px;height:52px;margin:0 2px 18px;
+    border-bottom:1px solid var(--line)}
+  .brand{display:flex;align-items:center;gap:10px;min-width:0}
+  .brand .mark{width:28px;height:28px;flex:0 0 auto;display:block}
+  .brand .bt{font-weight:600;font-size:15px;line-height:1.1}
+  .brand .bs{font-size:11px;color:var(--faint);line-height:1.2;margin-top:1px}
   .spacer{flex:1}
-  .pill{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;
-    padding:6px 11px;border-radius:999px;background:var(--card);border:1px solid var(--line)}
-  .dot{width:8px;height:8px;border-radius:50%;background:var(--faint)}
-  .dot.live{background:var(--good);animation:pulse 2s infinite}
-  .dot.warn{background:var(--warn)}
-  .dot.bad{background:var(--bad)}
-  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.45)}70%{box-shadow:0 0 0 7px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
+  .pill{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:500;
+    padding:3px 9px;border-radius:999px;border:1px solid var(--line);background:var(--raise);
+    color:var(--muted);white-space:nowrap}
+  .pill.green{color:var(--good);border-color:var(--good3);background:var(--good2)}
+  .pill.amber{color:var(--warn);border-color:var(--warn3);background:var(--warn2)}
+  .pill.red{color:var(--bad);border-color:var(--bad3);background:var(--bad2)}
+  .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:0 0 auto}
+  .pill.live .dot{animation:pulse 2.4s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.5)}70%{box-shadow:0 0 0 6px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
 
-  /* Cards */
-  .card{background:linear-gradient(180deg,var(--card) 0%,var(--bg2) 100%);
-    border:1px solid var(--line);border-radius:var(--r);padding:20px;margin-bottom:16px;
-    box-shadow:0 1px 0 rgba(255,255,255,.02) inset, 0 12px 30px -18px rgba(0,0,0,.7)}
-  .card h2{margin:0 0 4px;font-size:17px}
-  .card .sub{color:var(--muted);font-size:13.5px;margin:0 0 16px}
-
-  /* Identity strip */
-  .ident{display:flex;align-items:center;gap:14px;margin-bottom:6px}
-  .ident .glyph{width:46px;height:46px;flex:0 0 auto;border-radius:12px;
-    background:radial-gradient(circle at 30% 25%, #15323e, #0d1822);border:1px solid var(--line2);
-    display:grid;place-items:center}
-  .ident .who{flex:1;min-width:0}
-  .ident .who .id{font-weight:700;font-size:16px}
-  .ident .who .meta{color:var(--faint);font-size:12.5px}
+  /* Cards + sections */
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+    padding:16px;margin-bottom:12px}
+  .card h2{margin:0 0 4px;font-size:15px;font-weight:600}
+  .sub{color:var(--muted);font-size:13px;margin:0 0 14px;line-height:1.5}
+  .sect{font-size:11px;font-weight:500;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.6px;margin:18px 2px 8px}
 
   /* Steps */
-  .steps{display:flex;gap:6px;margin:0 2px 18px}
-  .steps .s{flex:1;height:4px;border-radius:3px;background:var(--line)}
-  .steps .s.on{background:var(--accent)}
-  .steps .s.done{background:var(--accent2)}
+  .steps{display:flex;gap:6px;margin:0 2px 14px}
+  .steps .s{flex:1;height:3px;border-radius:3px;background:var(--line2)}
+  .steps .s.on{background:var(--primary)} .steps .s.done{background:var(--muted)}
 
-  /* Wifi list */
-  .net{display:flex;align-items:center;gap:12px;padding:13px 12px;border:1px solid var(--line);
-    border-radius:12px;background:var(--card2);margin-bottom:9px;cursor:pointer;transition:.15s;
-    -webkit-tap-highlight-color:transparent}
-  .net:hover,.net:focus-visible{border-color:var(--line2);background:#1b2735;outline:none}
-  .net.sel{border-color:var(--accent);background:#102a33}
-  .net .ssid{flex:1;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* Welcome hero */
+  .hero{display:flex;flex-direction:column;align-items:center;text-align:center;padding:8px 6px 2px}
+  .hero .big{width:60px;height:60px;margin-bottom:12px}
+  .hero h2{font-size:18px} .hero .sub{max-width:380px}
+
+  /* Wi-Fi list */
+  .net{display:flex;align-items:center;gap:12px;padding:11px 12px;border:1px solid var(--line);
+    border-radius:var(--r-sm);background:var(--raise);margin-bottom:8px;cursor:pointer;transition:.13s}
+  .net:hover,.net:focus-visible{border-color:var(--line2);outline:none}
+  .net .ssid{flex:1;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .net .lock{color:var(--faint);flex:0 0 auto}
   .bars{display:flex;align-items:flex-end;gap:2px;height:16px;flex:0 0 auto}
-  .bars i{width:3px;border-radius:2px;background:var(--line2)}
-  .bars i.on{background:var(--accent)}
+  .bars i{width:3px;border-radius:2px;background:var(--line2)} .bars i.on{background:var(--muted)}
 
   /* Inputs + buttons */
-  label{display:block;font-size:12.5px;color:var(--muted);margin:14px 2px 6px;font-weight:600}
-  input[type=text],input[type=password]{width:100%;padding:13px 14px;border-radius:12px;
-    background:#0c141d;border:1px solid var(--line2);color:var(--txt);font-size:15px}
-  input:focus{outline:none;border-color:var(--accent)}
+  label{display:block;font-size:12px;color:var(--muted);margin:14px 2px 6px;font-weight:500}
+  input[type=text],input[type=password]{width:100%;padding:10px 12px;border-radius:var(--r-sm);
+    background:var(--input);border:1px solid var(--line2);color:var(--txt);font:14px var(--font)}
+  input:focus{outline:none;border-color:var(--muted)}
   .row{display:flex;gap:10px;align-items:center}
-  button{font:inherit;font-weight:700;border:0;border-radius:12px;padding:13px 16px;cursor:pointer;
-    transition:.15s;width:100%}
-  .btn{background:var(--accent);color:#04222a}
-  .btn:hover{filter:brightness(1.07)}
-  .btn:disabled{opacity:.5;cursor:default;filter:none}
-  .btn.ghost{background:var(--card2);color:var(--txt);border:1px solid var(--line2)}
-  .btn.ghost:hover{background:#1b2735}
-  .btn-sm{width:auto;padding:9px 13px;font-size:13px}
-
-  .hint{color:var(--faint);font-size:12.5px;margin-top:12px;display:flex;gap:8px}
+  button{font:inherit;font-weight:500;border:0;border-radius:var(--r-sm);padding:10px 16px;
+    cursor:pointer;transition:.13s;width:100%}
+  .btn{background:var(--primary);color:var(--primary-fg)} .btn:hover{background:#fff}
+  .btn:disabled{opacity:.5;cursor:default}
+  .btn.ghost{background:transparent;color:var(--txt);border:1px solid var(--line2)}
+  .btn.ghost:hover{background:var(--raise)}
+  .btn-sm{width:auto;padding:8px 12px;font-size:13px}
+  .linkbtn{background:none;border:0;color:var(--muted);font-size:12.5px;width:auto;padding:6px;
+    cursor:pointer;text-decoration:underline;text-underline-offset:3px}
+  .linkbtn:hover{color:var(--txt)}
+  .hint{color:var(--faint);font-size:12px;margin-top:12px;display:flex;gap:8px;line-height:1.45}
   .hint svg{flex:0 0 auto;margin-top:1px}
 
-  /* Status grid */
-  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px}
-  .stat{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px 13px}
-  .stat .k{color:var(--faint);font-size:11.5px;text-transform:uppercase;letter-spacing:.5px}
-  .stat .v{font-size:18px;font-weight:700;margin-top:3px}
-  .stat .v small{font-size:12px;color:var(--muted);font-weight:600}
+  /* Dashboard hero status */
+  .statusrow{display:flex;align-items:center;gap:18px}
+  .ringwrap{position:relative;width:100px;height:100px;flex:0 0 auto}
+  .ring{width:100px;height:100px;transform:rotate(-90deg)}
+  .ring .bg{fill:none;stroke:var(--line2);stroke-width:8}
+  .ring .fg{fill:none;stroke:var(--good);stroke-width:8;stroke-linecap:round;transition:stroke-dashoffset .6s ease}
+  .ringc{position:absolute;inset:0;display:grid;place-items:center;text-align:center}
+  .ringc .pct{font-size:21px;font-weight:600} .ringc .t{font-size:9px;color:var(--faint);letter-spacing:.5px}
+  .stnow{flex:1;min-width:0}
+  .stnow .st{font-weight:600;font-size:15px} .stnow .msg{color:var(--muted);font-size:12.5px;margin-top:3px;line-height:1.45}
 
-  /* Maturing ring */
-  .ring-wrap{display:flex;align-items:center;gap:18px;margin:6px 0 14px}
-  .ring-label{position:relative;width:96px;height:96px;flex:0 0 auto}
-  .ring{width:96px;height:96px;transform:rotate(-90deg)}
-  .ring .bg{fill:none;stroke:var(--line);stroke-width:9}
-  .ring .fg{fill:none;stroke:var(--accent);stroke-width:9;stroke-linecap:round;
-    transition:stroke-dashoffset .6s ease}
-  .ring-center{position:absolute;inset:0;display:grid;place-items:center}
-  .ring-center .pct{font-size:20px;font-weight:800}
-  .ring-center .t{font-size:10px;color:var(--faint)}
+  /* Stat grid (stat-card) */
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .stat{background:var(--raise);border:1px solid var(--line);border-radius:var(--r-sm);padding:12px 13px}
+  .stat .k{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px}
+  .stat .v{font-size:20px;font-weight:600;margin-top:4px}
+  .stat .v small{font-size:11.5px;color:var(--muted);font-weight:400}
 
-  .quality{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
-  .tag{font-size:12px;font-weight:600;padding:5px 10px;border-radius:999px;
-    background:var(--card2);border:1px solid var(--line);color:var(--muted)}
-  .tag.good{color:var(--good);border-color:#1d4d3d}
-  .tag.warn{color:var(--warn);border-color:#4d3f1d}
-  .tag.bad{color:var(--bad);border-color:#4d2424}
+  /* key/value */
+  .kv{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--line)}
+  .kv:last-child{border-bottom:0} .kv .k{color:var(--muted);font-size:13px}
+  .kv .v{font-family:var(--mono);font-size:12.5px;text-align:right;max-width:62%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
-  .hidden{display:none!important}
+  .tags{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
   .center{text-align:center}
   .spin{width:38px;height:38px;border-radius:50%;border:3px solid var(--line2);
-    border-top-color:var(--accent);animation:spin .9s linear infinite;margin:8px auto 14px}
+    border-top-color:var(--muted);animation:spin .9s linear infinite;margin:8px auto 14px}
   @keyframes spin{to{transform:rotate(360deg)}}
-  footer{text-align:center;color:var(--faint);font-size:12px;margin-top:24px}
-  a{color:var(--accent);text-decoration:none}
+  footer{text-align:center;color:var(--faint);font-size:11px;margin-top:20px;line-height:1.8}
+  a{color:var(--txt);text-decoration:none}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <div class="logo">
-      <svg class="mark" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-        <circle cx="16" cy="16" r="14" stroke="#22d3ee" stroke-width="2" opacity=".35"/>
-        <circle cx="16" cy="16" r="8.5" stroke="#22d3ee" stroke-width="2" opacity=".6"/>
-        <circle cx="16" cy="16" r="3" fill="#22d3ee"/>
-        <path d="M16 2v5M16 25v5M2 16h5M25 16h5" stroke="#22d3ee" stroke-width="2" stroke-linecap="round"/>
-      </svg>
-      <span>RTK<b>data</b></span>
-    </div>
-    <div class="spacer"></div>
-    <span class="pill"><span id="hdrDot" class="dot"></span><span id="hdrState">Setup</span></span>
+    <span class="brand"><span class="mark" id="logoHead"></span>
+      <span><span class="bt">RTKdata</span><span class="bs" style="display:block">Reference Station</span></span></span>
+    <span class="spacer"></span>
+    <span class="pill" id="statePill"><span class="dot"></span><span id="stateTxt">Loading</span></span>
   </header>
 
-  <div class="steps" id="steps">
-    <div class="s on"></div><div class="s"></div><div class="s"></div><div class="s"></div>
+  <!-- ===================== SETUP (captive AP) ===================== -->
+  <div id="setup" class="hidden">
+    <div class="steps" id="steps"><div class="s on"></div><div class="s"></div><div class="s"></div></div>
+
+    <section id="step1" class="card">
+      <div class="hero">
+        <span class="big" id="logoHero"></span>
+        <h2 id="devId">RTKdata Station</h2>
+        <p class="sub" id="devMeta">UM980 reference base</p>
+        <p class="sub">Let's get your station online. Connect it to your Wi-Fi, then RTKdata
+          computes its exact position over ~48 h and adds it to the network automatically.</p>
+        <button class="btn" onclick="go(2)">Start setup</button>
+      </div>
+    </section>
+
+    <section id="step2" class="card hidden">
+      <h2>Choose your Wi-Fi</h2>
+      <p class="sub">Pick the network the station should join. 2.4 GHz only.</p>
+      <div id="netList"><div class="center"><div class="spin"></div><div class="sub">Scanning…</div></div></div>
+      <div class="row" style="margin-top:4px">
+        <button class="btn ghost btn-sm" onclick="scan()">Rescan</button>
+        <div class="spacer"></div>
+        <button class="btn ghost btn-sm" onclick="manualToggle()">Hidden network</button>
+      </div>
+      <div id="manualWrap" class="hidden">
+        <label>Network name (SSID)</label>
+        <input id="manualSsid" type="text" autocomplete="off" placeholder="My-Network" />
+      </div>
+    </section>
+
+    <section id="step2b" class="card hidden">
+      <h2>Connect to <span id="pwSsid"></span></h2>
+      <p class="sub">Enter the Wi-Fi password.</p>
+      <label>Password</label>
+      <div class="row">
+        <input id="wifiPass" type="password" autocomplete="off" placeholder="Wi-Fi password" />
+        <button class="btn ghost btn-sm" onclick="togglePw()">Show</button>
+      </div>
+      <div class="row" style="margin-top:18px;gap:10px">
+        <button class="btn ghost" style="flex:0 0 38%" onclick="go(2)">Back</button>
+        <button class="btn" id="connectBtn" onclick="connect()">Connect</button>
+      </div>
+      <div class="hint">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="#737373" stroke-width="1.6"/><path d="M12 8v5" stroke="#737373" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="16" r="1" fill="#737373"/></svg>
+        The station restarts to join your network. This page may briefly disconnect, that is normal.
+      </div>
+    </section>
+
+    <section id="step3" class="card hidden center">
+      <div class="spin"></div>
+      <h2 id="connTitle">Joining your network…</h2>
+      <p class="sub" id="connSub">Waiting for the station to come back online.</p>
+    </section>
   </div>
 
-  <!-- STEP 1: Welcome / identity -->
-  <section id="step1" class="card">
-    <div class="ident">
-      <div class="glyph">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-          <path d="M12 21s-7-4.4-7-10a7 7 0 1 1 14 0c0 5.6-7 10-7 10Z" stroke="#22d3ee" stroke-width="1.6"/>
-          <circle cx="12" cy="11" r="2.4" fill="#22d3ee"/>
-        </svg>
-      </div>
-      <div class="who">
-        <div class="id" id="devId">RTKdata Station</div>
-        <div class="meta" id="devMeta">UM980 reference base</div>
-      </div>
-    </div>
-    <p class="sub" style="margin-top:14px">Let's get your reference station online. Connect it to your
-      Wi-Fi, then RTKdata computes its exact position over the next 48 hours and adds it to the network
-      automatically.</p>
-    <button class="btn" onclick="go(2)">Start setup</button>
-  </section>
-
-  <!-- STEP 2: Wifi pick -->
-  <section id="step2" class="card hidden">
-    <h2>Choose your Wi-Fi</h2>
-    <p class="sub">Select the network the station should use. 2.4 GHz only.</p>
-    <div id="netList"><div class="center"><div class="spin"></div><div class="sub">Scanning...</div></div></div>
-    <div class="row" style="margin-top:6px">
-      <button class="btn ghost btn-sm" onclick="scan()">Rescan</button>
-      <div class="spacer"></div>
-      <button class="btn ghost btn-sm" onclick="manualToggle()">Hidden network</button>
-    </div>
-    <div id="manualWrap" class="hidden">
-      <label>Network name (SSID)</label>
-      <input id="manualSsid" type="text" autocomplete="off" placeholder="My-Network" />
-    </div>
-  </section>
-
-  <!-- STEP 2b: password -->
-  <section id="step2b" class="card hidden">
-    <h2>Connect to <span id="pwSsid" style="color:var(--accent)"></span></h2>
-    <p class="sub">Enter the Wi-Fi password.</p>
-    <label>Password</label>
-    <div class="row">
-      <input id="wifiPass" type="password" autocomplete="off" placeholder="Wi-Fi password" />
-      <button class="btn ghost btn-sm" onclick="togglePw()">Show</button>
-    </div>
-    <div class="row" style="margin-top:18px;gap:10px">
-      <button class="btn ghost" style="flex:0 0 40%" onclick="go(2)">Back</button>
-      <button class="btn" id="connectBtn" onclick="connect()">Connect</button>
-    </div>
-    <div class="hint">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="#5b7185" stroke-width="1.6"/><path d="M12 8v5" stroke="#5b7185" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="16" r="1" fill="#5b7185"/></svg>
-      The station restarts to join your network. This page may briefly disconnect, that is normal.
-    </div>
-  </section>
-
-  <!-- STEP 3: connecting -->
-  <section id="step3" class="card hidden center">
-    <div class="spin"></div>
-    <h2 id="connTitle">Joining your network...</h2>
-    <p class="sub" id="connSub">Waiting for the station to come back online.</p>
-  </section>
-
-  <!-- STEP 4: online / maturing -->
-  <section id="step4" class="card hidden">
-    <h2>Station online</h2>
-    <p class="sub" id="onlineSub">Connected and streaming. Now we lock in the precise position.</p>
-
-    <div class="ring-wrap">
-      <div class="ring-label">
-        <svg class="ring" viewBox="0 0 120 120">
-          <circle class="bg" cx="60" cy="60" r="52"/>
-          <circle id="ringFg" class="fg" cx="60" cy="60" r="52" stroke-dasharray="326.7" stroke-dashoffset="326.7"/>
-        </svg>
-        <div class="ring-center">
-          <div class="pct" id="ringPct">0%</div>
-          <div class="t">to live</div>
+  <!-- ===================== DASHBOARD (LAN/STA) ===================== -->
+  <div id="dash" class="hidden">
+    <section class="card">
+      <div class="statusrow">
+        <div class="ringwrap">
+          <svg class="ring" viewBox="0 0 120 120">
+            <circle class="bg" cx="60" cy="60" r="52"/>
+            <circle id="ringFg" class="fg" cx="60" cy="60" r="52" stroke-dasharray="326.7" stroke-dashoffset="326.7"/>
+          </svg>
+          <div class="ringc"><div class="pct" id="ringPct">0%</div><div class="t">TO LIVE</div></div>
+        </div>
+        <div class="stnow">
+          <div class="st" id="dState">Provisioning</div>
+          <div class="msg" id="dMsg">Bringing the station online…</div>
+          <div class="tags" id="dTags"></div>
         </div>
       </div>
-      <div style="flex:1">
-        <div style="font-weight:700;font-size:15px" id="matureState">Computing position</div>
-        <div class="sub" style="margin:4px 0 0" id="matureMsg">
-          The station must deliver clean data for ~48 h before it joins the live RTKdata network.</div>
-        <div class="quality" id="qualTags"></div>
+    </section>
+
+    <div class="sect">RTCM data stream</div>
+    <section class="card">
+      <div class="grid">
+        <div class="stat"><div class="k">RTCM rate</div><div class="v" id="qRate">–<small> B/s</small></div></div>
+        <div class="stat"><div class="k">To caster</div><div class="v" id="qOut">–<small> B/s</small></div></div>
+        <div class="stat"><div class="k">Position</div><div class="v" id="qPos" style="font-size:15px">–</div></div>
+        <div class="stat"><div class="k">Uptime</div><div class="v" id="qUp">–</div></div>
       </div>
-    </div>
+    </section>
 
-    <div class="grid">
-      <div class="stat"><div class="k">Satellites</div><div class="v" id="qSats">-</div></div>
-      <div class="stat"><div class="k">Fix</div><div class="v" id="qFix">-</div></div>
-      <div class="stat"><div class="k">Uplink</div><div class="v" id="qRate">-<small> B/s</small></div></div>
-      <div class="stat"><div class="k">Uptime</div><div class="v" id="qUp">-</div></div>
-    </div>
+    <div class="sect">Station</div>
+    <section class="card">
+      <div class="kv"><span class="k">Station ID</span><span class="v" id="iId">–</span></div>
+      <div class="kv"><span class="k">Mountpoint</span><span class="v" id="iMp">–</span></div>
+      <div class="kv"><span class="k">Caster</span><span class="v" id="iCaster">–</span></div>
+      <div class="kv"><span class="k">Network</span><span class="v" id="iSsid">–</span></div>
+      <div class="kv"><span class="k">IP address</span><span class="v" id="iIp">–</span></div>
+      <div class="kv"><span class="k">Signal</span><span class="v" id="iRssi">–</span></div>
+    </section>
 
-    <div class="hint" id="posHint">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M12 21s-7-4.4-7-10a7 7 0 1 1 14 0c0 5.6-7 10-7 10Z" stroke="#5b7185" stroke-width="1.5"/></svg>
-      <span id="posText">Precise coordinates are computed on the RTKdata server, not on the device.</span>
-    </div>
-  </section>
+    <div class="sect">Self-healing supervisor</div>
+    <section class="card">
+      <div class="tags" id="healthTags"></div>
+      <div class="grid" style="margin-top:12px">
+        <div class="stat"><div class="k">Free memory</div><div class="v" id="hHeap">–<small> KB</small></div></div>
+        <div class="stat"><div class="k">Auto-recoveries</div><div class="v" id="hRec">–</div></div>
+        <div class="stat"><div class="k">Supervised reboots</div><div class="v" id="hReb">–</div></div>
+        <div class="stat"><div class="k">Receiver</div><div class="v" id="hRx" style="font-size:14px">UM980 base</div></div>
+      </div>
+      <div style="margin-top:14px;text-align:center">
+        <button class="linkbtn" onclick="enterSetup(null)">Reconfigure Wi-Fi</button>
+      </div>
+    </section>
+  </div>
 
-  <footer>RTKdata reference firmware - v<span id="fwv">1.0.0</span> - <span id="staIp">setup mode</span></footer>
+  <footer>RTKdata reference firmware · v<span id="fwv" class="mono">1.0.0</span><br>
+    <span id="footIp" class="mono">setup mode</span></footer>
 </div>
 
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
-const TWO_PI_R = 2 * Math.PI * 52;              // ring circumference (r=52)
-let selSsid = null, pollTimer = null;
+const TWO_PI_R = 2 * Math.PI * 52;
+let selSsid = null, pollTimer = null, CFG = {};
+
+/* Real RTKdata brand mark (icon.svg): white detail + blue->violet gradient pin.
+   Inlined (no <use>, no external ref) so it renders everywhere incl. mobile. */
+function logo(gid){
+  return '<svg viewBox="0 0 790 1000" width="100%" height="100%" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'+
+   '<defs><linearGradient id="'+gid+'" gradientUnits="userSpaceOnUse" x1="35.8" y1="493" x2="1069" y2="493">'+
+   '<stop offset=".15" stop-color="#1669EF"/><stop offset=".35" stop-color="#1B62EB"/>'+
+   '<stop offset=".63" stop-color="#2B50E0"/><stop offset=".86" stop-color="#3C3CD3"/></linearGradient></defs>'+
+   '<path fill="#fff" d="M786.9,396.9c0,14.9-1.7,31.1-5.2,48.1l-0.5,1.9l-8.6,32.3l-0.2,0.8c-0.7,2.2-1.4,4.4-2.2,6.6c-0.7,2-1.4,4.1-2.1,6.1c-72.9,205-338.7,468.4-350.1,479.8L395,995l-22.9-22.6C357,957.6,3.1,606.6,3.1,396.9c0-37.4,5.2-74.2,15.5-109.4l0.6-1.9l15.2-42.4l0.3-0.9c0.4-1.1,1-2.3,1.5-3.4c6.1-13.7,12.8-26.9,20.2-39.6C126.1,79.9,254.4,5,395,5C611.1,5,786.9,180.8,786.9,396.9z"/>'+
+   '<path fill="url(#'+gid+')" d="M395,37.7c-94.1,0-179.9,36.2-244,95.6c-36.7,33.9-66.2,75.4-86.2,121.9v0L50,296.7c-9.3,31.7-14.2,65.4-14.2,100.3C35.8,595.3,395,949.1,395,949.1s175.7-173,281.3-345c28.2-45.9,51.4-91.7,64.9-134.1l8.4-31.5c3-14.4,4.6-28.4,4.6-41.5C754.2,198.5,593.4,37.7,395,37.7z"/>'+
+   '<path fill="#fff" d="M533,199.9l-19.6-11.2c-55.3,15.2-86.3,23.5-141.6,38.7l-37,65l-0.1,0.1l-27,47.3l-0.1,0.1l-2.9,5c-31.4,55.2-12.4,125.1,42.4,156.8c0,0,0.1,0,0.1,0.1c0.1,0,0.3,0.1,0.4,0.2c0.1,0.1,0.3,0.1,0.4,0.3c55.3,31.1,125.2,12,156.6-43.2l3-5l26.9-47.4l37.1-64.9C556.8,286.2,548.3,255.2,533,199.9z M456.5,277.7c18.1,0,32.8,14.8,32.8,32.9c0,18.2-14.7,32.9-32.8,32.9c-18.2,0-32.9-14.7-32.9-32.9C423.6,292.4,438.3,277.7,456.5,277.7z"/>'+
+   '<path fill="#fff" d="M388,649c29.5-51.7,11.5-117.6-40.2-147.1s-117.6-11.5-147.1,40.2L388,649z"/>'+
+   '<path fill="#fff" d="M770.2,486.6c-0.7,2-1.4,4.1-2.1,6.1l-90.7,112.1l-1.2-0.7l-150.8-86l23.3-40.9l25.9-45.4c0.4-0.6,0.8-1.3,1.2-1.9c13.9-22.2,43-29.6,66.1-16.5l99.2,56.6L770.2,486.6z"/>'+
+   '<path fill="#fff" d="M292.6,270.9l-49.2,86.2L36.2,239c6-13.7,12.8-26.9,20.2-39.6l94.6-66.1l123.1,70.2C297.8,217.1,306.1,247.3,292.6,270.9z"/>'+
+   '<rect x="225.9" y="349" transform="matrix(0.8686 0.4955 -0.4955 0.8686 242.5227 -162.0511)" fill="#fff" width="401.8" height="54.5"/>'+
+   '<path fill="#fff" d="M300.8,669.3c-17.1,0-33.8-5.3-48.1-15.5c-21.5-15.4-34.5-40.4-34.7-66.9l18.9-0.1c0.2,20.4,10.2,39.7,26.8,51.6c16.3,11.6,36.6,15,55.8,9.2l5.5,18.2C317,668.1,308.8,669.3,300.8,669.3z"/>'+
+   '<path fill="#fff" d="M293.6,724.2c-24.7,0-48.9-7.7-69.6-22.5c-31.1-22.3-49.8-58.4-50.2-96.7l18.9-0.1c0.3,32.2,16,62.7,42.2,81.4c25.7,18.4,57.8,23.7,88.1,14.6l5.5,18.1C317,722.4,305.3,724.2,293.6,724.2z"/>'+
+   '</svg>';
+}
 
 async function api(path, opts){
   const r = await fetch(path, Object.assign({cache:"no-store"}, opts||{}));
@@ -261,50 +279,64 @@ async function api(path, opts){
   const t = (r.headers.get("content-type")||"");
   return t.includes("json") ? r.json() : r.text();
 }
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function setState(txt, cls){ $("#stateTxt").textContent = txt;
+  $("#statePill").className = "pill" + (cls?(" "+cls):"") + (cls==="green"?" live":""); }
+function fmtDur(s){ if(s==null) return "–"; s=s|0;
+  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60);
+  return h>0 ? h+"h "+m+"m" : (m>0? m+"m "+(s%60)+"s" : s+"s"); }
 
-function setHeader(state, cls){ $("#hdrState").textContent = state;
-  $("#hdrDot").className = "dot"+(cls?(" "+cls):""); }
-
-function steps(n){ document.querySelectorAll("#steps .s").forEach((el,i)=>{
-  el.className = "s" + (i < n-1 ? " done" : (i === n-1 ? " on" : "")); }); }
-
-function go(n){
-  ["step1","step2","step2b","step3","step4"].forEach(id => $("#"+id).classList.add("hidden"));
-  const map = {1:"step1",2:"step2","2.5":"step2b",3:"step3",4:"step4"};
-  $("#"+map[n]).classList.remove("hidden");
-  steps(Math.ceil(n));
-  if(n === 2) scan();
-  if(n === 4) startStatusPoll();
-  window.scrollTo(0,0);
+/* ---------------- mode routing ---------------- */
+async function boot(){
+  $("#logoHead").innerHTML = logo("lgH");
+  $("#logoHero").innerHTML = logo("lgB");
+  await loadIdentity();
+  let st = null;
+  try{ st = await api("/status"); }catch(e){}
+  const via = st && st.via;
+  const sta = st && st.wifi && st.wifi.sta;
+  const connected = sta && sta.connected && sta.ip4;
+  const mode = (via === "ap") ? "setup" : (via === "sta") ? "dash" : (connected ? "dash" : "setup");
+  if(mode === "dash") enterDash(); else enterSetup();
 }
+function show(id){ $("#setup").classList.toggle("hidden", id!=="setup");
+  $("#dash").classList.toggle("hidden", id!=="dash"); }
+function enterSetup(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null;} show("setup"); setState("Setup"); go(1); }
+function enterDash(){ show("dash"); setState("Online","green"); startStatusPoll(); }
 
-/* ---------- identity ---------- */
 async function loadIdentity(){
   try{
-    const cfg = await api("/config");
-    if(cfg.version){ $("#fwv").textContent = String(cfg.version).replace(/^v/,""); }
-    if(cfg.w_ap_ssid){ $("#devId").textContent = cfg.w_ap_ssid; }
-    $("#devMeta").textContent = "Firmware " + (cfg.version||"-") + "  -  UM980 reference base";
-  }catch(e){ /* setup AP may answer slowly; ignore */ }
+    CFG = await api("/config") || {};
+    if(CFG.version){ $("#fwv").textContent = String(CFG.version).replace(/^v/,""); }
+    if(CFG.w_ap_ssid){ $("#devId").textContent = CFG.w_ap_ssid; }
+    $("#devMeta").textContent = "Firmware " + (CFG.version||"–") + " · UM980 reference base";
+  }catch(e){}
 }
 
-/* ---------- wifi scan ---------- */
+/* ============================ SETUP WIZARD ============================ */
+function steps(n){ document.querySelectorAll("#steps .s").forEach((el,i)=>{
+  el.className = "s" + (i < n-1 ? " done" : (i === n-1 ? " on" : "")); }); }
+function go(n){
+  ["step1","step2","step2b","step3"].forEach(id => $("#"+id).classList.add("hidden"));
+  const map = {1:"step1",2:"step2","2.5":"step2b",3:"step3"};
+  $("#"+map[n]).classList.remove("hidden");
+  steps(Math.min(3, Math.ceil(n)));
+  if(n === 2) scan();
+  window.scrollTo(0,0);
+}
 function barsHtml(rssi){
-  // rssi dBm ~ -30 (great) .. -90 (poor) -> 0..4 bars
   const lvl = rssi >= -55 ? 4 : rssi >= -65 ? 3 : rssi >= -75 ? 2 : rssi >= -85 ? 1 : 0;
-  let h = '<div class="bars" aria-label="'+rssi+' dBm">';
+  let h = '<div class="bars">';
   for(let i=0;i<4;i++){ h += '<i class="'+(i<lvl?"on":"")+'" style="height:'+(5+i*4)+'px"></i>'; }
   return h + '</div>';
 }
-function lockIcon(auth){
-  if(!auth || /open/i.test(auth)) return '';
-  return '<span class="lock" title="'+escapeHtml(auth)+'"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><rect x="5" y="11" width="14" height="9" rx="2" stroke="#5b7185" stroke-width="1.6"/><path d="M8 11V8a4 4 0 0 1 8 0v3" stroke="#5b7185" stroke-width="1.6"/></svg></span>';
-}
+function lockIcon(auth){ if(!auth || /open/i.test(auth)) return '';
+  return '<span class="lock"><svg width="13" height="13" viewBox="0 0 24 24" fill="none"><rect x="5" y="11" width="14" height="9" rx="2" stroke="#737373" stroke-width="1.6"/><path d="M8 11V8a4 4 0 0 1 8 0v3" stroke="#737373" stroke-width="1.6"/></svg></span>'; }
 async function scan(){
-  $("#netList").innerHTML = '<div class="center"><div class="spin"></div><div class="sub">Scanning...</div></div>';
+  $("#netList").innerHTML = '<div class="center"><div class="spin"></div><div class="sub">Scanning…</div></div>';
   try{
-    let nets = await api("/wifi/scan");
-    if(!Array.isArray(nets)) nets = [];
+    let nets = await api("/wifi/scan"); if(!Array.isArray(nets)) nets = [];
     const best = {};
     for(const n of nets){ if(!n.ssid) continue;
       if(!(n.ssid in best) || n.rssi > best[n.ssid].rssi) best[n.ssid] = n; }
@@ -312,156 +344,155 @@ async function scan(){
     if(!list.length){ $("#netList").innerHTML = '<p class="sub">No networks found. Move closer to your router and rescan.</p>'; return; }
     $("#netList").innerHTML = list.map(n =>
       '<div class="net" tabindex="0" role="button" data-ssid="'+escapeHtml(n.ssid)+'" data-auth="'+escapeHtml(n.authmode||"")+'">'+
-        barsHtml(n.rssi)+
-        '<span class="ssid">'+escapeHtml(n.ssid)+'</span>'+
-        lockIcon(n.authmode)+
-      '</div>').join("");
+        barsHtml(n.rssi)+'<span class="ssid">'+escapeHtml(n.ssid)+'</span>'+lockIcon(n.authmode)+'</div>').join("");
     document.querySelectorAll("#netList .net").forEach(el =>
       el.addEventListener("click", () => pick(el.getAttribute("data-ssid"), el.getAttribute("data-auth"))));
-  }catch(e){
-    $("#netList").innerHTML = '<p class="sub">Scan failed. <a href="#" onclick="scan();return false">Try again</a>.</p>';
-  }
+  }catch(e){ $("#netList").innerHTML = '<p class="sub">Scan failed. <a href="#" onclick="scan();return false">Try again</a>.</p>'; }
 }
 function pick(ssid, auth){
-  selSsid = ssid;
-  $("#pwSsid").textContent = ssid;
-  $("#wifiPass").value = "";
-  // open networks: connect straight away
+  selSsid = ssid; $("#pwSsid").textContent = ssid; $("#wifiPass").value = "";
   if(!auth || /open/i.test(auth)){ connect(); return; }
-  go(2.5);
-  setTimeout(()=>$("#wifiPass").focus(), 200);
+  go(2.5); setTimeout(()=>$("#wifiPass").focus(), 200);
 }
 function manualToggle(){
   const w = $("#manualWrap"); w.classList.toggle("hidden");
-  if(!w.classList.contains("hidden")){
-    const i = $("#manualSsid"); i.focus();
+  if(!w.classList.contains("hidden")){ const i = $("#manualSsid"); i.focus();
     i.onkeydown = e => { if(e.key==="Enter" && i.value.trim()){
-      selSsid = i.value.trim(); $("#pwSsid").textContent = selSsid; $("#wifiPass").value=""; go(2.5); } };
-  }
+      selSsid = i.value.trim(); $("#pwSsid").textContent = selSsid; $("#wifiPass").value=""; go(2.5); } }; }
 }
 function togglePw(){ const i=$("#wifiPass"); i.type = i.type==="password"?"text":"password"; }
-
-/* ---------- connect ---------- */
 async function connect(){
   const pass = $("#wifiPass") ? $("#wifiPass").value : "";
   const btn = $("#connectBtn"); if(btn) btn.disabled = true;
-  try{
-    await api("/config", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ w_sta_active:"1", w_sta_ssid: selSsid, w_sta_pass: pass })});
-  }catch(e){ /* device restarts right after POST; aborted fetch is expected */ }
-  go(3);
-  $("#connTitle").textContent = "Joining " + selSsid + "...";
+  try{ await api("/config", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ w_sta_active:"1", w_sta_ssid: selSsid, w_sta_pass: pass })}); }catch(e){}
+  go(3); $("#connTitle").textContent = "Joining " + selSsid + "…"; setState("Connecting","amber");
   waitForOnline();
 }
 function waitForOnline(){
   let tries = 0;
-  const tick = async () => {
-    tries++;
-    try{
-      const st = await api("/status");
-      const sta = st.wifi && st.wifi.sta;
-      if(sta && sta.connected && sta.ip4){
-        $("#staIp").textContent = sta.ip4;
-        $("#onlineSub").textContent = "Connected to " + (sta.ssid||selSsid) + " - " + sta.ip4;
-        setHeader("Online","live");
-        go(4);
-        return;
-      }
-      $("#connSub").textContent = "Reconnecting to the station... (" + tries + ")";
-    }catch(e){
-      $("#connSub").textContent = "Station is restarting... stay on its Wi-Fi if asked. (" + tries + ")";
-    }
+  const tick = async () => { tries++;
+    try{ const st = await api("/status"); const sta = st.wifi && st.wifi.sta;
+      if(sta && sta.connected && sta.ip4){ enterDash(); return; }
+      $("#connSub").textContent = "Reconnecting to the station… (" + tries + ")";
+    }catch(e){ $("#connSub").textContent = "Station is restarting… stay on its Wi-Fi if asked. (" + tries + ")"; }
     if(tries < 60) setTimeout(tick, 2500);
     else $("#connSub").textContent = "Taking longer than expected. Check the RTKdata dashboard for this station.";
   };
-  setTimeout(tick, 3500);  // give the device time to reboot after the config POST
+  setTimeout(tick, 3500);
 }
 
-/* ---------- online status + 48h maturing ---------- */
-function setRing(pct){
-  pct = Math.max(0, Math.min(100, pct));
+/* ============================ DASHBOARD ============================ */
+function setRing(pct){ pct = Math.max(0, Math.min(100, pct));
   $("#ringFg").style.strokeDasharray = TWO_PI_R.toFixed(1);
   $("#ringFg").style.strokeDashoffset = (TWO_PI_R * (1 - pct/100)).toFixed(1);
-  $("#ringPct").textContent = Math.round(pct) + "%";
-}
-function fmtDur(s){ if(s==null) return "-";
-  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60);
-  return h>0 ? h+"h "+m+"m" : m+"m"; }
-function fixLabel(f){ return ({0:"No fix",1:"Single",2:"DGPS",4:"RTK Fix",5:"RTK Float"})[f] || (f||"-"); }
+  $("#ringPct").textContent = Math.round(pct) + "%"; }
+function pill(cls, txt){ return '<span class="pill '+cls+'"><span class="dot"></span>'+escapeHtml(txt)+'</span>'; }
 
 function startStatusPoll(){
   if(pollTimer) clearInterval(pollTimer);
   const poll = async () => {
-    try{
-      const st = await api("/status");
-      $("#qUp").textContent = fmtDur(st.uptime);
-      let rate = 0;
-      if(st.streams){
-        const s0 = st.streams.ntrip_server_0 || st.streams.ntrip_server || st.streams.uart;
-        if(s0 && s0.rate) rate = s0.rate.out || s0.rate.in || 0;
-      }
-      $("#qRate").innerHTML = (rate|0) + '<small> B/s</small>';
-      const sta = st.wifi && st.wifi.sta;
-      if(sta && sta.ip4) $("#staIp").textContent = sta.ip4;
-    }catch(e){}
-    try{ renderMaturing(await api("/rtk/status")); }
-    catch(e){ renderMaturing(null); }
+    let st=null, rtk=null;
+    try{ st = await api("/status"); }catch(e){}
+    try{ rtk = await api("/rtk/status"); }catch(e){}
+    renderDash(st, rtk);
   };
-  poll();
-  pollTimer = setInterval(poll, 5000);
+  poll(); pollTimer = setInterval(poll, 5000);
 }
+function renderDash(st, rtk){
+  if(st){
+    $("#qUp").textContent = fmtDur(st.uptime);
+    let rIn = 0, rOut = 0;
+    if(st.streams){ for(const k in st.streams){ const s0=st.streams[k];
+      if(s0 && s0.rate){ rIn = Math.max(rIn, s0.rate.in||0); rOut = Math.max(rOut, s0.rate.out||0); } } }
+    $("#qRate").innerHTML = (rIn|0) + '<small> B/s</small>';
+    $("#qOut").innerHTML = (rOut|0) + '<small> B/s</small>';
+    if(st.heap && st.heap.free!=null) $("#hHeap").innerHTML = Math.round(st.heap.free/1024) + '<small> KB</small>';
+    const sta = st.wifi && st.wifi.sta;
+    if(sta && sta.connected){
+      $("#iSsid").textContent = sta.ssid || "–";
+      $("#iIp").textContent = sta.ip4 || "–";
+      $("#iRssi").textContent = (sta.rssi!=null ? sta.rssi + " dBm" : "–");
+      $("#footIp").textContent = sta.ip4 || "";
+    }
+  }
+  /* station identity from /config (mountpoint + caster live in NVS) */
+  if(CFG.ntr_srv_mp) $("#iMp").textContent = CFG.ntr_srv_mp;
+  if(CFG.ntr_srv_host) $("#iCaster").textContent = CFG.ntr_srv_host + (CFG.ntr_srv_port?(":"+CFG.ntr_srv_port):"");
 
-function renderMaturing(r){
-  // graceful: before provisioning.c exists, /rtk/status 404s -> "provisioning starting"
-  if(!r){
-    setHeader("Online","live");
-    $("#matureState").textContent = "Provisioning";
-    $("#matureMsg").textContent = "Station is online. Enrollment with the RTKdata network begins shortly.";
-    setRing(0);
-    $("#qSats").textContent = "-"; $("#qFix").textContent = "-";
-    $("#qualTags").innerHTML = '<span class="tag warn">Awaiting enrollment</span>';
+  if(!rtk){
+    setState("Online","green");
+    $("#dState").textContent = "Provisioning";
+    $("#dMsg").textContent = "Station is online. Enrollment with the RTKdata network begins shortly.";
+    setRing(0); $("#qPos").textContent = "Survey-in";
+    $("#dTags").innerHTML = pill("green","Base mode") + pill("amber","Awaiting enrollment");
     return;
   }
-  const q = r.quality || {};
-  $("#qSats").textContent = q.sats!=null ? q.sats : "-";
-  $("#qFix").textContent  = fixLabel(q.fix);
-  setRing(r.progress_pct || 0);
+  setRing(rtk.progress_pct || 0);
+  if(rtk.station_id) $("#iId").textContent = rtk.station_id;
+  else if(CFG.rtk_dev_id) $("#iId").textContent = CFG.rtk_dev_id;
+  else if(st && st.wifi && st.wifi.ap && st.wifi.ap.ssid) $("#iId").textContent = st.wifi.ap.ssid;
 
-  const state = (r.state||"provisioning");
+  const state = (rtk.state||"provisioning");
+  const pos = rtk.position || {};
+  const phase = pos.phase || "";                 // locked | computing | awaiting_survey
+  const blocking = rtk.blocking || "";           // clean_window | precise_position
+  const eta = fmtDur(rtk.matures_in_s);          // honest "until live" = the binding gate
   if(state === "active"){
-    setHeader("Live","live");
-    $("#matureState").textContent = "Live on RTKdata";
-    $("#matureMsg").innerHTML = "This station is part of the live network." +
-      (r.station_id ? " ID <b>"+escapeHtml(r.station_id)+"</b>." : "");
+    setState("Live","green");
+    $("#dState").textContent = "Live on RTKdata";
+    $("#dMsg").innerHTML = "This station is part of the live network."+(rtk.station_id?" ID <b>"+escapeHtml(rtk.station_id)+"</b>.":"");
     setRing(100);
   } else if(state === "maturing"){
-    setHeader("Maturing","warn");
-    $("#matureState").textContent = "Locking position";
-    $("#matureMsg").textContent = "Computing the exact coordinates server-side. ~" +
-      fmtDur(r.matures_in_s) + " of clean data remaining before this station goes live.";
+    setState("Maturing","amber");
+    // Two gates must BOTH clear: a clean 48h data window AND a precise position
+    // (server-side PPP solve). Show whichever is furthest out, with an honest ETA.
+    if(blocking === "precise_position" || phase === "computing"){
+      $("#dState").textContent = "Computing position";
+      $("#dMsg").textContent = "Survey data captured. The exact position is being computed server-side from precise satellite products · "+(rtk.progress_pct||0)+"% · goes live in ~"+eta+".";
+    } else {
+      $("#dState").textContent = "Surveying in";
+      $("#dMsg").textContent = "Collecting a clean 48h data window · "+(rtk.progress_pct||0)+"% · ~"+eta+" until live.";
+    }
   } else {
-    setHeader("Provisioning","warn");
-    $("#matureState").textContent = "Provisioning";
-    $("#matureMsg").textContent = "Enrolling with the RTKdata network and verifying the data stream.";
+    setState("Provisioning","amber");
+    $("#dState").textContent = "Provisioning";
+    if(phase === "computing"){
+      $("#dMsg").textContent = "Survey captured · computing the exact position server-side · goes live in ~"+eta+".";
+    } else if(phase === "awaiting_survey"){
+      $("#dMsg").textContent = rtk.enrolled ? "Enrolled · waiting for the first survey capture." : "Enrolling with the RTKdata network.";
+    } else {
+      $("#dMsg").textContent = rtk.enrolled ? "Enrolled · verifying the data stream." : "Enrolling with the RTKdata network.";
+    }
   }
-  const tags = [];
-  if(q.sats!=null) tags.push(tag(q.sats>=20?"good":q.sats>=12?"warn":"bad", q.sats+" sats"));
-  if(q.fix!=null)  tags.push(tag(q.fix===4?"good":"warn", fixLabel(q.fix)));
-  if(r.data_ok!=null) tags.push(tag(r.data_ok?"good":"bad", r.data_ok?"Stream OK":"Stream gap"));
-  if(r.position && r.position.valid) tags.push(tag("good","Position locked"));
-  $("#qualTags").innerHTML = tags.join("");
-  if(r.position && r.position.valid){
-    $("#posText").textContent = "Server-computed position: " +
-      Number(r.position.lat).toFixed(7) + ", " + Number(r.position.lon).toFixed(7);
+  if(pos.valid){
+    $("#qPos").textContent = pos.lat.toFixed(6)+", "+pos.lon.toFixed(6) + (pos.h!=null?(" · "+pos.h.toFixed(1)+" m"):"");
+  } else {
+    $("#qPos").textContent = state==="active" ? "Locked"
+      : phase==="computing" ? "Computing…"
+      : state==="maturing" ? "Surveying in…" : "Survey-in";
+  }
+
+  /* base-station status tags (no rover sats/fix: this is a static base) */
+  const tags = [pill("green","Base mode")];
+  if(rtk.data_ok!=null) tags.push(pill(rtk.data_ok?"green":"amber", rtk.data_ok?"Streaming":"Not streaming"));
+  if(pos.valid) tags.push(pill("green","Surveyed in ✓"));
+  else if(phase==="computing") tags.push(pill("amber","Position: computing"));
+  else if(phase==="awaiting_survey") tags.push(pill("amber","Awaiting survey"));
+  $("#dTags").innerHTML = tags.join("");
+
+  /* self-healing supervisor */
+  const sh = rtk.self_heal;
+  if(sh){
+    $("#healthTags").innerHTML =
+      pill(sh.gnss_ok?"green":"red","GNSS") + pill(sh.caster_ok?"green":"red","Caster") + pill(sh.link_ok?"green":"red","Link");
+    $("#hRec").textContent = ((sh.rec_gnss||0)+(sh.rec_caster||0)+(sh.rec_wifi||0));
+    $("#hReb").textContent = (sh.reboots||0);
   }
 }
-function tag(cls, txt){ return '<span class="tag '+cls+'">'+escapeHtml(txt)+'</span>'; }
-function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c =>
-  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
-/* ---------- boot ---------- */
-loadIdentity();
-setHeader("Setup");
+setState("Loading");
+boot();
 </script>
 </body>
 </html>

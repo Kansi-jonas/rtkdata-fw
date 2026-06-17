@@ -1,0 +1,36 @@
+name: build
+
+# CI gate: compile the firmware on every push/PR and expose the OTA artifacts
+# (rtkdata-fw.bin + www.bin) as workflow artifacts. This is what makes "source ->
+# binaries" reproducible; the release workflow publishes them to the OTA channel.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ESP-IDF build (v5.3.1, esp32)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.1
+          target: esp32
+          path: '.'
+
+      - name: Collect OTA artifacts
+        run: |
+          mkdir -p out
+          cp build/rtkdata-fw.bin out/
+          cp build/www.bin out/
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtkdata-fw-${{ github.sha }}
+          path: out/*.bin
+          if-no-files-found: error
