@@ -7,6 +7,7 @@
 ESP_EVENT_DECLARE_BASE(OTA_EVENT);
 
 void ota_update_init();
+void ota_boot_check(void);
 void ota_check_newupdate(void *pvParameter);
 void ota_schedule_check_newupdate(void *pvParameter);
 

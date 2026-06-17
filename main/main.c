@@ -20,6 +20,7 @@
 #include <status_led.h>
 #include <interface/socket_client.h>
 #include <esp_sntp.h>
+#include <time.h>
 #include <core_dump.h>
 #include <esp_ota_ops.h>
 #include <stream_stats.h>
@@ -174,12 +175,34 @@ void app_main()
     net_init();
 
     wifi_init();
-    
-    ota_update_init();
 
+    ota_update_init();          // SPIFFS mount (web server serves from it)
+
+    gnss_init();                // UM980 UART config (no heap/TLS) - configure receiver early
+
+    // The OTA must run BEFORE the data plane: at boot ~136 KB heap is free, vs
+    // only ~58 KB once NTRIP sockets + the provisioning HTTPS heartbeat + the web
+    // server are up -- and the OTA's TLS download OOM-PANICKED at ~58 KB (v1.0.1
+    // crash loop). So: wait for STA IP + a synced clock (TLS cert validity), then
+    // check+install synchronously with full heap. It reboots into the new version
+    // if one is published; otherwise we fall through and bring the data plane up.
+    wait_for_ip();
+
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
+    sntp_set_time_sync_notification_cb(sntp_time_set_handler);
+    esp_sntp_init();
+
+    // bounded wait (<=10s) for the clock so the OTA TLS cert validity check passes
+    for (int i = 0; i < 20 && time(NULL) < 1700000000; i++) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    ota_boot_check();           // installs + reboots if a newer version exists; else returns
+
+    // ---- data plane (brought up only after the OTA window) ----
     ntrip_server_init();
-
-    gnss_init();
 
     web_server_init();
 
@@ -191,25 +214,16 @@ void app_main()
     supervisor_init();
     provisioning_init();
 
+    check_count_webhandler();
+
     uart_nmea("$PESP,INIT,COMPLETE");
 
     ESP_LOGI(TAG,"main heap_size = %ld\r\n", esp_get_free_heap_size());
 
-    wait_for_ip();
-
-    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
-    sntp_set_time_sync_notification_cb(sntp_time_set_handler);
-    esp_sntp_init();
-
-    check_count_webhandler();
-
-    // update firmware
-    ESP_LOGI(TAG,"Start updater tasks for checking new version");
-    
-    xTaskCreate(&ota_check_newupdate, "OTA_Check_Task", 4096, NULL, 5, NULL);
-    xTaskCreate(&ota_schedule_check_newupdate, "OTA_Check_Task", 4096, NULL, 5, NULL);
+    // Daily OTA poll: lightweight manifest check; reboots ONLY when a newer
+    // version is published (then ota_boot_check installs it at full heap). No new
+    // version -> no restart.
+    xTaskCreate(&ota_schedule_check_newupdate, "OTA_Sched_Task", 4096, NULL, 5, NULL);
 
 #ifdef DEBUG_HEAP
     while (true) {

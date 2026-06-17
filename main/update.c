@@ -42,11 +42,41 @@ void send_update_completed() {
     esp_event_post_to(ota_event_loop, OTA_EVENT, OTA_EVENT_UPDATE_COMPLETED, NULL, 0, portMAX_DELAY);
 }
 
+// A download needs the full mbedtls TLS + flash buffers. With the data plane up
+// (NTRIP sockets, the provisioning HTTPS heartbeat, the web server) only ~58 KB
+// remained free and the OTA's TLS handshake OOM-PANICKED -> crash loop. The
+// boot check runs before the data plane (~136 KB free); this guard is the
+// belt-and-suspenders: if heap is ever below this, defer GRACEFULLY (return,
+// keep running) instead of crashing.
+#define MIN_OTA_HEAP (110 * 1024)
+
+// true iff 'cand' is a strictly newer dotted version than 'cur' ("1.0.2">"1.0.1").
+// Prevents downgrades (channel older than the running build) re-flashing in a
+// loop. Unparseable -> fall back to "any change" so an update is still possible.
+static bool ota_version_is_newer(const char *cand, const char *cur) {
+    int ca[3] = {0, 0, 0}, cu[3] = {0, 0, 0};
+    int nca = sscanf(cand, "%d.%d.%d", &ca[0], &ca[1], &ca[2]);
+    int ncu = sscanf(cur,  "%d.%d.%d", &cu[0], &cu[1], &cu[2]);
+    if (nca < 1 || ncu < 1) return strcmp(cand, cur) != 0;
+    for (int i = 0; i < 3; i++) {
+        if (ca[i] > cu[i]) return true;
+        if (ca[i] < cu[i]) return false;
+    }
+    return false;
+}
+
 esp_err_t ota_update_firmware(const char *url) {
 
     esp_err_t err = ESP_FAIL;
 
     ESP_LOGI(TAG, "Beginn update file from url: %s", url);
+
+    size_t free_heap = esp_get_free_heap_size();
+    if (free_heap < MIN_OTA_HEAP) {
+        ESP_LOGE(TAG, "free heap %u < %u needed for OTA -> deferring (no crash)",
+                 (unsigned)free_heap, (unsigned)MIN_OTA_HEAP);
+        return ESP_FAIL;
+    }
 
     // start http client
     esp_http_client_config_t http_config = {
@@ -268,6 +298,13 @@ esp_err_t update_SPIFFS(const char *url) {
     ESP_LOGI(TAG, "Beginn update spiffs file from url: %s", url);
 
     esp_err_t err = ESP_FAIL;
+
+    size_t free_heap = esp_get_free_heap_size();
+    if (free_heap < MIN_OTA_HEAP) {
+        ESP_LOGE(TAG, "free heap %u < %u needed for SPIFFS OTA -> deferring (no crash)",
+                 (unsigned)free_heap, (unsigned)MIN_OTA_HEAP);
+        return ESP_FAIL;
+    }
 
     // start http client
     esp_http_client_config_t http_config = {
@@ -606,6 +643,44 @@ cJSON* ota_fetch_json_from_url(){
 
 }
 
+// Synchronous one-shot OTA check, run at BOOT before the data plane (NTRIP /
+// provisioning / web server) starts. At that point ~136 KB heap is free, so the
+// heavy TLS download has room -- vs ~58 KB once the data plane is up, which
+// OOM-crashed the in-task download. If a strictly newer version is published it
+// downloads + applies + reboots (never returns); otherwise it returns and the
+// caller proceeds to bring up the data plane.
+void ota_boot_check(void) {
+
+    ESP_LOGI(TAG, "boot OTA check (free heap=%u)", (unsigned)esp_get_free_heap_size());
+
+    cJSON *jsonFile = ota_fetch_json_from_url();
+
+    if (!jsonFile) {
+        ESP_LOGW(TAG, "boot OTA check: no manifest reachable, skipping");
+        return;
+    }
+
+    cJSON *version_json = cJSON_GetObjectItem(jsonFile, "version");
+    cJSON *files_json   = cJSON_GetObjectItem(jsonFile, "update_files_urls");
+
+    if (cJSON_IsString(version_json) && cJSON_IsArray(files_json)) {
+
+        const char *new_version = version_json->valuestring;
+
+        if (ota_version_is_newer(new_version, FW_VERSION)) {
+
+            ESP_LOGI(TAG, "newer version %s > %s -> updating at boot (full heap)", new_version, FW_VERSION);
+            updateFirmware(files_json);   // downloads, applies, esp_restart() -> no return
+        } else {
+            ESP_LOGI(TAG, "no newer version (channel=%s current=%s)", new_version, FW_VERSION);
+        }
+    } else {
+        ESP_LOGE(TAG, "boot OTA check: invalid manifest (missing version/urls)");
+    }
+
+    cJSON_Delete(jsonFile);
+}
+
 void ota_check_newupdate(void *pvParameter) {
 
     while (true) {
@@ -660,28 +735,51 @@ void ota_check_newupdate(void *pvParameter) {
 
 }
 
+// Daily OTA poll. Does a LIGHTWEIGHT manifest fetch only (one small ~1 KB HTTPS
+// GET, which runs fine even with the data plane up); it reboots ONLY when a
+// strictly newer version is actually published, so the heavy download then runs
+// at boot with full heap. No new version -> NO restart (zero reboots in normal
+// operation; the device only reboots to install a real update).
 void ota_schedule_check_newupdate(void *pvParameter){
 
-    ESP_LOGI(TAG, "start scheduler for checking new updates");
+    ESP_LOGI(TAG, "OTA daily-check scheduler started");
+
+    bool checked_this_minute = false;
 
     while (true) {
-        
-        // get the current time
+
         time_t now;
         struct tm timeinfo;
         time(&now);
         localtime_r(&now, &timeinfo);
 
-        // check the time for update
         if (timeinfo.tm_hour == 0 && timeinfo.tm_min == 0) {
 
-            ESP_LOGI(TAG, "It's time: %id:%id to OTA check for new firmware version",timeinfo.tm_hour,timeinfo.tm_min);
+            if (!checked_this_minute) {
+                checked_this_minute = true;
+                ESP_LOGI(TAG, "daily OTA check (free heap=%u)", (unsigned)esp_get_free_heap_size());
 
-            checkUpdates = true;
+                cJSON *jsonFile = ota_fetch_json_from_url();
+                if (jsonFile) {
+                    cJSON *v = cJSON_GetObjectItem(jsonFile, "version");
+                    bool newer = cJSON_IsString(v) && ota_version_is_newer(v->valuestring, FW_VERSION);
+                    if (newer) {
+                        ESP_LOGI(TAG, "newer version %s available -> restart to install at boot (full heap)", v->valuestring);
+                    }
+                    cJSON_Delete(jsonFile);
+                    if (newer) {
+                        vTaskDelay(pdMS_TO_TICKS(300));
+                        esp_restart();   // boot OTA check downloads + applies with full heap
+                    }
+                } else {
+                    ESP_LOGW(TAG, "daily OTA check: manifest not reachable");
+                }
+            }
+        } else {
+            checked_this_minute = false;
         }
 
-        // wait one minute until next check
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        vTaskDelay(pdMS_TO_TICKS(30000));
     }
 }
 
