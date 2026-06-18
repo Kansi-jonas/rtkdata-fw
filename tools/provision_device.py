@@ -111,7 +111,13 @@ def main() -> None:
     chip = normalize_chip_id(mac)
     print(f"chip_id     : {chip}")
     print(f"key_version : {args.key_version}")
-    print(f"enroll_key  : {enroll_key}")
+    # Do NOT print the full enroll_key (it is a per-device secret). A short
+    # fingerprint is enough to match/verify without leaking it. Use --show-key
+    # to print it in full (e.g. for manual NVS entry) on a trusted terminal.
+    if args.show_key:
+        print(f"enroll_key  : {enroll_key}")
+    else:
+        print(f"enroll_key  : {enroll_key[:8]}... (suppressed; full key written to NVS)")
 
     build_nvs_bin(enroll_key, args.key_version, args.out)
     print(f"nvs image   : {args.out}  (namespace='{NVS_NAMESPACE}', size {NVS_SIZE})")
