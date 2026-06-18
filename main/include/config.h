@@ -240,6 +240,11 @@ typedef struct config_item {
 #define KEY_RTK_STATION_TOK "rtk_sta_tok"
 #define KEY_RTK_STATE "rtk_state"
 #define KEY_RTK_OTA_BASE "rtk_ota_base"
+// Per-device enroll key (64-hex), provisioned into NVS at flash time from a
+// server-only master. Replaces the baked fleet secret. See
+// docs/enroll-per-device-key.md. NEVER in the .bin / repo.
+#define KEY_RTK_ENROLL_KEY "rtk_enr_key"
+#define KEY_RTK_KEY_VER "rtk_key_ver"
 
 // Bump on every OTA release. update.c compares this against ota/release.json's
 // "version" with an EXACT strcmp, so the published build MUST self-report the

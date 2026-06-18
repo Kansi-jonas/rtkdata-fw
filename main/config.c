@@ -611,6 +611,17 @@ const config_item_t CONFIG_ITEMS[] = {
                 .key = KEY_RTK_OTA_BASE,
                 .type = CONFIG_ITEM_TYPE_STRING,
                 .def.str = ""
+        }, {
+                // Per-device enroll key (64-hex), written at flash time. Secret:
+                // never logged / exported. Empty default = unprovisioned.
+                .key = KEY_RTK_ENROLL_KEY,
+                .type = CONFIG_ITEM_TYPE_STRING,
+                .secret = true,
+                .def.str = ""
+        }, {
+                .key = KEY_RTK_KEY_VER,
+                .type = CONFIG_ITEM_TYPE_UINT8,
+                .def.uint8 = 1
         },
 };
 

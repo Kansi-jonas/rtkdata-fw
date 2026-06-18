@@ -40,12 +40,13 @@
 
 #define TAG "PROVISION"
 
-/* Bootstrap secret used to HMAC the enroll request. Provisioned per fleet at
- * build/flash time (CI injects it); the per-station token returned by enroll is
- * used for subsequent heartbeats. Placeholder here - do NOT ship as-is. */
-#ifndef RTK_ENROLL_SECRET
-#define RTK_ENROLL_SECRET "REPLACE_WITH_FLEET_PROVISIONING_SECRET"
-#endif
+/* Enrollment auth: the enroll request is HMAC-signed with a PER-DEVICE key that
+ * is provisioned into NVS at flash time (key KEY_RTK_ENROLL_KEY, 64-hex), derived
+ * on the flash host from a master key that lives ONLY on the host + the IE, never
+ * in firmware. No fleet-wide secret is baked into the .bin (a public .bin / flash
+ * dump must not leak a key usable for the whole fleet). The per-station token
+ * returned by enroll is used for subsequent heartbeats. See
+ * docs/enroll-per-device-key.md for the byte-exact FW<->IE contract. */
 
 #define DEFAULT_POLL_S   30
 #define MIN_POLL_S       10
@@ -56,6 +57,8 @@ static char  s_device_id[40] = {0};
 static char  s_mac[18]       = {0};
 static char  s_ie_host[96]   = {0};
 static char  s_token[96]     = {0};
+static char  s_enroll_key[80] = {0};   // per-device 64-hex enroll key from NVS
+static uint8_t s_key_ver      = 1;     // which master version derived it
 static int   s_poll_s        = DEFAULT_POLL_S;
 static bool  s_fixed_base_set = false;
 
@@ -223,21 +226,34 @@ static void load_identity(void) {
     config_get_str_blob_alloc(CONF_ITEM(KEY_RTK_STATION_TOK), (void **)&tok);
     if (tok) strlcpy(s_token, tok, sizeof(s_token));
     free(tok);
+
+    char *ek = NULL;
+    config_get_str_blob_alloc(CONF_ITEM(KEY_RTK_ENROLL_KEY), (void **)&ek);
+    if (ek) strlcpy(s_enroll_key, ek, sizeof(s_enroll_key));
+    free(ek);
+    s_key_ver = config_get_u8(CONF_ITEM(KEY_RTK_KEY_VER));
+    if (s_key_ver == 0) s_key_ver = 1;
 }
 
 /* ------------------------------------------------------------------ enroll */
 
 static bool enroll(void) {
+    if (!s_enroll_key[0]) {
+        // No per-device enroll key in NVS -> unprovisioned. Do NOT fall back to
+        // any baked secret (there is none). Stays UNCLAIMED until flashed with a key.
+        ESP_LOGW(TAG, "unprovisioned: no per-device enroll key (NVS rtk_enr_key); cannot enroll");
+        return false;
+    }
     uint32_t nonce = esp_random();
     char canon[256];
     snprintf(canon, sizeof(canon), "%s|%s|%s|um980|%u", s_device_id, s_mac, FW_VERSION, (unsigned)nonce);
     char hmac[65];
-    hmac_sha256_hex(RTK_ENROLL_SECRET, canon, hmac);
+    hmac_sha256_hex(s_enroll_key, canon, hmac);
 
     char body[512];
     snprintf(body, sizeof(body),
-        "{\"device_id\":\"%s\",\"mac\":\"%s\",\"fw_version\":\"%s\",\"hw\":\"um980\",\"nonce\":%u,\"hmac\":\"%s\"}",
-        s_device_id, s_mac, FW_VERSION, (unsigned)nonce, hmac);
+        "{\"device_id\":\"%s\",\"mac\":\"%s\",\"fw_version\":\"%s\",\"hw\":\"um980\",\"nonce\":%u,\"key_version\":%u,\"hmac\":\"%s\"}",
+        s_device_id, s_mac, FW_VERSION, (unsigned)nonce, (unsigned)s_key_ver, hmac);
 
     char url[160];
     snprintf(url, sizeof(url), "https://%s/api/edge/enroll", s_ie_host);
@@ -354,7 +370,9 @@ static void heartbeat(void) {
     char canon[160];
     snprintf(canon, sizeof(canon), "%s|%u|%u", s_device_id, (unsigned)h.uptime_s, (unsigned)nonce);
     char hmac[65];
-    hmac_sha256_hex(s_token[0] ? s_token : RTK_ENROLL_SECRET, canon, hmac);
+    // Heartbeat is keyed with the per-station token issued at enroll; it only
+    // runs once state >= PROVISIONING, so s_token is always set here.
+    hmac_sha256_hex(s_token, canon, hmac);
 
     char body[640];
     snprintf(body, sizeof(body),

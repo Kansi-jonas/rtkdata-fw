@@ -23,10 +23,8 @@ idf_component_register(SRCS "main.c"
 
 spiffs_create_partition_image(www ../www FLASH_IN_PROJECT)
 
-# Fleet provisioning secret, injected from the build environment (CI passes it
-# from a GitHub secret; locally via `-e RTK_ENROLL_SECRET=...`). When unset the
-# build falls back to the placeholder in provisioning.c so it still compiles.
-# Never hardcode the secret in tracked source.
-if(DEFINED ENV{RTK_ENROLL_SECRET})
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE RTK_ENROLL_SECRET="$ENV{RTK_ENROLL_SECRET}")
-endif()
+# NOTE: there is intentionally NO enroll-secret compile definition. Enrollment
+# auth uses a PER-DEVICE key written into NVS at flash time (KEY_RTK_ENROLL_KEY),
+# derived from a host/server-only master. No fleet-wide secret is ever baked into
+# the binary (the .bin is public via OTA, so a baked secret would leak the fleet).
+# See docs/enroll-per-device-key.md.
