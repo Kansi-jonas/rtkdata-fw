@@ -31,6 +31,7 @@
 #include "driver/uart.h"
 #include "driver/ledc.h"
 #include "config.h"
+#include <stdlib.h>
 #include "wifi.h"
 #include "state.h"
 #include "interface/socket_server.h"
@@ -180,6 +181,25 @@ void app_main()
 
     gnss_init();                // UM980 UART config (no heap/TLS) - configure receiver early
 
+    // Fresh-device provisioning fix: wait_for_ip() below blocks until the STA
+    // gets an IP, which a device with NO STA WiFi configured never does -- so the
+    // web UI (started after it) would never come up and the user could never
+    // enter WiFi (chicken-and-egg). When no STA SSID is set, start the
+    // provisioning web server NOW in AP mode. A fresh device has no internet to
+    // OTA against, so the OTA-window heap concern does not apply; a provisioned
+    // device keeps the original order (web server after the OTA window).
+    bool sta_provisioned = false;
+    {
+        char *ssid = NULL;
+        config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_WIFI_STA_SSID), (void **)&ssid);
+        sta_provisioned = (ssid && ssid[0]);
+        free(ssid);
+    }
+    if (!sta_provisioned) {
+        ESP_LOGW(TAG, "no STA WiFi configured -> starting provisioning web server (AP mode)");
+        web_server_init();
+    }
+
     // The OTA must run BEFORE the data plane: at boot ~136 KB heap is free, vs
     // only ~58 KB once NTRIP sockets + the provisioning HTTPS heartbeat + the web
     // server are up -- and the OTA's TLS download OOM-PANICKED at ~58 KB (v1.0.1
@@ -204,7 +224,9 @@ void app_main()
     // ---- data plane (brought up only after the OTA window) ----
     ntrip_server_init();
 
-    web_server_init();
+    if (sta_provisioned) {
+        web_server_init();   // provisioned device: web server after the OTA window (full heap)
+    }
 
     socket_server_init();
     socket_client_init();
