@@ -1,5 +1,5 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "channel": "stable",
   "notes": "REVERTED to 1.0.0: the v1.0.1 OTA crash-looped on the device (PANIC during the HTTPS download, silent reboot, never completed) -> device stuck re-trying. Holding the channel at 1.0.0 (== running FW_VERSION) so devices stop attempting the update and stay on the stable build. Re-release as 1.0.2 once the OTA download crash is fixed.",
   "update_files_urls": [
