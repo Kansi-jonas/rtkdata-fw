@@ -445,14 +445,15 @@ function renderDash(st, rtk){
     setRing(100);
   } else if(state === "maturing"){
     setState("Maturing","amber");
-    // Two gates must BOTH clear: a clean 48h data window AND a precise position
-    // (server-side PPP solve). Show whichever is furthest out, with an honest ETA.
-    if(blocking === "precise_position" || phase === "computing"){
-      $("#dState").textContent = "Computing position";
-      $("#dMsg").textContent = "Survey data captured. The exact position is being computed server-side from precise satellite products · "+(rtk.progress_pct||0)+"% · goes live in ~"+eta+".";
+    // Once the position is LOCKED the rest is just a short stability check before
+    // going live -- NOT a re-survey. Say so clearly (no hardcoded window length;
+    // the honest ETA is matures_in_s).
+    if(phase === "locked"){
+      $("#dState").textContent = "Position fixed";
+      $("#dMsg").textContent = "Position locked (cm-precise). Final stability check before going live · "+(rtk.progress_pct||0)+"% · ~"+eta+" to go.";
     } else {
-      $("#dState").textContent = "Surveying in";
-      $("#dMsg").textContent = "Collecting a clean 48h data window · "+(rtk.progress_pct||0)+"% · ~"+eta+" until live.";
+      $("#dState").textContent = "Computing position";
+      $("#dMsg").textContent = "Survey captured · the exact position is being computed server-side · "+(rtk.progress_pct||0)+"% · goes live in ~"+eta+".";
     }
   } else {
     setState("Provisioning","amber");
@@ -469,8 +470,9 @@ function renderDash(st, rtk){
     $("#qPos").textContent = pos.lat.toFixed(6)+", "+pos.lon.toFixed(6) + (pos.h!=null?(" · "+pos.h.toFixed(1)+" m"):"");
   } else {
     $("#qPos").textContent = state==="active" ? "Locked"
+      : phase==="locked" ? "Locked"
       : phase==="computing" ? "Computing…"
-      : state==="maturing" ? "Surveying in…" : "Survey-in";
+      : state==="maturing" ? "Computing…" : "Survey-in";
   }
 
   /* base-station status tags (no rover sats/fix: this is a static base) */
