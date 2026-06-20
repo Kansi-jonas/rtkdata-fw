@@ -1,7 +1,7 @@
 {
-  "version": "1.0.3",
+  "version": "1.0.0",
   "channel": "stable",
-  "notes": "REVERTED to 1.0.0: the v1.0.1 OTA crash-looped on the device (PANIC during the HTTPS download, silent reboot, never completed) -> device stuck re-trying. Holding the channel at 1.0.0 (== running FW_VERSION) so devices stop attempting the update and stay on the stable build. Re-release as 1.0.2 once the OTA download crash is fixed.",
+  "notes": "HELD at 1.0.0 (2026-06-20): the v1.0.3 OTA re-triggered the OTA-download PANIC crash-loop on a device whose running OTA path is still the v1.0.1-era buggy one (Backtrace CORRUPTED mid-download of rtkdata-fw.bin, even at full ~155K heap). Holding the channel below any deployed FW_VERSION so devices stop attempting the update and boot clean. Do NOT raise this until the OTA-download crash is fixed AND the fixed OTA is on every device (buggy-OTA devices must be USB-reflashed; they cannot self-OTA to the fix).",
   "update_files_urls": [
     "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/rtkdata-fw.bin",
     "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/www.bin"
