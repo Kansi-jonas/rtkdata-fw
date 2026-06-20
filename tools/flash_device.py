@@ -40,7 +40,7 @@ FW_PARTS = [
 
 
 def esptool(port, *args):
-    cmd = ["python", "-m", "esptool"]
+    cmd = [sys.executable, "-m", "esptool"]
     if port:
         cmd += ["--port", port]
     cmd += list(args)
@@ -80,33 +80,35 @@ def main():
     if not enroll_key:
         sys.exit("error: could not derive enroll key (master must be 64 hex)")
     bareid = ("RTK" + chip).upper()
-    print(f"      chip_id={chip}  device_id=rtk-{chip}  mountpoint=RTK_{bareid}  AP=RTKdata_{chip[6:].upper()}")
+    # SoftAP SSID uses the AP MAC = base MAC with the last octet +1 (ESP32 default).
+    ap_ssid = "RTKdata_" + chip[6:10].upper() + "%02X" % ((int(chip[10:12], 16) + 1) & 0xFF)
+    print(f"      chip_id={chip}  device_id=rtk-{chip}  mountpoint=RTK_{bareid}  AP={ap_ssid}")
     print(f"      enroll_key={enroll_key[:8]}... (suppressed; written to NVS, key_version={a.key_version})")
 
     # 2. erase
     if not a.skip_erase:
-        print("[2/4] erase_flash ...")
-        esptool(a.port, "erase_flash")
+        print("[2/4] erase-flash ...")
+        esptool(a.port, "erase-flash")
     else:
         print("[2/4] erase skipped")
 
-    # 3. firmware
+    # 3. firmware (esptool v5 syntax: hyphenated subcommand + flags)
     print("[3/4] writing firmware ...")
-    esptool(a.port, "--chip", "esp32", "-b", a.baud, "--before", "default_reset", "--after", "hard_reset",
-            "write_flash", "--flash_mode", "dio", "--flash_size", "16MB", "--flash_freq", "40m", *parts)
+    esptool(a.port, "--chip", "esp32", "--baud", a.baud,
+            "write-flash", "--flash-mode", "dio", "--flash-size", "16MB", "--flash-freq", "40m", *parts)
 
     # 4. per-device enroll key -> NVS
     print("[4/4] writing per-device enroll key to NVS ...")
     nvs = os.path.join(tempfile.gettempdir(), f"nvs_{chip}.bin")
     build_nvs_bin(enroll_key, a.key_version, nvs)
-    esptool(a.port, "write_flash", NVS_OFFSET, nvs)
+    esptool(a.port, "write-flash", NVS_OFFSET, nvs)
     try:
         os.unlink(nvs)
     except OSError:
         pass
 
     print("\nDONE. Power-cycle the device:")
-    print(f"  - it comes up as WiFi AP 'RTKdata_{chip[6:].upper()}' -> connect -> set the site WiFi")
+    print(f"  - it comes up as WiFi AP '{ap_ssid}' -> connect -> set the site WiFi")
     print("  - it then enrolls automatically and appears on /dashboard/edge")
     print(f"  inventory: device_id=rtk-{chip}  mountpoint=RTK_{bareid}")
 

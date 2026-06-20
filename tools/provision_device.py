@@ -55,7 +55,7 @@ def derive_enroll_key(master_hex: str, mac: str) -> str:
 
 
 def read_mac(port: str) -> str:
-    out = subprocess.check_output(["esptool.py", "--port", port, "read_mac"], text=True)
+    out = subprocess.check_output([sys.executable, "-m", "esptool", "--port", port, "read-mac"], text=True)
     m = re.search(r"MAC:\s*([0-9A-Fa-f:]{17})", out)
     if not m:
         sys.exit(f"error: could not parse MAC from esptool output:\n{out}")
@@ -72,12 +72,18 @@ def build_nvs_bin(enroll_key: str, key_version: int, out_bin: str) -> None:
     with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, newline="\n") as f:
         f.write(csv)
         csv_path = f.name
-    # nvs_partition_gen.py ships with ESP-IDF (components/nvs_flash/nvs_partition_generator)
-    subprocess.check_call(
-        ["python3", "-m", "esp_idf_nvs_partition_gen", "generate", csv_path, out_bin, NVS_SIZE]
-        if _has_module("esp_idf_nvs_partition_gen")
-        else ["nvs_partition_gen.py", "generate", csv_path, out_bin, NVS_SIZE]
-    )
+    # Use the CURRENT interpreter (sys.executable), not a hardcoded "python3"
+    # (Windows usually only has "python"). The NVS generator is the standalone
+    # pip module esp_idf_nvs_partition_gen (pip install esp-idf-nvs-partition-gen)
+    # or the ESP-IDF nvs_partition_gen module if on PYTHONPATH.
+    if _has_module("esp_idf_nvs_partition_gen"):
+        mod = "esp_idf_nvs_partition_gen"
+    elif _has_module("nvs_partition_gen"):
+        mod = "nvs_partition_gen"
+    else:
+        os.unlink(csv_path)
+        sys.exit("error: NVS generator not found. Run: pip install esp-idf-nvs-partition-gen")
+    subprocess.check_call([sys.executable, "-m", mod, "generate", csv_path, out_bin, NVS_SIZE])
     os.unlink(csv_path)
 
 
@@ -126,7 +132,7 @@ def main() -> None:
         if not args.port:
             sys.exit("error: --flash needs --port")
         print(f"flashing nvs partition at {NVS_OFFSET} (this wipes other NVS keys)...")
-        subprocess.check_call(["esptool.py", "--port", args.port, "write_flash", NVS_OFFSET, args.out])
+        subprocess.check_call([sys.executable, "-m", "esptool", "--port", args.port, "write-flash", NVS_OFFSET, args.out])
         print("done. device will derive its key on next boot and enroll.")
     else:
         print(f"\nto flash:  esptool.py --port {args.port or 'COM4'} write_flash {NVS_OFFSET} {args.out}")

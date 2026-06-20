@@ -170,10 +170,35 @@ void gnss_recover(void) {
     config_gnss_base();
 }
 
+/* Query + log the UM980 firmware version (VERSIONA). The #VERSIONA response
+ * carries the model + firmware build (e.g. ...,"UM980",...,"R4.10Build11833",...)
+ * which we need for inventory + partner config questions (which UM980 fw is on
+ * the station). VERSIONA is a one-shot query, so it still answers after the
+ * "unlog com1" in config_gnss_base. */
+void gnss_log_version(void) {
+    s_capturing = true;
+    cap_reset();
+    drv_uart_gnss_send((uint8_t *)"VERSIONA\r\n", 10);
+    for (int waited = 0; waited < 2000; waited += ACK_POLL_MS) {
+        vTaskDelay(pdMS_TO_TICKS(ACK_POLL_MS));
+        if (cap_contains("VERSION")) break;     // got the #VERSIONA line
+    }
+    static char tmp[CAP_SZ];
+    portENTER_CRITICAL(&s_cap_mux);
+    size_t n = s_cap_len;
+    memcpy(tmp, s_cap, n + 1);
+    portEXIT_CRITICAL(&s_cap_mux);
+    s_capturing = false;
+    for (size_t i = 0; i < n; i++) if (tmp[i] == '\r' || tmp[i] == '\n') tmp[i] = ' ';
+    ESP_LOGI(TAG, "UM980 VERSIONA: %s", n ? tmp : "(no response)");
+    uart_nmea("$PESP,RTK,GNSS,VER,%s", n ? tmp : "none");
+}
+
 void gnss_init(void) {
     // Register the response-capture handler once (coexists with the NTRIP forwarder).
     uart_register_read_handler(gnss_uart_capture);
 
     gnss_reset_pulse();
     config_gnss_base();
+    gnss_log_version();     // log the UM980 firmware (inventory + partner config)
 }

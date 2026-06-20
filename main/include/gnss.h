@@ -18,6 +18,10 @@ void gnss_init(void);
 // Apply the reference-base RTCM config (ACK-gated). Provisional survey-in base.
 void config_gnss_base(void);
 
+// Query (VERSIONA) + log the UM980 firmware version/build. Called at boot for
+// inventory; the response carries the model + firmware build string.
+void gnss_log_version(void);
+
 // Switch the base from survey-in to a FIXED position computed by the IE
 // (lat/lon in degrees, height in metres, ITRF2020). Returns true if the UM980
 // acknowledged. Called by the provisioning client once the position converges.
