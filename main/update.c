@@ -6,6 +6,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_ota_ops.h"
@@ -17,6 +18,8 @@
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_partition.h"
+#include "nvs.h"
+#include "uart.h"
 
 static const char *TAG              = "OTA";
 static       bool checkUpdates      = true;
@@ -50,6 +53,26 @@ void send_update_completed() {
 // keep running) instead of crashing.
 #define MIN_OTA_HEAP (110 * 1024)
 
+/* ---- anti-brick OTA state (NVS) ---------------------------------------
+ * Two counters in NVS namespace "ota" guarantee a bad update can never leave the
+ * device stuck in a crash-loop (the v1.0.1-era failure mode):
+ *   fail_ver/fail_cnt : per-target-version DOWNLOAD-attempt counter. After
+ *                       MAX_OTA_ATTEMPTS failed installs of a given version we
+ *                       stop retrying it and boot the current FW (device usable).
+ *   bootloop          : consecutive boots that never reached a healthy run.
+ *                       MAX_BOOT_LOOPS in a row -> fall back to the FACTORY app.
+ * Both are reset by ota_mark_valid_task after OTA_HEALTHY_MS of stable uptime.
+ * Paired with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE: a freshly-OTA'd image boots
+ * PENDING_VERIFY and the bootloader auto-reverts it if it crashes before the
+ * health task confirms it. */
+#define OTA_NVS_NS       "ota"
+#define OTA_KEY_FAILVER  "fail_ver"
+#define OTA_KEY_FAILCNT  "fail_cnt"
+#define OTA_KEY_BOOTLOOP "bootloop"
+#define MAX_OTA_ATTEMPTS 3
+#define MAX_BOOT_LOOPS   5
+#define OTA_HEALTHY_MS   (60 * 1000)
+
 // true iff 'cand' is a strictly newer dotted version than 'cur' ("1.0.2">"1.0.1").
 // Prevents downgrades (channel older than the running build) re-flashing in a
 // loop. Unparseable -> fall back to "any change" so an update is still possible.
@@ -63,6 +86,40 @@ static bool ota_version_is_newer(const char *cand, const char *cur) {
         if (ca[i] < cu[i]) return false;
     }
     return false;
+}
+
+// Gate an install attempt on the per-version failure counter. Returns true and
+// records the attempt (BEFORE the download, so a crash mid-download still counts)
+// when the version has failed fewer than MAX_OTA_ATTEMPTS times; false once it is
+// exhausted, so the caller boots the current FW instead of re-trying forever.
+// Fail-OPEN on any NVS error: never let a storage hiccup block a real update.
+static bool ota_attempt_allowed(const char *version) {
+    nvs_handle_t h;
+    if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "ota nvs unavailable -> allowing attempt (fail-open)");
+        return true;
+    }
+    char   stored[24] = {0};
+    size_t len        = sizeof(stored);
+    uint8_t cnt       = 0;
+    if (nvs_get_str(h, OTA_KEY_FAILVER, stored, &len) == ESP_OK && strcmp(stored, version) == 0) {
+        nvs_get_u8(h, OTA_KEY_FAILCNT, &cnt);
+    } else {
+        cnt = 0;   // a different (or no) version was recorded -> fresh start
+    }
+    if (cnt >= MAX_OTA_ATTEMPTS) {
+        ESP_LOGE(TAG, "version %s failed %u/%u times -> NOT retrying (staying on %s, device usable)",
+                 version, cnt, MAX_OTA_ATTEMPTS, FW_VERSION);
+        uart_nmea("$PESP,OTA,GIVEUP,%s,%u", version, cnt);
+        nvs_close(h);
+        return false;
+    }
+    nvs_set_str(h, OTA_KEY_FAILVER, version);
+    nvs_set_u8(h, OTA_KEY_FAILCNT, (uint8_t)(cnt + 1));
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "OTA attempt %u/%u for version %s", cnt + 1, MAX_OTA_ATTEMPTS, version);
+    return true;
 }
 
 esp_err_t ota_update_firmware(const char *url) {
@@ -508,7 +565,12 @@ void calculate_total_file_size(cJSON *files_json) {
 
 }
 
-void updateFirmware(cJSON *files_json) {
+// Download + apply every file in the manifest. Returns ESP_OK only if ALL files
+// applied; on the FIRST failure it stops and returns ESP_FAIL WITHOUT rebooting.
+// (The old version called esp_restart() unconditionally -> a failed download
+// rebooted -> re-attempted the same download -> crash loop. Now: reboot only on
+// success, so a failed install just falls through to the current, working FW.)
+esp_err_t updateFirmware(cJSON *files_json) {
 
     ESP_LOGI(TAG, "Starting RTKdata OTA update...");
 
@@ -516,6 +578,7 @@ void updateFirmware(cJSON *files_json) {
 
     calculate_total_file_size(files_json);
 
+    bool ok = true;
     cJSON* file_url;
 
     cJSON_ArrayForEach(file_url, files_json) {
@@ -523,15 +586,14 @@ void updateFirmware(cJSON *files_json) {
         if( cJSON_IsString(file_url)){
 
             if(!isWWWBinFile(file_url->valuestring)){
-                
+
                 if (ota_update_firmware(file_url->valuestring) == ESP_OK) {
 
                     ESP_LOGI(TAG, "Firmware from %s was successfull updated.", file_url->valuestring);
-                    //free(fileUrl);
                 } else {
 
                     ESP_LOGE(TAG, "Error on firmware update from %s", file_url->valuestring);
-                    //free(fileUrl);
+                    ok = false;
                     break;
                 }
 
@@ -540,11 +602,10 @@ void updateFirmware(cJSON *files_json) {
                 if (update_SPIFFS(file_url->valuestring) == ESP_OK) {
 
                     ESP_LOGI(TAG, "Spiffs from %s was successfull updated.", file_url->valuestring);
-                    //free(fileUrl);
                 } else {
 
                     ESP_LOGE(TAG, "Error on spiffs update from %s", file_url->valuestring);
-                    //free(fileUrl);
+                    ok = false;
                     break;
                 }
 
@@ -555,11 +616,18 @@ void updateFirmware(cJSON *files_json) {
     }
 
     send_update_completed();
-    
-    ESP_LOGI(TAG, "OTA update completed. Restarting...");
 
-    esp_restart();
+    if (ok) {
+        ESP_LOGI(TAG, "OTA update completed -> restarting into the new image");
+        uart_nmea("$PESP,OTA,INSTALLED,restarting");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();          // no return on success
+    }
 
+    // Failed: do NOT restart. Return so the caller continues on the current FW.
+    ESP_LOGE(TAG, "OTA update FAILED -> staying on current FW %s (no reboot)", FW_VERSION);
+    uart_nmea("$PESP,OTA,FAILED,%s", FW_VERSION);
+    return ESP_FAIL;
 }
 
 cJSON* ota_fetch_json_from_url(){
@@ -669,8 +737,16 @@ void ota_boot_check(void) {
 
         if (ota_version_is_newer(new_version, FW_VERSION)) {
 
-            ESP_LOGI(TAG, "newer version %s > %s -> updating at boot (full heap)", new_version, FW_VERSION);
-            updateFirmware(files_json);   // downloads, applies, esp_restart() -> no return
+            if (!ota_attempt_allowed(new_version)) {
+                // exhausted the retry budget for this version -> do NOT attempt
+                // again; boot the current (working) FW instead of crash-looping.
+                cJSON_Delete(jsonFile);
+                return;
+            }
+            ESP_LOGI(TAG, "newer version %s > %s -> installing at boot (full heap)", new_version, FW_VERSION);
+            esp_err_t up = updateFirmware(files_json);   // reboots on success; returns on failure
+            ESP_LOGE(TAG, "boot OTA install did not succeed (%s) -> continuing on current FW %s",
+                     esp_err_to_name(up), FW_VERSION);
         } else {
             ESP_LOGI(TAG, "no newer version (channel=%s current=%s)", new_version, FW_VERSION);
         }
@@ -679,6 +755,122 @@ void ota_boot_check(void) {
     }
 
     cJSON_Delete(jsonFile);
+}
+
+/* ---- anti-brick boot helpers ------------------------------------------ */
+
+// Run the boot OTA check on a dedicated 16 KB-stack task and block until it is
+// done. The synchronous TLS download + flash write needs ~16 KB of stack; doing
+// it on the 3584-byte main task overflowed (0xa5a5a5a5 stack-smash -> crash
+// loop). The task self-reboots on a successful install, so this only returns
+// when there is nothing to install or the install failed (device keeps the
+// current, working FW).
+static SemaphoreHandle_t s_ota_boot_done = NULL;
+
+static void ota_boot_check_task(void *arg) {
+    (void)arg;
+    ota_boot_check();
+    if (s_ota_boot_done) xSemaphoreGive(s_ota_boot_done);
+    vTaskDelete(NULL);
+}
+
+void ota_boot_check_blocking(void) {
+    s_ota_boot_done = xSemaphoreCreateBinary();
+    if (!s_ota_boot_done) {
+        ESP_LOGE(TAG, "no mem for OTA sync -> skipping boot OTA (device stays usable)");
+        return;
+    }
+    if (xTaskCreate(ota_boot_check_task, "ota_boot", 16384, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "could not spawn OTA boot task (low mem) -> skipping boot OTA (device stays usable)");
+        vSemaphoreDelete(s_ota_boot_done);
+        s_ota_boot_done = NULL;
+        return;
+    }
+    xSemaphoreTake(s_ota_boot_done, portMAX_DELAY);   // the task reboots if it installs
+    vSemaphoreDelete(s_ota_boot_done);
+    s_ota_boot_done = NULL;
+}
+
+// Anti-brick boot-loop guard. Call ONCE early in app_main (after NVS init, before
+// the risky bring-up). Counts consecutive boots that never reach a healthy run;
+// after MAX_BOOT_LOOPS in a row it forces a boot into the FACTORY app (the
+// bench-flashed known-good image) by erasing the OTA-select data, so the device
+// can never stay stuck in a crash-loop regardless of cause. ota_mark_valid_task
+// resets the counter after OTA_HEALTHY_MS of stable uptime. Fail-safe: any NVS
+// error just returns (never blocks boot).
+void ota_boot_loop_guard(void) {
+    nvs_handle_t h;
+    if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    uint8_t boots = 0;
+    nvs_get_u8(h, OTA_KEY_BOOTLOOP, &boots);
+    boots++;
+    nvs_set_u8(h, OTA_KEY_BOOTLOOP, boots);
+    nvs_commit(h);
+    nvs_close(h);
+
+    ESP_LOGI(TAG, "boot-loop guard: %u consecutive boot(s) without a healthy run", boots);
+    if (boots < MAX_BOOT_LOOPS) return;
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running && running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) {
+        ESP_LOGE(TAG, "crash-loop (%u) but already on FACTORY -> cannot fall back further", boots);
+        return;
+    }
+    const esp_partition_t *otadata = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, NULL);
+    if (!otadata) {
+        ESP_LOGE(TAG, "crash-loop (%u) but no otadata partition -> cannot force factory", boots);
+        return;
+    }
+
+    ESP_LOGE(TAG, "crash-loop (%u boots) -> erasing otadata, rebooting into FACTORY app", boots);
+    uart_nmea("$PESP,OTA,FACTORYFALLBACK,%u", boots);
+    if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {   // clean slate for factory
+        nvs_set_u8(h, OTA_KEY_BOOTLOOP, 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    esp_partition_erase_range(otadata, 0, otadata->size);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_restart();   // bootloader now selects the factory app
+}
+
+// Anti-brick health-confirm task. Spawn ONCE at the end of app_main (after the
+// data plane is up). After OTA_HEALTHY_MS of stable uptime it (1) resets the
+// crash-loop + download-failure counters and (2) if the running image is a
+// freshly-OTA'd one pending verification, confirms it valid so the bootloader
+// keeps it. If the firmware crashes before reaching here, it never confirms ->
+// the bootloader rolls back (OTA image) or the boot-loop guard falls back to
+// factory on the next boot.
+void ota_mark_valid_task(void *pvParameter) {
+    (void)pvParameter;
+    vTaskDelay(pdMS_TO_TICKS(OTA_HEALTHY_MS));
+
+    nvs_handle_t h;
+    if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, OTA_KEY_BOOTLOOP, 0);
+        nvs_erase_key(h, OTA_KEY_FAILVER);
+        nvs_erase_key(h, OTA_KEY_FAILCNT);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "OTA image confirmed healthy after %ds -> rollback cancelled", OTA_HEALTHY_MS / 1000);
+            uart_nmea("$PESP,OTA,CONFIRMED,%s", FW_VERSION);
+        } else {
+            ESP_LOGE(TAG, "esp_ota_mark_app_valid failed: %s", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGI(TAG, "firmware healthy after %ds (not a pending-verify image; nothing to confirm)",
+                 OTA_HEALTHY_MS / 1000);
+    }
+    vTaskDelete(NULL);
 }
 
 void ota_check_newupdate(void *pvParameter) {

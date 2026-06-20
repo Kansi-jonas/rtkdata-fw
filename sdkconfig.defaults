@@ -21,6 +21,15 @@ CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 CONFIG_LWIP_IP_FORWARD=y
 CONFIG_LWIP_IPV4_NAPT=y
 
+# Anti-brick OTA: a freshly-OTA'd app boots as PENDING_VERIFY and must call
+# esp_ota_mark_app_valid_cancel_rollback() within its health window (done by
+# ota_mark_valid_task after 60s stable uptime). If it crash-loops before
+# confirming, the bootloader auto-reverts to the previous working app. This is
+# the core defence against a bad OTA bricking a shipped device. NOTE: the
+# bootloader must be reflashed (USB) for this to take effect; OTA only updates
+# the app, not the bootloader -- so existing field units are not retro-protected.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # App runtime tuning (match the validated local build)
 CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
 CONFIG_FREERTOS_HZ=100

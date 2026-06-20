@@ -128,6 +128,11 @@ void app_main()
     init_state();
     uart_init();
 
+    // Anti-brick: count this boot. If we have crash-looped MAX_BOOT_LOOPS times
+    // without ever reaching a healthy run, this falls back to the factory app
+    // before the risky bring-up below. Runs after NVS (config_init) + UART ready.
+    ota_boot_loop_guard();
+
     xTaskCreate(reset_button_task, "reset_button", 4096, NULL, TASK_PRIORITY_RESET_BUTTON, NULL);
 
     esp_reset_reason_t reset_reason = esp_reset_reason();
@@ -219,7 +224,7 @@ void app_main()
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    ota_boot_check();           // installs + reboots if a newer version exists; else returns
+    ota_boot_check_blocking();  // installs + reboots if newer; runs on a 16K-stack task (anti stack-smash)
 
     // ---- data plane (brought up only after the OTA window) ----
     ntrip_server_init();
@@ -242,10 +247,17 @@ void app_main()
 
     ESP_LOGI(TAG,"main heap_size = %ld\r\n", esp_get_free_heap_size());
 
+    // Anti-brick: confirm THIS image healthy after a stable-uptime grace period.
+    // If the firmware crash-loops before this runs it never confirms -> the
+    // bootloader rolls back (OTA image) or the boot-loop guard falls back to
+    // factory. Runs on every boot; also resets the crash-loop + fail counters.
+    xTaskCreate(&ota_mark_valid_task, "ota_confirm", 4096, NULL, 4, NULL);
+
     // Daily OTA poll: lightweight manifest check; reboots ONLY when a newer
-    // version is published (then ota_boot_check installs it at full heap). No new
-    // version -> no restart.
-    xTaskCreate(&ota_schedule_check_newupdate, "OTA_Sched_Task", 4096, NULL, 5, NULL);
+    // version is published (then ota_boot_check_blocking installs it at full
+    // heap). No new version -> no restart. 8 KB stack: the manifest GET still
+    // does a TLS handshake (cert-bundle verify), too tight at 4 KB.
+    xTaskCreate(&ota_schedule_check_newupdate, "OTA_Sched_Task", 8192, NULL, 5, NULL);
 
 #ifdef DEBUG_HEAP
     while (true) {

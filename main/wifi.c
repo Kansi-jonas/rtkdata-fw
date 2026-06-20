@@ -116,8 +116,16 @@ static void wifi_ap_start_only() {
         net_init_softap(true);
     }
 
-    // Now AP-Interface on
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    // Now AP-Interface on. Fail SOFT here: during esp_restart() the Wi-Fi driver
+    // is being stopped, which fires STA_DISCONNECTED -> this handler. esp_wifi_set_mode
+    // then returns ESP_ERR_WIFI_STOP_STATE and an ESP_ERROR_CHECK would abort() ->
+    // a PANIC on EVERY planned restart while connected (OTA reboot, daily-check
+    // reboot, factory fallback). Skip the AP bring-up instead of crashing.
+    esp_err_t merr = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (merr != ESP_OK) {
+        ESP_LOGW(TAG, "AP start skipped: esp_wifi_set_mode(APSTA) -> %s (Wi-Fi stopping?)", esp_err_to_name(merr));
+        return;
+    }
 
     // AP-Config from NVS and set it
     wifi_init_softap(true);
