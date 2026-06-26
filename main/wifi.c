@@ -321,10 +321,25 @@ static void handle_sta_disconnected(void *arg, esp_event_base_t base, int32_t id
     supervisor_note_sta_ip(false);
     xEventGroupClearBits(wifi_event_group, WIFI_STA_GOT_IPV6_BIT);
 
-    if (status_led_sta != NULL) 
+    if (status_led_sta != NULL)
         status_led_sta->flashing_mode = STATUS_LED_STATIC;
 
-    wifi_ap_start_only();
+    // SECURITY: do NOT re-open the OPEN config AP on STA loss for a PROVISIONED unit.
+    // Re-opening on every disconnect left the open AP up indefinitely (this path did
+    // not arm the 15-min auto-off) and let an attacker deauth the STA to force the
+    // open AP up and reconfigure the unit. The AP is now strictly boot-time-boxed
+    // (15-min auto-off, see wifi_ap_start_timer); to re-onboard a deployed unit,
+    // power-cycle it for a fresh 15-min window. STA reconnect is handled
+    // independently by wifi_sta_reconnect_task. Only an UNprovisioned unit (no STA,
+    // needs the AP for first onboarding) re-opens here, time-boxed via the timer.
+    char *sta_ssid = NULL;
+    config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_WIFI_STA_SSID), (void **)&sta_ssid);
+    bool provisioned = (sta_ssid && sta_ssid[0]);
+    free(sta_ssid);
+    if (!provisioned) {
+        wifi_ap_start_only();
+        wifi_ap_start_timer();   // time-box even this AP-up to 15 min
+    }
 }
 
 static void handle_sta_auth_mode_change(void *arg, esp_event_base_t base, int32_t id, void *event_data){
@@ -456,9 +471,15 @@ static void handle_ap_sta_ip_assigned(void *arg, esp_event_base_t base, int32_t 
 
 /*============================= Public helpers ==============================*/
 
-void wait_for_ip(void){
+// Wait up to timeout_ms for the STA to get an IPv4 (0 = wait forever). Returns
+// true if connected, false on timeout. Bounded so a device whose configured WiFi
+// is wrong/down/out-of-range does NOT block boot forever -- the caller then brings
+// up the AP config server so the user can re-onboard without the reset button.
+bool wait_for_ip(uint32_t timeout_ms){
 
-    xEventGroupWaitBits(wifi_event_group, WIFI_STA_GOT_IPV4_BIT, false, false, portMAX_DELAY);
+    TickType_t ticks = (timeout_ms == 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_STA_GOT_IPV4_BIT, false, false, ticks);
+    return (bits & WIFI_STA_GOT_IPV4_BIT) != 0;
 }
 
 /*============================= Net init ====================================*/
@@ -605,9 +626,13 @@ static void wifi_init_softap(bool ap_enable) {
 
         config_ap.ap.ssid_len = ap_ssid_len;
 
-        if (ap_ssid_len == 0) {
+        // Force the RTKdata_<MAC> SSID if the stored one is empty OR not already
+        // RTKdata-format. This rebrands any stale/legacy SSID (e.g. an "OnoLink_*"
+        // left in NVS by the original vendor firmware) so a shipped unit never
+        // broadcasts a foreign brand, even when flashed no-erase.
+        if (ap_ssid_len == 0 || strncmp((char *)config_ap.ap.ssid, "RTKdata_", 8) != 0) {
 
-            // Generate default AP SSID based on MAC address and store
+            // Generate the RTKdata AP SSID from the MAC and store it
             uint8_t mac[6];
 
             esp_wifi_get_mac(WIFI_IF_AP, mac);

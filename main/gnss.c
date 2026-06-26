@@ -26,6 +26,7 @@
 #include <esp_log.h>
 #include <esp_event.h>
 #include <driver/gpio.h>
+#include "nvs.h"
 
 #include "gnss.h"
 #include "uart.h"
@@ -115,6 +116,44 @@ static void gnss_reset_pulse(void) {
     vTaskDelay(pdMS_TO_TICKS(GNSS_RESET_MS));
 }
 
+/* ---- persisted fixed base (anti reboot-re-survey) ----------------------
+ * Once the IE pushes the PPP-converged precise coordinate (gnss_set_fixed_base),
+ * we persist it in NVS. On every later boot/recovery config_gnss_base reads it back
+ * and re-applies "mode base <lat> <lon> <h>" instead of a fresh survey-in, so a
+ * power-cycle / reboot / GNSS-recover does NOT re-measure (which would broadcast a
+ * meter-level 1005 until the next IE heartbeat re-pushed it). A fresh, never-fixed
+ * device falls back to the provisional survey-in. */
+#define GNSS_NVS_NS    "gnss"
+#define GNSS_KEY_BASE  "base"
+typedef struct { double lat, lon, h; } gnss_base_fix_t;
+
+// Reject Null-Island and out-of-range coords: never apply garbage as a fixed base
+// (it would broadcast a wrong 1005 to every rover). Mirrors the LH-side guards.
+static bool gnss_coord_valid(double lat, double lon) {
+    if (lat == 0.0 && lon == 0.0) return false;
+    return lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0;
+}
+
+static bool gnss_load_fixed_base(double *lat, double *lon, double *h) {
+    nvs_handle_t nh;
+    if (nvs_open(GNSS_NVS_NS, NVS_READONLY, &nh) != ESP_OK) return false;
+    gnss_base_fix_t b;
+    size_t sz = sizeof(b);
+    esp_err_t err = nvs_get_blob(nh, GNSS_KEY_BASE, &b, &sz);
+    nvs_close(nh);
+    if (err != ESP_OK || sz != sizeof(b) || !gnss_coord_valid(b.lat, b.lon)) return false;
+    *lat = b.lat; *lon = b.lon; *h = b.h;
+    return true;
+}
+
+static void gnss_save_fixed_base(double lat, double lon, double h) {
+    nvs_handle_t nh;
+    if (nvs_open(GNSS_NVS_NS, NVS_READWRITE, &nh) != ESP_OK) return;
+    gnss_base_fix_t b = { lat, lon, h };
+    if (nvs_set_blob(nh, GNSS_KEY_BASE, &b, sizeof(b)) == ESP_OK) nvs_commit(nh);
+    nvs_close(nh);
+}
+
 /* ---- reference-base configuration ------------------------------------- */
 
 void config_gnss_base(void) {
@@ -134,21 +173,47 @@ void config_gnss_base(void) {
         "rtcm1005,com1,10\r\n",       // ARP identity anchor (LH rewrites this)
         "rtcm1033,com1,10\r\n",       // receiver/antenna descriptor
         "rtcm1230,com1,10\r\n",       // GLONASS code-phase biases (cross-brand RTK)
-        "mode base time 300 1.5\r\n", // provisional survey-in (VERIFY syntax on first hw)
-        "saveconfig\r\n",
+        // The base MODE + saveconfig are issued AFTER this list, conditional on a
+        // persisted precise coordinate (fixed) vs a fresh device (survey-in).
     };
     ESP_LOGI(TAG, "configuring UM980 reference base (ACK-gated)");
     s_capturing = true;
-    int ok = 0, total = (int)(sizeof(seq) / sizeof(seq[0]));
-    for (int i = 0; i < total; i++) {
+    int seq_n = (int)(sizeof(seq) / sizeof(seq[0]));
+    int ok = 0, total = seq_n + 2;   // + base-mode + saveconfig
+    for (int i = 0; i < seq_n; i++) {
         if (send_cmd_acked(seq[i], ACK_RETRIES)) ok++;
     }
+
+    // Base mode: re-apply the persisted PPP-precise FIXED coordinate if we have one
+    // (so a reboot/power-cycle does NOT re-survey), else provisional survey-in.
+    double lat, lon, h;
+    if (gnss_load_fixed_base(&lat, &lon, &h)) {
+        char cmd[96];
+        snprintf(cmd, sizeof(cmd), "mode base %.9f %.9f %.4f\r\n", lat, lon, h);
+        if (send_cmd_acked(cmd, ACK_RETRIES)) ok++;
+        ESP_LOGI(TAG, "restored FIXED base from NVS: %.9f %.9f %.4f", lat, lon, h);
+        uart_nmea("$PESP,RTK,GNSS,BASEMODE,FIXED");
+    } else {
+        if (send_cmd_acked("mode base time 300 1.5\r\n", ACK_RETRIES)) ok++;  // VERIFY syntax on first hw
+        ESP_LOGI(TAG, "no persisted fixed base -> provisional survey-in");
+        uart_nmea("$PESP,RTK,GNSS,BASEMODE,SURVEYIN");
+    }
+    if (send_cmd_acked("saveconfig\r\n", ACK_RETRIES)) ok++;
+
     s_capturing = false;
     ESP_LOGI(TAG, "UM980 base config: %d/%d commands acked", ok, total);
     uart_nmea("$PESP,RTK,GNSS,CONFIG,%d,%d", ok, total);
 }
 
 bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
+    // Never apply a garbage coordinate as the fixed base (it would be broadcast as
+    // the 1005 to every rover). Reject Null-Island / out-of-range outright.
+    if (!gnss_coord_valid(lat_deg, lon_deg)) {
+        ESP_LOGE(TAG, "rejecting invalid fixed base %.9f %.9f", lat_deg, lon_deg);
+        uart_nmea("$PESP,RTK,GNSS,FIXEDBASE,0");
+        return false;
+    }
+
     char cmd[96];
     // UM980: "mode base <lat> <lon> <height>" - degrees / metres, ITRF2020 from the IE
     snprintf(cmd, sizeof(cmd), "mode base %.9f %.9f %.4f\r\n", lat_deg, lon_deg, height_m);
@@ -157,6 +222,9 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
     bool ok = send_cmd_acked(cmd, ACK_RETRIES);
     if (ok) ok = send_cmd_acked("saveconfig\r\n", ACK_RETRIES);
     s_capturing = false;
+
+    // Persist so a reboot/recovery re-applies this fixed coord instead of re-surveying.
+    if (ok) gnss_save_fixed_base(lat_deg, lon_deg, height_m);
 
     ESP_LOGI(TAG, "fixed base %.9f %.9f %.4f -> %s", lat_deg, lon_deg, height_m, ok ? "OK" : "FAILED");
     uart_nmea("$PESP,RTK,GNSS,FIXEDBASE,%d", ok ? 1 : 0);

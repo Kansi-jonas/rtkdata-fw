@@ -48,6 +48,10 @@
 #define BUTTON_GPIO GPIO_NUM_13
 #define BUTTON_DOWN 1
 
+// Bounded boot wait for the STA IP. If WiFi is wrong/down/out-of-range we stop
+// waiting after this and bring up the AP config server so the user can re-onboard.
+#define WIFI_BOOT_IP_TIMEOUT_MS 30000
+
 static const char *TAG = "MAIN";
 
 static char *reset_reason_name(esp_reset_reason_t reason);
@@ -200,18 +204,25 @@ void app_main()
         sta_provisioned = (ssid && ssid[0]);
         free(ssid);
     }
+    bool web_started = false;
     if (!sta_provisioned) {
         ESP_LOGW(TAG, "no STA WiFi configured -> starting provisioning web server (AP mode)");
         web_server_init();
+        web_started = true;
     }
 
-    // The OTA must run BEFORE the data plane: at boot ~136 KB heap is free, vs
-    // only ~58 KB once NTRIP sockets + the provisioning HTTPS heartbeat + the web
-    // server are up -- and the OTA's TLS download OOM-PANICKED at ~58 KB (v1.0.1
-    // crash loop). So: wait for STA IP + a synced clock (TLS cert validity), then
-    // check+install synchronously with full heap. It reboots into the new version
-    // if one is published; otherwise we fall through and bring the data plane up.
-    wait_for_ip();
+    // The OTA must run BEFORE the data plane (full heap). Wait for the STA IP, but
+    // BOUNDED: if the configured WiFi is wrong/down/out-of-range we must NOT block
+    // boot forever. On timeout, bring up the AP config server so the user can
+    // re-onboard WITHOUT the reset button, and continue (the STA keeps
+    // auto-reconnecting; the data plane comes up once an IP arrives).
+    bool got_ip = wait_for_ip(WIFI_BOOT_IP_TIMEOUT_MS);
+    if (!got_ip && !web_started) {
+        ESP_LOGW(TAG, "no STA IP within %ds -> AP config server up for re-onboarding",
+                 WIFI_BOOT_IP_TIMEOUT_MS / 1000);
+        web_server_init();
+        web_started = true;
+    }
 
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
@@ -229,8 +240,9 @@ void app_main()
     // ---- data plane (brought up only after the OTA window) ----
     ntrip_server_init();
 
-    if (sta_provisioned) {
-        web_server_init();   // provisioned device: web server after the OTA window (full heap)
+    if (!web_started) {
+        web_server_init();   // provisioned + connected: web server after the OTA window (full heap)
+        web_started = true;
     }
 
     socket_server_init();

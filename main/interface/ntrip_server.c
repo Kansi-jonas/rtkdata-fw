@@ -333,7 +333,7 @@ static void ntrip_server_wait_for_start(ntrip_instance_t *inst){
         vTaskResume(inst->task_sleep);
     }
 
-    wait_for_ip();
+    wait_for_ip(0);   // block (forever) until the STA has an IP before (re)connecting
 }
 
 // config (Host, Port, Passwort, Mountpoint)

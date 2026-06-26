@@ -251,7 +251,7 @@ typedef struct config_item {
 // same version the manifest carries, otherwise the device re-flashes in a loop.
 // release.yml sets the manifest version from the git tag (v1.0.1 -> "1.0.1"),
 // so keep this in lockstep with the tag you push.
-#define FW_VERSION "1.0.4"
+#define FW_VERSION "1.0.5"
 
 #define UPDATE_SERVER_URL "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/"
 #define VERSION_FILE "release.json"

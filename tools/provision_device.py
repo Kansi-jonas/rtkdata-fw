@@ -105,6 +105,8 @@ def main() -> None:
     ap.add_argument("--out", default="nvs_enroll.bin", help="output NVS image path")
     ap.add_argument("--flash", action="store_true",
                     help="flash the nvs partition (CAUTION: wipes other NVS keys)")
+    ap.add_argument("--show-key", action="store_true",
+                    help="print the full derived enroll_key (per-device SECRET; trusted terminal only)")
     args = ap.parse_args()
 
     if not args.master:

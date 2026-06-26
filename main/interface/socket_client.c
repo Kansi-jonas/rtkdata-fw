@@ -63,7 +63,7 @@ static void socket_client_task(void *ctx) {
     while (true) {
         retry_delay(delay_handle);
 
-        wait_for_ip();
+        wait_for_ip(0);   // block (forever) until the STA has an IP
 
         char *host, *connect_message;
         uint16_t port = config_get_u16(CONF_ITEM(KEY_CONFIG_SOCKET_CLIENT_PORT));

@@ -59,7 +59,7 @@ void wifi_ap_status(wifi_ap_status_t *status);
 
 void wifi_sta_status(wifi_sta_status_t *status);
 
-void wait_for_ip();
+bool wait_for_ip(uint32_t timeout_ms);   // bounded; true if STA got an IP, false on timeout (0 = forever)
 
 void wifi_driver_restart(void);
 

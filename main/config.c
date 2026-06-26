@@ -721,42 +721,20 @@ esp_err_t config_init() {
 
 esp_err_t config_reset() {
 
-    esp_err_t resultError = ESP_FAIL; 
-
     uart_nmea("$PESP,CFG,RESET");
 
-    // get the ntrip data from memory
-    char *host, *mountpoint, *username, *password;
-    
-    uint16_t port = config_get_u16(CONF_ITEM(KEY_CONFIG_NTRIP_SERVER_PORT));
-    config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_NTRIP_SERVER_HOST), (void **) &host);
-    config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_NTRIP_SERVER_USERNAME), (void **) &username);
-    config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_NTRIP_SERVER_PASSWORD), (void **) &password);
-    config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_NTRIP_SERVER_MOUNTPOINT), (void **) &mountpoint);
+    // WiFi reset ONLY. Clear the STA credentials so the station reopens its setup
+    // AP for re-onboarding, and PRESERVE everything else -- crucially the per-device
+    // identity (enroll key, key version, station token, device id, state) and the
+    // NTRIP/caster config. The reset button must NEVER destroy the per-device enroll
+    // key: it is HMAC-derived from a server-only master and cannot be re-created
+    // on-device, so wiping it would permanently strand the unit (re-enroll forever
+    // fails). A full factory wipe is the USB-reflash path, not this button.
+    nvs_erase_key(config_handle, KEY_CONFIG_WIFI_STA_SSID);
+    nvs_erase_key(config_handle, KEY_CONFIG_WIFI_STA_PASSWORD);
+    nvs_erase_key(config_handle, KEY_CONFIG_WIFI_STA_ACTIVE);
 
-    // get the state from the memory
-    //uint16_t state = config_get_u16(CONF_ITEM(KEY_CONFIG_MODE_ACTIVE));
-
-    resultError = nvs_erase_all(config_handle);
-
-    // set the ntrip data in the memory
-    config_set_u16(KEY_CONFIG_NTRIP_SERVER_PORT,port);
-    config_set_str(KEY_CONFIG_NTRIP_SERVER_HOST,host);
-    config_set_str(KEY_CONFIG_NTRIP_SERVER_USERNAME,username);
-    config_set_str(KEY_CONFIG_NTRIP_SERVER_PASSWORD,password);
-    config_set_str(KEY_CONFIG_NTRIP_SERVER_MOUNTPOINT,mountpoint);
-
-    // set the state data in the memory
-    //config_set_u16(KEY_CONFIG_MODE_ACTIVE,state);
-
-    config_commit();
-
-    free(host);
-    free(mountpoint);
-    free(username);
-    free(password);
-
-    return resultError;
+    return config_commit();
 }
 
 int8_t config_get_i8(const config_item_t *item) {

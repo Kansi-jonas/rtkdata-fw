@@ -405,7 +405,7 @@ static void heartbeat(void) {
 
 static void provisioning_task(void *ctx) {
     (void)ctx;
-    wait_for_ip();
+    wait_for_ip(0);   // block (forever) until the STA has an IP before enrolling
     load_identity();
 
     uint8_t state = config_get_u8(CONF_ITEM(KEY_RTK_STATE));
