@@ -17,9 +17,14 @@
 #include "config.h"
 #include "supervisor.h"
 #include "esp_mac.h"
+#include "dns_server.h"
 
 #define AP_AUTO_OFF_MS    (15U * 60U * 1000U)
 #define AP_AUTO_OFF_TICKS pdMS_TO_TICKS(AP_AUTO_OFF_MS)
+// Cap how often the auto-off is re-armed while a client stays connected, so a
+// parked or hostile client cannot hold the OPEN setup AP up forever. Bounds the
+// open-AP window to ~(1 + AP_MAX_REARMS) * 15 min per AP session.
+#define AP_MAX_REARMS     2
 
 static const char *TAG = "WIFI";
 
@@ -34,6 +39,8 @@ static TaskHandle_t sta_status_task     = NULL;
 static TaskHandle_t sta_reconnect_task  = NULL;
 static TaskHandle_t blink_led_task      = NULL;
 static TaskHandle_t wifi_ctrl_task      = NULL;
+
+static int          ap_rearm_count      = 0;   // consecutive auto-off re-arms this AP session
 
 static TimerHandle_t ap_stop_timer      = NULL; 
 
@@ -143,6 +150,18 @@ static void wifi_control_task(void *arg) {
 
         xEventGroupWaitBits(wifi_event_group, WIFI_AP_STOP_DUE_BIT,
                             pdTRUE, pdFALSE, portMAX_DELAY);
+
+        // Do NOT pull the config AP out from under an actively-connected client
+        // (a customer mid-onboarding, or re-entering a wrong Wi-Fi password). If
+        // someone is on the AP when the 15-min auto-off fires, re-arm a fresh
+        // window instead of stopping; the AP only closes once no client is left.
+        if ((xEventGroupGetBits(wifi_event_group) & WIFI_AP_STA_CONNECTED_BIT)
+                && ap_rearm_count < AP_MAX_REARMS) {
+
+            ap_rearm_count++;
+            wifi_ap_start_timer();
+            continue;
+        }
 
         wifi_mode_t cur;
 
@@ -368,6 +387,14 @@ static void handle_ap_start(void *arg, esp_event_base_t base, int32_t id, void *
     }
 
     ap_active = true;
+    ap_rearm_count = 0;   // fresh AP session: reset the auto-off re-arm budget
+
+    // Captive-portal DNS hijack so a client that joins the setup AP gets its OS
+    // "sign in to network" popup. Setup mode only: skip when NAT/internet
+    // passthrough is on (those AP clients need real DNS, not a hijack).
+    if (!config_get_bool1(CONF_ITEM(KEY_CONFIG_WIFI_STA_AP_FORWARD))) {
+        dns_hijack_start();
+    }
 
     // Fresh start: DNS propagation not yet done
     dhcps_dns_propagated = false;
@@ -376,6 +403,13 @@ static void handle_ap_start(void *arg, esp_event_base_t base, int32_t id, void *
 static void handle_ap_stop(void *arg, esp_event_base_t base, int32_t id, void *event_data){
 
     ESP_LOGI(TAG, "WIFI_EVENT_AP_STOP");
+
+    dns_hijack_stop();
+
+    // Resync to ground truth: a missed STA-disconnect must not latch the
+    // "client connected" bit and hold the open AP up across sessions.
+    xEventGroupClearBits(wifi_event_group, WIFI_AP_STA_CONNECTED_BIT);
+    ap_rearm_count = 0;
 
     ap_active = false;
 
@@ -500,17 +534,26 @@ static void net_init_softap(bool ap_enable){
         uint8_t subnet          = config_get_u8(CONF_ITEM(KEY_CONFIG_WIFI_STA_SUBNET));
         ip_info_ap.netmask.addr = esp_netif_htonl(0xffffffffu << (32u - subnet));
 
-        // IP forwarding/NATP: let DHCPS offer DNS (we will set it later from STA)
-        if (config_get_bool1(CONF_ITEM(KEY_CONFIG_WIFI_STA_AP_FORWARD))) {
-
-            uint8_t dhcps_offer = true;
-
-            ESP_ERROR_CHECK(esp_netif_dhcps_option(esp_netif_ap, ESP_NETIF_OP_SET,
-                            ESP_NETIF_DOMAIN_NAME_SERVER, &dhcps_offer, 1));
-        }
+        // DHCP must hand clients a DNS server, or they never query us at all.
+        uint8_t dhcps_offer = true;
+        ESP_ERROR_CHECK(esp_netif_dhcps_option(esp_netif_ap, ESP_NETIF_OP_SET,
+                        ESP_NETIF_DOMAIN_NAME_SERVER, &dhcps_offer, 1));
 
         ESP_ERROR_CHECK(esp_netif_dhcps_stop(esp_netif_ap));
         ESP_ERROR_CHECK(esp_netif_set_ip_info(esp_netif_ap, &ip_info_ap));
+
+        // Setup mode (captive portal): hand out the AP's OWN ip as DNS so every
+        // lookup hits the on-device DNS hijack and the OS pops its sign-in page.
+        // Forward/NAT mode overrides this with the real upstream DNS once the STA
+        // gets an IP (handle_sta_got_ip).
+        if (!config_get_bool1(CONF_ITEM(KEY_CONFIG_WIFI_STA_AP_FORWARD))) {
+
+            esp_netif_dns_info_t ap_dns = {0};
+            ap_dns.ip.type            = ESP_IPADDR_TYPE_V4;
+            ap_dns.ip.u_addr.ip4.addr = ip_info_ap.ip.addr;
+            ESP_ERROR_CHECK(esp_netif_set_dns_info(esp_netif_ap, ESP_NETIF_DNS_MAIN, &ap_dns));
+        }
+
         ESP_ERROR_CHECK(esp_netif_dhcps_start(esp_netif_ap));
     }
 

@@ -65,8 +65,6 @@ static int  firmwareUpdateProgress      = 0;
 static int  countWebHandler             = 0; 
 static int  maxWebHandlerCount          = 16;
 
-static uint32_t hosting_admin_change_code   = 0; 
-
 #define IS_FILE_EXT(filename, ext) \
     (strcasecmp(&filename[strlen(filename) - sizeof(ext) + 1], ext) == 0)
 
@@ -256,96 +254,6 @@ static esp_err_t check_auth(httpd_req_t *req) {
     if (auth_method == AUTH_METHOD_HOTSPOT) return hotspot_auth(req);
     if (auth_method == AUTH_METHOD_BASIC) return basic_auth(req);
     return ESP_OK;
-}
-
-static esp_err_t adminmodepass_post_handler(httpd_req_t *req) {
-
-    esp_err_t   result_error = ESP_FAIL;
-
-    char        content[256] = {0};
-
-    int         ret          = httpd_req_recv(req, content, sizeof(content));
-
-    cJSON       *root        = NULL;
-
-    if (check_auth(req) == ESP_FAIL){
-
-        result_error = ESP_FAIL;
-
-    }else{
-
-        if (ret <= 0) {
-
-            httpd_resp_send_408(req);
-
-            result_error = ESP_FAIL;
-
-        }else{
-
-            root = cJSON_Parse(content);
-        
-            if (root == NULL) {
-
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no json");
-        
-                result_error = ESP_FAIL;
-        
-            }else if (cJSON_HasObjectItem(root, "admin_mode_pass")) {
-        
-                    cJSON *entry = cJSON_GetObjectItem(root, "admin_mode_pass");
-        
-                    if (cJSON_IsString(entry)) {
-        
-                            const char *pass    = entry->valuestring;
-                            size_t      length  = strlen(pass);
-
-                            char *serverPass;
-
-                            config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_MODE_PASSWORD), (void **) &serverPass);
-
-                            if (length > 0 && strcmp(pass, serverPass) == 0) {
-
-                                hosting_admin_change_code = esp_random() % 900000 + 100000;  // code for changing from hosting to admin mode
-
-                                char response[64];
-
-                                snprintf(response, sizeof(response), "{\"admin_mode_code\": \"%06lu\"}", (unsigned long)hosting_admin_change_code);
-
-                        
-                                httpd_resp_set_type(req, "application/json");
-                                httpd_resp_sendstr(req, response);
-        
-                                result_error = ESP_OK;
-
-                            }else{
-
-                                httpd_resp_set_status(req, "401 Unauthorized");
-                                httpd_resp_set_type(req, "application/json");
-                                httpd_resp_send(req, "{\"error\": \"Wrong password\"}", HTTPD_RESP_USE_STRLEN);
-
-                                result_error = ESP_FAIL;
-                            }
-                        
-                    }else{
-
-                        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "wrong json field");
-
-                        result_error = ESP_FAIL;
-                    }
-        
-            }else{
-
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "wrong json field");
-
-                result_error = ESP_FAIL;
-
-            }
-
-        }
-          
-    }
-
-    return result_error;
 }
 
 static esp_err_t log_get_handler(httpd_req_t *req) {
@@ -677,67 +585,6 @@ static bool parse_json_entry(const cJSON *root, const char *key, cJSON **entry) 
     return true;
 }
 
-static bool handle_mode_change(const cJSON *root, const config_item_t *item, bool *allow_password_change) {
-
-    bool result = false;
-
-    if (strcmp(item->key, KEY_CONFIG_MODE_ACTIVE) == 0){
-
-        cJSON *entry;
-
-        if (parse_json_entry(root, item->key, &entry) && cJSON_IsString(entry)){
-
-            State_t newState = strtoul(entry->valuestring, NULL, 10);
-            State_t oldState = get_state();
-
-            if (oldState == HOSTINGMODE && newState == ADMINMODE) {
-
-                cJSON *code_entry;
-
-                if (!parse_json_entry(root, "admin_mode_code", &code_entry) || !cJSON_IsString(code_entry)) {
-
-                    ESP_LOGI(TAG, "Admin mode change attempted without valid code.");
-
-                    result = false;
-
-                }else{
-
-                    uint32_t code = (uint32_t)strtoul(code_entry->valuestring, NULL, 10);
-
-                    if (hosting_admin_change_code != code) {
-
-                        ESP_LOGI(TAG, "Admin mode code invalid.");
-
-                        result = false;
-
-                    }else{
-
-                        config_set_str(KEY_CONFIG_MODE_PASSWORD, "");
-
-                        set_state(ADMINMODE);
-                
-                        result = true;
-
-                    }
-
-                }
-
-            } else if (oldState == ADMINMODE && newState == HOSTINGMODE) {
-
-                set_state(HOSTINGMODE);
-
-                *allow_password_change = true;
-
-                result = true;
-            }
-
-        }
-
-    }
-
-    return result;
-}
-
 static esp_err_t write_config_value(const config_item_t *item, const cJSON *entry, size_t length){
 
     esp_err_t err = ESP_OK;
@@ -908,7 +755,7 @@ static esp_err_t write_config_value(const config_item_t *item, const cJSON *entr
     return err;
 }
 
-static esp_err_t apply_config_value(const config_item_t *item, const cJSON *entry, bool allow_password_change) {
+static esp_err_t apply_config_value(const config_item_t *item, const cJSON *entry) {
 
     esp_err_t err = ESP_OK;
 
@@ -943,13 +790,6 @@ static esp_err_t apply_config_value(const config_item_t *item, const cJSON *entr
         err = ESP_OK;  // Skip processing
     }
 
-    // Password change not allowed in hosting mode
-    else if (strcmp(item->key, KEY_CONFIG_MODE_PASSWORD) == 0 && get_state() == HOSTINGMODE &&
-            !allow_password_change) {
-
-        err = ESP_OK;  // Skip processing
-    }
-
     // Otherwise: proceed with configuration handling
     else {
         
@@ -980,7 +820,6 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
     if (!parse_json(&root, buffer)) return ESP_FAIL;
 
     int     config_item_count       = 0;
-    bool    allow_password_change   = false;
 
     const   config_item_t *config_items = config_items_get(&config_item_count);
 
@@ -993,9 +832,7 @@ static esp_err_t config_post_handler(httpd_req_t *req) {
 
         if (!parse_json_entry(root, item->key, &entry)) continue;
 
-        if (handle_mode_change(root, item, &allow_password_change)) continue;
-
-        esp_err_t err = apply_config_value(item, entry, allow_password_change);
+        esp_err_t err = apply_config_value(item, entry);
 
         if (err != ESP_OK) {
 
@@ -1239,9 +1076,6 @@ static httpd_handle_t web_server_start(void)
         countWebHandler++;
 
         register_uri_handler(server, "/rtk/status", HTTP_GET, rtk_status_get_handler);
-        countWebHandler++;
-
-        register_uri_handler(server, "/adminmodepass", HTTP_POST, adminmodepass_post_handler);
         countWebHandler++;
 
         register_uri_handler(server, "/*", HTTP_GET, file_get_handler);

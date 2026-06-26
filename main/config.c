@@ -582,11 +582,6 @@ const config_item_t CONFIG_ITEMS[] = {
                 .key = KEY_CONFIG_MODE_COLOR,
                 .type = CONFIG_ITEM_TYPE_COLOR,
                 .def.color.rgba = 0x0044ff55u
-        },{
-                .key = KEY_CONFIG_MODE_PASSWORD,
-                .type = CONFIG_ITEM_TYPE_STRING,
-                .secret = true,
-                .def.str = ""
         },
 
         // RTKdata provisioning (IE enrollment + state machine)

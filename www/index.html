@@ -139,6 +139,13 @@
   <div id="setup" class="hidden">
     <div class="steps" id="steps"><div class="s on"></div><div class="s"></div><div class="s"></div></div>
 
+    <section id="alreadyOnline" class="card hidden">
+      <h2>Already connected</h2>
+      <p class="sub">This station is online on <b id="aoSsid">your Wi-Fi</b> at <a id="aoIpLink" href="#">its address</a>.</p>
+      <p class="sub">To open its status dashboard, connect your phone or computer to that same Wi-Fi and visit the address above. Reloading this page just restarts Wi-Fi setup, you don't need to repeat it.</p>
+      <button class="btn ghost" onclick="reconfig()">Reconfigure Wi-Fi</button>
+    </section>
+
     <section id="step1" class="card">
       <div class="hero">
         <span class="big" id="logoHero"></span>
@@ -298,12 +305,25 @@ async function boot(){
   const sta = st && st.wifi && st.wifi.sta;
   const connected = sta && sta.connected && sta.ip4;
   const mode = (via === "ap") ? "setup" : (via === "sta") ? "dash" : (connected ? "dash" : "setup");
-  if(mode === "dash") enterDash(); else enterSetup();
+  if(mode === "dash") enterDash();
+  else if(via === "ap" && connected) enterAlreadyOnline(sta);
+  else enterSetup();
 }
 function show(id){ $("#setup").classList.toggle("hidden", id!=="setup");
   $("#dash").classList.toggle("hidden", id!=="dash"); }
 function enterSetup(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null;} show("setup"); setState("Setup"); go(1); }
 function enterDash(){ show("dash"); setState("Online","green"); startStatusPoll(); }
+function enterAlreadyOnline(sta){
+  if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
+  show("setup"); setState("Online","green");
+  ["step1","step2","step2b","step3"].forEach(id => $("#"+id).classList.add("hidden"));
+  $("#steps").classList.add("hidden");
+  const ip = (sta && sta.ip4) || "";
+  $("#aoSsid").textContent = (sta && sta.ssid) || "your Wi-Fi";
+  const a = $("#aoIpLink"); a.href = "http://"+ip; a.textContent = "http://"+ip;
+  $("#alreadyOnline").classList.remove("hidden");
+}
+function reconfig(){ $("#alreadyOnline").classList.add("hidden"); $("#steps").classList.remove("hidden"); go(1); }
 
 async function loadIdentity(){
   try{
