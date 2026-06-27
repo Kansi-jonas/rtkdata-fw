@@ -59,5 +59,9 @@ jobs:
           git config user.name  "rtkdata-ci"
           git config user.email "ci@rtkdata.com"
           git add ota/rtkdata-fw.bin ota/www.bin ota/release.json
-          git commit -m "release: ${{ github.event.release.tag_name }} -> OTA channel (published)"
-          git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo "OTA channel already matches ${{ github.event.release.tag_name }}; nothing to publish"
+          else
+            git commit -m "release: ${{ github.event.release.tag_name }} -> OTA channel (published)"
+            git push origin HEAD:main
+          fi
