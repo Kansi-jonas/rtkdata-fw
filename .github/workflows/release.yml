@@ -1,16 +1,16 @@
 name: release
 
-# Tag a release (e.g. `git tag v1.0.1 && git push origin v1.0.1`) to build the
-# firmware and publish it to the OTA channel: copies rtkdata-fw.bin + www.bin into
-# ota/ and bumps ota/release.json to the tag version, committed back to main. The
-# box-side OTA (update.c) then sees the new version and self-updates.
+# Stage a release (build + DRAFT GitHub Release). NOTHING reaches a field device here.
 #
-# NOTE: this commits the .bin into the repo (same model OnoLink used on gitlab, and
-# what raw.githubusercontent OTA needs). If repo size becomes a concern, switch the
-# OTA URL to GitHub Release assets or S3.
+#   1. bump FW_VERSION in main/include/config.h, commit
+#   2. git tag v1.0.7 && git push origin v1.0.7
+#   3. this builds the firmware, verifies FW_VERSION == tag, and creates a DRAFT
+#      release with rtkdata-fw.bin + www.bin attached
+#   4. review the draft on the Releases page, then click "Publish release"
+#      -> the promote-ota workflow writes it to the OTA channel (main/ota/) and
+#         the fleet self-updates within ~24h
 #
-# TODO: inject the fleet provisioning secret here (RTK_ENROLL_SECRET) from a GitHub
-# secret instead of the source placeholder, before this goes to real devices.
+# The "Publish release" click is the only thing that goes live (the Freigabe).
 
 on:
   push:
@@ -20,13 +20,24 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+
+      - name: Verify FW_VERSION matches the tag
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          FW=$(grep -oP '#define\s+FW_VERSION\s+"\K[^"]+' main/include/config.h)
+          echo "tag=${VER}  FW_VERSION=${FW}"
+          if [ "${VER}" != "${FW}" ]; then
+            echo "::error::tag ${VER} != FW_VERSION ${FW} (bump config.h first; a mismatch causes an OTA re-flash loop)"
+            exit 1
+          fi
 
       - name: ESP-IDF build (v5.3.1, esp32)
         uses: espressif/esp-idf-ci-action@v1
@@ -35,30 +46,18 @@ jobs:
           target: esp32
           path: '.'
 
-      - name: Publish to OTA channel
-        run: |
-          set -euo pipefail
-          VER="${GITHUB_REF_NAME#v}"
-          echo "publishing version ${VER}"
-          cp build/rtkdata-fw.bin ota/rtkdata-fw.bin
-          cp build/www.bin       ota/www.bin
-          python3 - "$VER" <<'PY'
-          import json, sys
-          p = "ota/release.json"
-          d = json.load(open(p))
-          d["version"] = sys.argv[1]
-          json.dump(d, open(p, "w"), indent=2)
-          open(p, "a").write("\n")
-          PY
-          git config user.name  "rtkdata-ci"
-          git config user.email "ci@rtkdata.com"
-          git add ota/rtkdata-fw.bin ota/www.bin ota/release.json
-          git commit -m "release: ${GITHUB_REF_NAME} (firmware + www + manifest)"
-          git push origin HEAD:main
-
-      - name: GitHub Release
+      - name: Draft GitHub Release (review, then Publish to go live)
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
+          name: ${{ github.ref_name }}
+          body: |
+            Firmware ${{ github.ref_name }}.
+
+            This is a DRAFT. Review the attached binaries, then click "Publish release"
+            to push it to the OTA channel. The fleet self-updates within ~24h (boot
+            check + daily 00:00 poll). Only publish a version reachable by the 1.0.4+
+            OTA path; pre-1.0.4 devices must be USB-reflashed.
           files: |
-            ota/rtkdata-fw.bin
-            ota/www.bin
+            build/rtkdata-fw.bin
+            build/www.bin

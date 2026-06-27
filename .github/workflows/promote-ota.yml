@@ -1,0 +1,63 @@
+name: promote-ota
+
+# The Freigabe. Fires only when you PUBLISH a (draft) GitHub Release. It copies
+# the release's firmware assets into main/ota/ (the OTA channel the fleet polls)
+# and bumps ota/release.json to the release tag. Until you click "Publish
+# release", nothing reaches a field device.
+#
+# Channel URL is hardcoded in the firmware (config.h UPDATE_SERVER_URL ->
+# raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/), so the channel
+# stays on main/ota/ and this works for the already-shipped fleet.
+
+on:
+  release:
+    types: [released]
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download the published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.release.tag_name }}"
+          VER="${TAG#v}"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p 'rtkdata-fw.bin' -p 'www.bin' -D dl --clobber
+          test -f dl/rtkdata-fw.bin
+          test -f dl/www.bin
+          echo "VER=$VER" >> "$GITHUB_ENV"
+
+      - name: Sanity-check the binary carries this FW_VERSION
+        run: |
+          set -euo pipefail
+          if command -v strings >/dev/null && ! strings dl/rtkdata-fw.bin | grep -qx "$VER"; then
+            echo "::warning::FW_VERSION string '$VER' not found in the binary (verify the release was built from a matching config.h)"
+          fi
+
+      - name: Write the OTA channel (main/ota/)
+        run: |
+          set -euo pipefail
+          cp dl/rtkdata-fw.bin ota/rtkdata-fw.bin
+          cp dl/www.bin        ota/www.bin
+          python3 - "$VER" <<'PY'
+          import json, sys
+          d = json.load(open("ota/release.json"))
+          d["version"] = sys.argv[1]
+          json.dump(d, open("ota/release.json", "w"), indent=2)
+          open("ota/release.json", "a").write("\n")
+          PY
+          git config user.name  "rtkdata-ci"
+          git config user.email "ci@rtkdata.com"
+          git add ota/rtkdata-fw.bin ota/www.bin ota/release.json
+          git commit -m "release: ${{ github.event.release.tag_name }} -> OTA channel (published)"
+          git push origin HEAD:main
