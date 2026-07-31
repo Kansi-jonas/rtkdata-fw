@@ -160,7 +160,9 @@ static void uart_task(void *ctx) {
     uint8_t buffer[UART_BUFFER_SIZE];
 
     while (true) {
-        int32_t len = uart_read_bytes(uart_port, buffer, sizeof(buffer), pdMS_TO_TICKS(50));
+        // sizeof(buffer) - 1: the '\0' below lands one past the read on a
+        // full buffer otherwise (stack smash)
+        int32_t len = uart_read_bytes(uart_port, buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(50));
         if (len < 0) {
             ESP_LOGE(TAG, "Error reading from UART");
         } else if (len == 0) {
