@@ -620,6 +620,51 @@ static void ntrip_server_send_data(ntrip_instance_t *inst, int32_t length, void 
             }
         }
 
+    } else if (sent > 0 && sent < length) {
+
+        /* SHORT WRITE (2026-07-31).
+         *
+         * lwIP returns a positive count smaller than requested when SO_SNDTIMEO
+         * expires after part of the buffer was already queued. The previous code
+         * counted that as a full success and silently discarded the remaining
+         * length - sent bytes.
+         *
+         * That buffer comes straight off the UART with arbitrary boundaries, so
+         * the discard lands MID-RTCM-FRAME: the next write resumes at a false
+         * offset, the length/CRC framing is destroyed, and every consumer
+         * downstream has to resynchronise. Measured at the caster over seven
+         * days: 2125 junk + 16 CRC-invalid bytes, exclusively in APAC and
+         * exclusively on EDGE muxes, none on any third-party source.
+         *
+         * A partial write means the stream is corrupt from here on, and it
+         * cannot be repaired by writing more: the missing bytes are gone. The
+         * only honest options are to buffer the remainder (needs a frame-aware
+         * queue and an async drain, see review 2026-07-31 - deliberately NOT
+         * done here) or to end the connection. We end it. The rover loses the
+         * reconnect interval, but never receives a truncated frame.
+         *
+         * Cost: one extra reconnect per short write. Observed frequency at the
+         * caster is a handful per week per station, so this is cheap. If it ever
+         * becomes frequent, the metric to watch is upload connection lifetime in
+         * the caster log; that is the signal to build the real queue.
+         */
+        ESP_LOGW(TAG, "[%d] short write (%d of %d bytes), closing socket to avoid "
+                      "emitting a truncated RTCM frame", inst->index, sent, (int)length);
+
+        supervisor_note_caster_tx(sent);
+
+        if (inst->stats) {
+            stream_stats_increment(inst->stats, 0, sent);
+        }
+
+        inst->reconnect_req = true;
+        destroy_socket(&inst->sock);
+
+        if (inst->task_server) {
+
+            vTaskResume(inst->task_server);
+        }
+
     } else if (sent > 0) {
 
         inst->blocked_sends = 0;
