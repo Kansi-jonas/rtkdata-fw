@@ -38,6 +38,7 @@
 #include "update.h"
 #include "state.h"
 #include "provisioning.h"
+#include "interface/ntrip.h"
 
 // Max length a file path can have on storage
 #define FILE_PATH_MAX (ESP_VFS_PATH_MAX + CONFIG_SPIFFS_OBJ_NAME_LEN)
@@ -1018,6 +1019,52 @@ static esp_err_t rtk_status_get_handler(httpd_req_t *req) {
     return json_response(req, root);
 }
 
+// NTRIP send-path diagnostics (parser/ring/per-instance sender counters).
+// Counter names are deliberate: accepted_to_lwip is what the stack took,
+// not what reached the wire.
+static esp_err_t ntrip_tx_stats_get_handler(httpd_req_t *req) {
+    if (check_auth(req) == ESP_FAIL) return ESP_FAIL;
+
+    ntrip_ingest_stats_t ing;
+    ntrip_server_ingest_stats(&ing);
+
+    static ntrip_tx_stats_t txs[NTRIP_MAX_INSTANCES];
+    size_t n = ntrip_server_tx_stats(txs, NTRIP_MAX_INSTANCES);
+
+    cJSON *root = cJSON_CreateObject();
+
+    cJSON *ingest = cJSON_AddObjectToObject(root, "ingest");
+    cJSON_AddNumberToObject(ingest, "frames_ok", (double)ing.frames_ok);
+    cJSON_AddNumberToObject(ingest, "bytes_ok", (double)ing.bytes_ok);
+    cJSON_AddNumberToObject(ingest, "bytes_discarded", (double)ing.bytes_discarded);
+    cJSON_AddNumberToObject(ingest, "crc_errors", (double)ing.crc_errors);
+    cJSON_AddNumberToObject(ingest, "ring_pushed_frames", (double)ing.ring_pushed_frames);
+    cJSON_AddNumberToObject(ingest, "ring_cum_bytes", (double)ing.ring_cum_bytes);
+
+    cJSON *arr = cJSON_AddArrayToObject(root, "instances");
+    for (size_t i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "index", txs[i].index);
+        cJSON_AddBoolToObject(o, "connected", txs[i].connected);
+        cJSON_AddNumberToObject(o, "accepted_to_lwip", (double)txs[i].accepted_to_lwip);
+        cJSON_AddNumberToObject(o, "sent_frames", (double)txs[i].sent_frames);
+        cJSON_AddNumberToObject(o, "copied_bytes", (double)txs[i].copied_bytes);
+        cJSON_AddNumberToObject(o, "dropped_bytes", (double)txs[i].dropped_bytes);
+        cJSON_AddNumberToObject(o, "skipped_bytes", (double)txs[i].skipped_bytes);
+        cJSON_AddNumberToObject(o, "skipped_frames", txs[i].skipped_frames);
+        cJSON_AddNumberToObject(o, "dropped_frames_stale", txs[i].dropped_frames_stale);
+        cJSON_AddNumberToObject(o, "dropped_stale_bytes", (double)txs[i].dropped_stale_bytes);
+        cJSON_AddNumberToObject(o, "eagain_count", (double)txs[i].eagain_count);
+        cJSON_AddNumberToObject(o, "reconnects", txs[i].reconnects);
+        cJSON_AddNumberToObject(o, "pending", txs[i].pending);
+        cJSON_AddNumberToObject(o, "max_queue_age_ms", txs[i].max_queue_age_ms);
+        cJSON_AddNumberToObject(o, "last_sock_errno", txs[i].last_sock_errno);
+        cJSON_AddItemToArray(arr, o);
+    }
+
+    return json_response(req, root);
+}
+
 static esp_err_t register_uri_handler(httpd_handle_t server, const char *path, httpd_method_t method, esp_err_t (*handler)(httpd_req_t *r)) {
     httpd_uri_t uri_config_get = {
             .uri        = path,
@@ -1076,6 +1123,9 @@ static httpd_handle_t web_server_start(void)
         countWebHandler++;
 
         register_uri_handler(server, "/rtk/status", HTTP_GET, rtk_status_get_handler);
+        countWebHandler++;
+
+        register_uri_handler(server, "/ntrip/tx_stats", HTTP_GET, ntrip_tx_stats_get_handler);
         countWebHandler++;
 
         register_uri_handler(server, "/*", HTTP_GET, file_get_handler);

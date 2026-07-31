@@ -14,8 +14,11 @@
 #include <freertos/event_groups.h>
 #include <freertos/task.h> 
 #include <esp_ota_ops.h>
+#include <esp_timer.h>
 #include <errno.h>
+#include <fcntl.h>
 #include "interface/ntrip.h"
+#include "interface/ntrip_tx_core.h"
 #include "config.h"
 #include "util.h"
 #include "uart.h"
@@ -24,8 +27,12 @@
 static const char *TAG = "NTRIP_SERVER";
 
 #define BUFFER_SIZE 512
-#define MAX_NTRIP_SERVERS 10   // 0 … 9
+#define MAX_NTRIP_SERVERS NTRIP_MAX_INSTANCES   // 0 … 9
 #define NTRIP_SEND_TIMEOUT_MS 500
+#define NTRIP_RECV_TIMEOUT_MS 10000
+#define NTRIP_DRAIN_WAIT_MS 200
+#define NTRIP_PROBE_INTERVAL_MS 2000
+#define NTRIP_DRAIN_MAX_SPINS 64
 
 #define NTRIP_SLEEP_TASK_STACK      4096   // in Words (FreeRTOS-Stackeinheit)
 #define NTRIP_SLEEP_STACK_WARN_WORDS 128   // Threshold: < 128 Words free -> Log-Warning
@@ -46,9 +53,9 @@ typedef struct {
     retry_delay_handle_t    retry;           // Retry-Backoff
     int                     sock;            // Socket for this instance
     int                     data_keep_alive; // KeepAlive counter
-    int                     blocked_sends;   // counter for blocked sends
+    ntrip_tx_t              tx;              // sender state + counters (tx core)
     volatile bool           reconnect_req;   // supervisor / send-error -> reconnect
-    
+
 } ntrip_instance_t;
 
 //global instance register
@@ -58,6 +65,21 @@ static size_t            g_instance_count               = 0;
 static SemaphoreHandle_t g_instances_mutex              = NULL;
 
 static bool s_uart_handler_registered = false;
+
+// Shared RTCM ingest: one parser (single GNSS UART source) feeding one frame
+// ring, all statically allocated. Only CRC-valid complete frames enter the
+// ring; the per-instance server tasks drain it. The UART path touches no
+// socket anywhere.
+static rtcm_parser_t     g_rtcm_parser;
+static ntrip_ring_t      g_frame_ring;
+static SemaphoreHandle_t g_ring_mutex = NULL;
+
+static void ring_lock_hook(void *ctx)   { xSemaphoreTake((SemaphoreHandle_t)ctx, portMAX_DELAY); }
+static void ring_unlock_hook(void *ctx) { xSemaphoreGive((SemaphoreHandle_t)ctx); }
+
+static inline uint32_t ntrip_now_ms(void) {
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
 
 //helper
 
@@ -367,8 +389,11 @@ static void ntrip_server_load_config_from_storage(ntrip_instance_t *inst, char *
 
 }
 
-// Socket send timeout setzen
-static void ntrip_server_set_socket_timeout(ntrip_instance_t *inst)
+// Handshake socket timeouts. The SOURCE request and its response run on a
+// blocking socket; SO_RCVTIMEO bounds the response wait (the old code could
+// block in read() forever). After the handshake the socket goes non-blocking
+// and neither timeout applies to the data path.
+static void ntrip_server_set_handshake_timeouts(ntrip_instance_t *inst)
 {
     struct timeval tv;
 
@@ -377,9 +402,79 @@ static void ntrip_server_set_socket_timeout(ntrip_instance_t *inst)
 
     if (setsockopt(inst->sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
 
-        ESP_LOGW(TAG, "[%d] Failed to set SO_SNDTIMEO: %d %s", inst->index, 
+        ESP_LOGW(TAG, "[%d] Failed to set SO_SNDTIMEO: %d %s", inst->index,
             errno, strerror(errno));
     }
+
+    tv.tv_sec  = NTRIP_RECV_TIMEOUT_MS / 1000;
+    tv.tv_usec = (NTRIP_RECV_TIMEOUT_MS % 1000) * 1000;
+
+    if (setsockopt(inst->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+
+        ESP_LOGW(TAG, "[%d] Failed to set SO_RCVTIMEO: %d %s", inst->index,
+            errno, strerror(errno));
+    }
+}
+
+// The send callback for the tx core. Runs exclusively in this instance's own
+// server task on a non-blocking socket: nothing here can stall another
+// instance, the UART path, or the event loop.
+static int ntrip_server_sock_send(void *ctx, const uint8_t *buf, size_t len, int *out_errno)
+{
+    ntrip_instance_t *inst = (ntrip_instance_t *)ctx;
+
+    int n = send(inst->sock, buf, len, 0);
+
+    if (n > 0) {
+
+        supervisor_note_caster_tx(n);
+
+        if (inst->stats) {
+            stream_stats_increment(inst->stats, 0, n);
+        }
+
+    } else if (n < 0) {
+
+        *out_errno = errno;
+    }
+
+    return n;
+}
+
+static bool ntrip_server_make_nonblocking(ntrip_instance_t *inst)
+{
+    int fl = fcntl(inst->sock, F_GETFL, 0);
+
+    if (fl < 0 || fcntl(inst->sock, F_SETFL, fl | O_NONBLOCK) < 0) {
+
+        ESP_LOGW(TAG, "[%d] fcntl O_NONBLOCK failed: %d %s", inst->index,
+            errno, strerror(errno));
+        return false;
+    }
+
+    return true;
+}
+
+// Detect a closed/broken connection; consumes and discards caster chatter so
+// the receive window can never fill up. Returns false when the connection is
+// gone.
+static bool ntrip_server_probe_socket(ntrip_instance_t *inst)
+{
+    char scratch[64];
+
+    int r = recv(inst->sock, scratch, sizeof(scratch), MSG_DONTWAIT);
+
+    if (r == 0) {
+        ESP_LOGW(TAG, "[%d] caster closed connection", inst->index);
+        return false;
+    }
+
+    if (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
+        ESP_LOGW(TAG, "[%d] socket probe error %d", inst->index, errno);
+        return false;
+    }
+
+    return true;
 }
 
 // Monitoring after successfull connect
@@ -470,8 +565,6 @@ static void ntrip_server_task(void *ctx){
 
     while (true) {
 
-        inst->blocked_sends = 0;
-
         char *txbuf = NULL;
         char *host  = NULL;
         char *mp    = NULL;
@@ -495,7 +588,7 @@ static void ntrip_server_task(void *ctx){
         ERROR_ACTION(TAG, inst->sock == CONNECT_SOCKET_ERROR_CONNECT, goto _error,
                      "Connect failed");
 
-        ntrip_server_set_socket_timeout(inst);
+        ntrip_server_set_handshake_timeouts(inst);
 
         txbuf = malloc(BUFFER_SIZE);
 
@@ -508,9 +601,21 @@ static void ntrip_server_task(void *ctx){
                 (pwd ? pwd : ""), (mp ? mp : ""), NTRIP_SERVER_NAME,
                  &esp_app_get_description()->version[1]);
 
-        int err = write(inst->sock, txbuf, strlen(txbuf));
+        // The request must go out completely; a short write here would desync
+        // the handshake exactly like it desynced RTCM frames on the data path.
+        size_t req_len = strlen(txbuf);
+        size_t req_off = 0;
 
-        ERROR_ACTION(TAG, err < 0, goto _error, "Send request failed: %d %s", errno, strerror(errno));
+        while (req_off < req_len) {
+
+            int werr = write(inst->sock, txbuf + req_off, req_len - req_off);
+
+            if (werr <= 0) break;
+
+            req_off += (size_t)werr;
+        }
+
+        ERROR_ACTION(TAG, req_off != req_len, goto _error, "Send request failed: %d %s", errno, strerror(errno));
 
         int len = read(inst->sock, txbuf, BUFFER_SIZE - 1);
 
@@ -524,6 +629,9 @@ static void ntrip_server_task(void *ctx){
                     "Mountpoint connect error: %s", status == NULL ? "HTTP malformed" : status);
 
         free(status);
+
+        ERROR_ACTION(TAG, !ntrip_server_make_nonblocking(inst), goto _error,
+                     "Could not switch socket to non-blocking");
 
         ESP_LOGI(TAG, "[%d] Connected to %s:%u/%s", inst->index, host ? host : "", port, mp ? mp : "");
 
@@ -548,19 +656,64 @@ static void ntrip_server_task(void *ctx){
         // Monitoring after connected
         ntrip_server_log_connect_monitoring(inst);
 
-        // Hold the connection up, but actively detect a half-open socket instead of
-        // suspending forever (the stock bug: a GNSS stall meant no send ever failed,
-        // so a dead caster socket was never noticed -> the station went dark).
+        // This task owns the socket exclusively from here on. The UART path
+        // only parses into the shared frame ring and notifies us; we drain
+        // complete RTCM frames to the caster on a non-blocking socket. The
+        // probe (recv) keeps detecting a half-open socket like before (the
+        // stock bug: a GNSS stall meant no send ever failed, so a dead caster
+        // socket was never noticed -> the station went dark).
+        ntrip_tx_reset_conn(&inst->tx, &g_frame_ring, ntrip_now_ms());
+        ulTaskNotifyTake(pdTRUE, 0);   // clear notifications from before this connect
+
         inst->reconnect_req = false;
+        uint32_t last_probe_ms = ntrip_now_ms();
+
         while (!inst->reconnect_req) {
-            char probe;
-            int r = recv(inst->sock, &probe, 1, MSG_DONTWAIT | MSG_PEEK);
-            if (r == 0) { ESP_LOGW(TAG, "[%d] caster closed connection", inst->index); break; }
-            if (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
-                ESP_LOGW(TAG, "[%d] socket probe error %d", inst->index, errno); break;
+
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(NTRIP_DRAIN_WAIT_MS));
+
+            uint32_t now = ntrip_now_ms();
+
+            // Drain until the ring is empty or the socket pushes back. The
+            // spin cap only bounds one wake-up; the outer loop continues.
+            ntrip_tx_poll_result_t pr;
+            int spins = 0;
+
+            do {
+                pr = ntrip_tx_poll(&inst->tx, &g_frame_ring, now,
+                                   NTRIP_TX_MAX_SENDS_PER_POLL,
+                                   NTRIP_TX_STALE_DROP_MS,
+                                   ntrip_server_sock_send, inst);
+            } while (pr == NTRIP_TX_POLL_PROGRESS && ++spins < NTRIP_DRAIN_MAX_SPINS);
+
+            if (pr == NTRIP_TX_POLL_ERROR) {
+                ESP_LOGW(TAG, "[%d] send error (%d: %s), closing connection",
+                         inst->index, inst->tx.last_sock_errno,
+                         strerror(inst->tx.last_sock_errno));
+                break;
             }
-            vTaskDelay(pdMS_TO_TICKS(2000));
+
+            if (ntrip_tx_stalled(&inst->tx, now, NTRIP_TX_PROGRESS_TIMEOUT_MS)) {
+                ESP_LOGW(TAG, "[%d] no send progress for %d ms with %u bytes pending, "
+                         "reconnecting", inst->index, NTRIP_TX_PROGRESS_TIMEOUT_MS,
+                         (unsigned)ntrip_tx_pending(&inst->tx));
+                break;
+            }
+
+            now = ntrip_now_ms();
+
+            if ((uint32_t)(now - last_probe_ms) >= NTRIP_PROBE_INTERVAL_MS) {
+
+                last_probe_ms = now;
+
+                if (!ntrip_server_probe_socket(inst)) break;
+            }
         }
+
+        // Account whatever was still pending; the next connection starts with
+        // a fresh, complete frame, never the rest of this one.
+        ntrip_tx_abort(&inst->tx);
+        inst->tx.reconnects++;
 
         // Disconnect handling (Bits/LED/Logs)
         ntrip_server_handle_disconnect(inst, host, port, mp);
@@ -576,130 +729,29 @@ static void ntrip_server_task(void *ctx){
 
 // -----------------------------------------------------------UART-----------------------------------------------------------------//
 
-// Send data to a instance
-static void ntrip_server_send_data(ntrip_instance_t *inst, int32_t length, void *buffer) {
+static void ntrip_server_on_frame(void *ctx, const uint8_t *frame, uint16_t len,
+    uint32_t now) {
 
-    int sent = write(inst->sock, buffer, length);
+    (void)ctx;
 
-    if (sent < 0) {
-
-        int errsv = errno;
-
-        if (errsv == EWOULDBLOCK || errsv == EAGAIN) {
-
-            // Send buffer is full or timeout -> Paket drop, no reaction
-            ESP_LOGW(TAG,"[%d] send would block/timeout, dropping %d bytes",
-                     inst->index, (int)length);
-
-            inst->blocked_sends++;         
-
-            if (inst->blocked_sends > 20) {
-
-                ESP_LOGW(TAG, "[%d] too many blocked sends, closing socket/reconnecting", inst->index);
-
-                inst->reconnect_req = true;
-                destroy_socket(&inst->sock);
-
-                if (inst->task_server) {
-
-                    vTaskResume(inst->task_server);
-                }
-            }
-
-        } else {
-
-            ESP_LOGW(TAG,"[%d] send error (%d: %s), closing socket",
-                     inst->index, errsv, strerror(errsv));
-
-            inst->reconnect_req = true;
-            destroy_socket(&inst->sock);
-
-            if (inst->task_server) {
-
-                vTaskResume(inst->task_server);
-            }
-        }
-
-    } else if (sent > 0 && sent < length) {
-
-        /* SHORT WRITE (2026-07-31).
-         *
-         * lwIP returns a positive count smaller than requested when SO_SNDTIMEO
-         * expires after part of the buffer was already queued. The previous code
-         * counted that as a full success and silently discarded the remaining
-         * length - sent bytes.
-         *
-         * That buffer comes straight off the UART with arbitrary boundaries, so
-         * the discard lands MID-RTCM-FRAME: the next write resumes at a false
-         * offset, the length/CRC framing is destroyed, and every consumer
-         * downstream has to resynchronise. Measured at the caster over seven
-         * days: 2125 junk + 16 CRC-invalid bytes, exclusively in APAC and
-         * exclusively on EDGE muxes, none on any third-party source.
-         *
-         * A partial write means the stream is corrupt from here on, and it
-         * cannot be repaired by writing more: the missing bytes are gone. The
-         * only honest options are to buffer the remainder (needs a frame-aware
-         * queue and an async drain, see review 2026-07-31 - deliberately NOT
-         * done here) or to end the connection. We end it. The rover loses the
-         * reconnect interval, but never receives a truncated frame.
-         *
-         * Cost: one extra reconnect per short write. Observed frequency at the
-         * caster is a handful per week per station, so this is cheap. If it ever
-         * becomes frequent, the metric to watch is upload connection lifetime in
-         * the caster log; that is the signal to build the real queue.
-         */
-        ESP_LOGW(TAG, "[%d] short write (%d of %d bytes), closing socket to avoid "
-                      "emitting a truncated RTCM frame", inst->index, sent, (int)length);
-
-        supervisor_note_caster_tx(sent);
-
-        if (inst->stats) {
-            stream_stats_increment(inst->stats, 0, sent);
-        }
-
-        inst->reconnect_req = true;
-        destroy_socket(&inst->sock);
-
-        if (inst->task_server) {
-
-            vTaskResume(inst->task_server);
-        }
-
-    } else if (sent > 0) {
-
-        inst->blocked_sends = 0;
-        supervisor_note_caster_tx(sent);
-
-        if (inst->stats) {
-            stream_stats_increment(inst->stats, 0, sent);
-        }
-    }
-
-    // sent == 0 -> ignore
+    ntrip_ring_push(&g_frame_ring, frame, len, now);
 }
 
-// complete processing for one instance
-static void ntrip_server_handle_uart_instance(ntrip_instance_t *inst,int32_t length, void *buffer) {
-
-    if (inst && inst->ev) {
-
-        EventBits_t bits = xEventGroupGetBits(inst->ev);
-
-        // EventBits & KeepAlive update, check if we should send
-        if (ntrip_server_update_data_state(inst, bits)) {
-            
-            ntrip_server_send_data(inst, length, buffer);
-        }
-
-    }
-
-}
-
+// UART data on the default event loop. This path touches no socket: it parses
+// the byte stream, pushes complete CRC-valid frames into the shared ring, and
+// notifies the connected instances' server tasks. Everything here is bounded;
+// a stalled caster socket cannot back up into this handler (that was the core
+// defect of the rejected 2026-07-31 queue design).
 static void ntrip_server_uart_handler(void* handler_args,esp_event_base_t base,int32_t length,
     void* buffer) {
 
     (void)handler_args;
     (void)base;
+
+    if (length <= 0 || !buffer) return;
+
+    rtcm_parser_feed(&g_rtcm_parser, (const uint8_t *)buffer, (size_t)length,
+                     ntrip_now_ms(), ntrip_server_on_frame, NULL);
 
     if (g_instances_mutex){
 
@@ -709,7 +761,17 @@ static void ntrip_server_uart_handler(void* handler_args,esp_event_base_t base,i
 
             ntrip_instance_t *inst = g_instances[k];
 
-            ntrip_server_handle_uart_instance(inst, length, buffer);
+            if (inst && inst->ev) {
+
+                EventBits_t bits = xEventGroupGetBits(inst->ev);
+
+                // EventBits & KeepAlive update; wake the drain task if the
+                // instance is connected
+                if (ntrip_server_update_data_state(inst, bits) && inst->task_server) {
+
+                    xTaskNotifyGive(inst->task_server);
+                }
+            }
         }
 
         xSemaphoreGive(g_instances_mutex);
@@ -765,6 +827,23 @@ void ntrip_server_init() {
             return;
         }
 
+    }
+
+    // RTCM ingest (parser + ring) MUST exist before the UART handler can run.
+    // All statically allocated; only the mutex can fail.
+    if (!g_ring_mutex) {
+
+        g_ring_mutex = xSemaphoreCreateMutex();
+
+        if (!g_ring_mutex) {
+
+            ESP_LOGE(TAG, "Failed to create g_ring_mutex, NTRIP disabled");
+
+            return;
+        }
+
+        rtcm_parser_init(&g_rtcm_parser);
+        ntrip_ring_init(&g_frame_ring, ring_lock_hook, ring_unlock_hook, g_ring_mutex);
     }
 
     // UART-Handler EINMAL registrieren
@@ -871,4 +950,66 @@ void ntrip_server_reconnect_all(void) {
         if (inst) inst->reconnect_req = true;
     }
     xSemaphoreGive(g_instances_mutex);
+}
+
+// Diagnostics snapshot for the web UI (/ntrip/tx_stats). The 64-bit counters
+// are written by other tasks without a lock, so a value can tear on this
+// 32-bit target; that is acceptable for diagnostics and keeps the hot path
+// free of extra locking.
+size_t ntrip_server_tx_stats(ntrip_tx_stats_t *out, size_t max) {
+
+    size_t n = 0;
+
+    if (!g_instances_mutex || !out) return 0;
+
+    xSemaphoreTake(g_instances_mutex, portMAX_DELAY);
+
+    for (size_t k = 0; k < g_instance_count && n < max; ++k) {
+
+        ntrip_instance_t *inst = g_instances[k];
+
+        if (!inst) continue;
+
+        const ntrip_tx_t *tx = &inst->tx;
+        ntrip_tx_stats_t *s = &out[n++];
+
+        s->index               = inst->index;
+        s->connected           = inst->ev &&
+                                 (xEventGroupGetBits(inst->ev) & CASTER_READY_BIT);
+        s->accepted_to_lwip    = tx->accepted_to_lwip;
+        s->sent_frames         = tx->sent_frames;
+        s->copied_bytes        = tx->copied_bytes;
+        s->dropped_bytes       = tx->dropped_bytes;
+        s->skipped_bytes       = tx->skipped_bytes;
+        s->skipped_frames      = tx->skipped_frames;
+        s->dropped_frames_stale = tx->dropped_frames_stale;
+        s->dropped_stale_bytes = tx->dropped_stale_bytes;
+        s->eagain_count        = tx->eagain_count;
+        s->reconnects          = tx->reconnects;
+        s->pending             = ntrip_tx_pending(tx);
+        s->max_queue_age_ms    = tx->max_queue_age_ms;
+        s->last_sock_errno     = tx->last_sock_errno;
+    }
+
+    xSemaphoreGive(g_instances_mutex);
+
+    return n;
+}
+
+void ntrip_server_ingest_stats(ntrip_ingest_stats_t *out) {
+
+    if (!out) return;
+
+    memset(out, 0, sizeof(*out));
+
+    if (g_ring_mutex) xSemaphoreTake(g_ring_mutex, portMAX_DELAY);
+
+    out->frames_ok          = g_rtcm_parser.frames_ok;
+    out->bytes_ok           = g_rtcm_parser.bytes_ok;
+    out->bytes_discarded    = g_rtcm_parser.bytes_discarded;
+    out->crc_errors         = g_rtcm_parser.crc_errors;
+    out->ring_pushed_frames = g_frame_ring.pushed_frames;
+    out->ring_cum_bytes     = g_frame_ring.cum_bytes;
+
+    if (g_ring_mutex) xSemaphoreGive(g_ring_mutex);
 }
