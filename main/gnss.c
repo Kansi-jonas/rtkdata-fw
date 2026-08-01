@@ -17,6 +17,7 @@
  *
  * License: GPLv3 (see LICENSE).
  */
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -96,10 +97,16 @@ static bool send_cmd_acked(const char *cmd, int retries) {
         for (int waited = 0; waited < ACK_TIMEOUT_MS; waited += ACK_POLL_MS) {
             vTaskDelay(pdMS_TO_TICKS(ACK_POLL_MS));
             if (cap_contains("response: OK")) {
+                // A command response IS receiver liveness: during (re)config the
+                // RTCM output is intentionally stopped, and the frame-based
+                // watchdog must not count silence WE caused (2026-08-01: it
+                // hardware-reset a healthy receiver mid-configuration).
+                supervisor_note_gnss_rx();
                 ESP_LOGI(TAG, "ack: %.*s", show, cmd);
                 return true;
             }
             if (cap_contains("PARSING FAIL")) {            // matches the "FAILD" typo too
+                supervisor_note_gnss_rx();                 // rejected, but alive
                 ESP_LOGW(TAG, "rejected: %.*s", show, cmd);
                 return false;                              // won't pass on retry
             }
@@ -216,6 +223,21 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
         ESP_LOGE(TAG, "rejecting invalid fixed base %.9f %.9f", lat_deg, lon_deg);
         uart_nmea("$PESP,RTK,GNSS,FIXEDBASE,0");
         return false;
+    }
+
+    // Idempotence gate: the IE re-pushes the coordinate on heartbeat replies,
+    // and boot already applied the NVS-persisted one. Re-sending "mode base"
+    // for an UNCHANGED coordinate makes the UM980 stop its RTCM output for
+    // many seconds for zero gain (measured 2026-08-01: an 18+ s stall right
+    // after boot that tripped the liveness watchdog into a needless receiver
+    // reset). Epsilons: ~0.1 mm in position, 0.5 mm in height.
+    double cur_lat, cur_lon, cur_h;
+    if (gnss_load_fixed_base(&cur_lat, &cur_lon, &cur_h) &&
+        fabs(cur_lat - lat_deg) < 1e-9 &&
+        fabs(cur_lon - lon_deg) < 1e-9 &&
+        fabs(cur_h - height_m) < 5e-4) {
+        ESP_LOGI(TAG, "fixed base unchanged, skipping re-apply");
+        return true;
     }
 
     char cmd[96];

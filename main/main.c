@@ -132,6 +132,11 @@ void app_main()
     init_state();
     uart_init();
 
+    // RTCM ingest (parser + frame ring) comes up WITH the UART, not with the
+    // data plane below: the supervisor judges GNSS liveness by valid frames
+    // from this path, and its boot grace must not race the OTA window.
+    ntrip_server_ingest_init();
+
     // Anti-brick: count this boot. If we have crash-looped MAX_BOOT_LOOPS times
     // without ever reaching a healthy run, this falls back to the factory app
     // before the risky bring-up below. Runs after NVS (config_init) + UART ready.
