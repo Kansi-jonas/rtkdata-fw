@@ -40,6 +40,21 @@ jobs:
           target: esp32
           path: '.'
 
+      # Boot gate. The compiler and the host tests both pass on an image that
+      # panics in app_main: on 2026-08-01 a reordered init took a semaphore that
+      # did not exist yet and every device would have asserted at boot, before
+      # the anti-brick guard could count it. This boots the real image in QEMU
+      # and fails the build if it does not reach the banner. See
+      # tools/qemu-smoke.sh for what it can and cannot cover (no radio, no
+      # UM980, no caster).
+      - name: QEMU boot smoke test
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.1
+          target: esp32
+          path: '.'
+          command: tools/qemu-smoke.sh build
+
       - name: Collect OTA artifacts
         run: |
           mkdir -p out
