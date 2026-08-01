@@ -130,12 +130,16 @@ void app_main()
 
     config_init();
     init_state();
-    uart_init();
 
-    // RTCM ingest (parser + frame ring) comes up WITH the UART, not with the
+    // RTCM ingest (parser + frame ring) comes up BEFORE the UART task exists:
+    // uart_task calls ntrip_server_ingest_uart() synchronously, and the UM980
+    // streams from power-on, so bytes can arrive the moment the task runs.
+    // Initializing after uart_init() raced the first chunks against the
+    // parser/ring memset (v1.1.2 audit 2026-08-01). Still long before the
     // data plane below: the supervisor judges GNSS liveness by valid frames
     // from this path, and its boot grace must not race the OTA window.
     ntrip_server_ingest_init();
+    uart_init();
 
     // Anti-brick: count this boot. If we have crash-looped MAX_BOOT_LOOPS times
     // without ever reaching a healthy run, this falls back to the factory app

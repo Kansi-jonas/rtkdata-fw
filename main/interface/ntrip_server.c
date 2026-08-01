@@ -863,8 +863,9 @@ void ntrip_server_ingest_uart(const uint8_t *data, size_t len) {
 
 }
 
-// RTCM ingest (parser + ring). Idempotent. MUST run right after uart_init(),
-// long BEFORE the data plane: GNSS liveness is noted per valid frame in this
+// RTCM ingest (parser + ring). Idempotent. MUST run BEFORE uart_init() spawns
+// uart_task (which feeds ntrip_server_ingest_uart synchronously), and long
+// BEFORE the data plane: GNSS liveness is noted per valid frame in this
 // path, and the supervisor's 30 s boot grace must never expire just because
 // the OTA window delayed ntrip_server_init(). (Found 2026-08-01 via the new
 // heartbeat telemetry: a slow OTA check let the supervisor hardware-reset a
@@ -873,9 +874,9 @@ void ntrip_server_ingest_init(void) {
 
     if (g_ring_mutex) return;
 
-    g_ring_mutex = xSemaphoreCreateMutex();
+    SemaphoreHandle_t mtx = xSemaphoreCreateMutex();
 
-    if (!g_ring_mutex) {
+    if (!mtx) {
 
         ESP_LOGE(TAG, "Failed to create g_ring_mutex, RTCM ingest disabled");
 
@@ -883,7 +884,16 @@ void ntrip_server_ingest_init(void) {
     }
 
     rtcm_parser_init(&g_rtcm_parser);
-    ntrip_ring_init(&g_frame_ring, ring_lock_hook, ring_unlock_hook, g_ring_mutex);
+    ntrip_ring_init(&g_frame_ring, ring_lock_hook, ring_unlock_hook, mtx);
+
+    // Publish LAST: g_ring_mutex doubles as the ready flag that
+    // ntrip_server_ingest_uart() checks, so parser + ring must be fully
+    // initialized before it becomes non-NULL. Release ordering keeps the
+    // compiler from hoisting the store above the init calls; main.c also
+    // sequences ingest_init before uart_init as the primary guarantee
+    // (v1.1.2 audit 2026-08-01: mutex-first init raced uart_task against
+    // the parser/ring memset).
+    __atomic_store_n(&g_ring_mutex, mtx, __ATOMIC_RELEASE);
 
     // uart_task feeds ntrip_server_ingest_uart() directly from here on;
     // there is deliberately NO esp_event handler in the RTCM path.
