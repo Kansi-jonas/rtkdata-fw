@@ -39,6 +39,7 @@
 #include "state.h"
 #include "provisioning.h"
 #include "interface/ntrip.h"
+#include "uart.h"
 
 // Max length a file path can have on storage
 #define FILE_PATH_MAX (ESP_VFS_PATH_MAX + CONFIG_SPIFFS_OBJ_NAME_LEN)
@@ -1040,6 +1041,7 @@ static esp_err_t ntrip_tx_stats_get_handler(httpd_req_t *req) {
     cJSON_AddNumberToObject(ingest, "crc_errors", (double)ing.crc_errors);
     cJSON_AddNumberToObject(ingest, "ring_pushed_frames", (double)ing.ring_pushed_frames);
     cJSON_AddNumberToObject(ingest, "ring_cum_bytes", (double)ing.ring_cum_bytes);
+    cJSON_AddNumberToObject(ingest, "uart_event_post_drops", uart_event_post_drops());
 
     cJSON *arr = cJSON_AddArrayToObject(root, "instances");
     for (size_t i = 0; i < n; i++) {

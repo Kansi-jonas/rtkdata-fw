@@ -10,6 +10,10 @@ ESP_EVENT_DECLARE_BASE(UART_EVENT_WRITE);
 
 void uart_init();
 
+// UART chunks the esp_event bus failed to deliver to its consumers (the RTCM
+// path is fed directly and is NOT affected; this counts the secondary path).
+uint32_t uart_event_post_drops(void);
+
 int uart_log(char *buffer, size_t len);
 int uart_nmea(const char *fmt, ...);
 int uart_write(char *buffer, size_t len);

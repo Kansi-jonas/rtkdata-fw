@@ -25,6 +25,7 @@
 
 #include "uart.h"
 #include "config.h"
+#include "interface/ntrip.h"
 #include "interface/socket_server.h"
 #include "tasks.h"
 #include "util.h"
@@ -72,6 +73,9 @@ void uart_unregister_write_handler(esp_event_handler_t event_handler) {
 
 static int uart_port = -1;
 static bool uart_log_forward = false;
+static volatile uint32_t s_event_post_drops = 0;
+
+uint32_t uart_event_post_drops(void) { return s_event_post_drops; }
 
 static stream_stats_handle_t stream_stats;
 
@@ -170,7 +174,26 @@ static void uart_task(void *ctx) {
         }
 
         stream_stats_increment(stream_stats, len, 0);
-        esp_event_post(UART_EVENT_READ, len, &buffer, len, portMAX_DELAY);
+
+        // The RTCM path is a direct synchronous call: no heap copy, no event
+        // queue, nothing that can fail silently between the UART and the
+        // frame ring (review 2026-08-01: esp_event_post returns
+        // ESP_ERR_NO_MEM under heap pressure and the result was ignored, so
+        // a chunk could vanish mid-frame).
+        ntrip_server_ingest_uart(buffer, (size_t)len);
+
+        // The event bus still serves the OTHER consumers (gnss config
+        // capture, socket_client/server forwarding). A failed post no longer
+        // touches RTCM, but it is counted instead of ignored.
+        esp_err_t perr = esp_event_post(UART_EVENT_READ, len, &buffer, len, portMAX_DELAY);
+        if (perr != ESP_OK) {
+            s_event_post_drops++;
+            if (s_event_post_drops == 1 || (s_event_post_drops % 100) == 0) {
+                ESP_LOGE(TAG, "esp_event_post failed (%d), %lu UART chunks not "
+                         "delivered to secondary consumers",
+                         (int)perr, (unsigned long)s_event_post_drops);
+            }
+        }
         buffer[len] = '\0';
         if(gnss_cmd_mode)
         {

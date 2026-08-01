@@ -53,7 +53,11 @@ static portMUX_TYPE s_cap_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void gnss_uart_capture(void *arg, esp_event_base_t base, int32_t id, void *data) {
     (void)arg; (void)base;
-    supervisor_note_gnss_rx();              // any GNSS byte batch = the receiver is alive
+    // GNSS liveness is noted per CRC-valid RTCM frame in the NTRIP ingest
+    // path now, NOT per raw byte batch: command echoes or serial garbage must
+    // not keep a receiver "alive" that produces no usable corrections
+    // (review 2026-08-01). The supervisor's gnss_recover then re-runs this
+    // config, and the wedge rung reboots if that never helps.
     if (!s_capturing || data == NULL) return;
     int len = (int)id;                          // uart_task posts len as the event id
     const uint8_t *d = (const uint8_t *)data;

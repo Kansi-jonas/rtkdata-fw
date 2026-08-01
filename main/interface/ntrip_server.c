@@ -54,7 +54,10 @@ typedef struct {
     int                     sock;            // Socket for this instance
     int                     data_keep_alive; // KeepAlive counter
     ntrip_tx_t              tx;              // sender state + counters (tx core)
-    volatile bool           reconnect_req;   // supervisor / send-error -> reconnect
+    // Reconnect request as a generation counter, not a clearable boolean: a
+    // request that arrives during DNS/handshake must survive until the drain
+    // loop can honor it (review 2026-08-01).
+    volatile uint32_t       reconnect_gen;
 
 } ntrip_instance_t;
 
@@ -63,8 +66,6 @@ typedef struct {
 static ntrip_instance_t *g_instances[MAX_NTRIP_SERVERS] = {0};
 static size_t            g_instance_count               = 0;
 static SemaphoreHandle_t g_instances_mutex              = NULL;
-
-static bool s_uart_handler_registered = false;
 
 // Shared RTCM ingest: one parser (single GNSS UART source) feeding one frame
 // ring, all statically allocated. Only CRC-valid complete frames enter the
@@ -261,7 +262,47 @@ static void ntrip_server_sleep_task(void *ctx)
     }
 }
 
-// Init: EventGroup, Sleep-Task, UART-Handler, LED, Stats, Retry
+// Remove an instance from the global register. Under the mutex, so the UART
+// ingest path can never see (or notify) a half-torn-down instance.
+static void ntrip_server_deregister_instance(ntrip_instance_t *inst) {
+
+    if (!g_instances_mutex || !inst) return;
+
+    xSemaphoreTake(g_instances_mutex, portMAX_DELAY);
+
+    for (size_t k = 0; k < g_instance_count; ++k) {
+
+        if (g_instances[k] == inst) {
+
+            for (size_t j = k + 1; j < g_instance_count; ++j) {
+
+                g_instances[j - 1] = g_instances[j];
+            }
+
+            g_instances[--g_instance_count] = NULL;
+
+            break;
+        }
+    }
+
+    xSemaphoreGive(g_instances_mutex);
+}
+
+// Init failed mid-way: deregister BEFORE this task deletes itself, otherwise
+// the ingest path keeps notifying a dead task handle (review 2026-08-01).
+static void ntrip_server_abort_task_init(ntrip_instance_t *inst) {
+
+    ntrip_server_deregister_instance(inst);
+
+    if (inst->ev) {
+        vEventGroupDelete(inst->ev);
+    }
+
+    free(inst);
+    vTaskDelete(NULL);
+}
+
+// Init: EventGroup, Sleep-Task, LED, Stats, Retry
 static void ntrip_server_init_task_context(ntrip_instance_t *inst, char *key,size_t key_size,
     char *stats_name, size_t stats_size){
 
@@ -272,15 +313,15 @@ static void ntrip_server_init_task_context(ntrip_instance_t *inst, char *key,siz
 
     if (!inst->ev) {
 
-        ESP_LOGE(TAG, "[%d] Failed to create EventGroup", inst->index);
-        vTaskDelete(NULL);
+        ESP_LOGE(TAG, "[%d] Failed to create EventGroup, disabling this instance", inst->index);
+        ntrip_server_abort_task_init(inst);
     }
 
     if (xTaskCreate(ntrip_server_sleep_task,"ntrip_server_sleep_task",NTRIP_SLEEP_TASK_STACK,inst,
             TASK_PRIORITY_INTERFACE,&inst->task_sleep) != pdPASS) {
 
-        ESP_LOGE(TAG, "[%d] Failed to create sleep task", inst->index);
-        vTaskDelete(NULL);
+        ESP_LOGE(TAG, "[%d] Failed to create sleep task, disabling this instance", inst->index);
+        ntrip_server_abort_task_init(inst);
     }
 
     // load LED-color
@@ -576,6 +617,11 @@ static void ntrip_server_task(void *ctx){
 
         ntrip_server_load_config_from_storage(inst, key, sizeof(key), &host, &port, &pwd, &mp);
 
+        // Snapshot the reconnect generation BEFORE dialing: a request that
+        // arrives during DNS/handshake ends the new connection promptly
+        // instead of being lost (the old boolean was cleared unconditionally).
+        uint32_t conn_gen = inst->reconnect_gen;
+
         ESP_LOGI(TAG, "[%d] Connecting to %s:%u/%s", inst->index, host ? host : "", port, mp ? mp : "");
 
         uart_nmea("$PESP,NTRIP,SRV,CONNECTING,%d,%s:%u,%s", inst->index, host ? host : "", port, mp ? mp : "");
@@ -633,25 +679,32 @@ static void ntrip_server_task(void *ctx){
         ERROR_ACTION(TAG, !ntrip_server_make_nonblocking(inst), goto _error,
                      "Could not switch socket to non-blocking");
 
-        ESP_LOGI(TAG, "[%d] Connected to %s:%u/%s", inst->index, host ? host : "", port, mp ? mp : "");
-
-        uart_nmea("$PESP,NTRIP,SRV,CONNECTED,%d,%s:%u,%s", inst->index, host ? host : "", port, mp ? mp : "");
-
-        if (inst->retry) {
-
-            retry_reset(inst->retry);
-        }
-
-        if (inst->led) {
-
-            inst->led->active = true;
-        }
+        // ORDER MATTERS (review 2026-08-01): cursor/accounting/notifications
+        // are initialized BEFORE CASTER_READY_BIT is visible. The other way
+        // round, a frame pushed in between was skipped without being counted.
+        ntrip_tx_reset_conn(&inst->tx, &g_frame_ring, ntrip_now_ms());
+        ulTaskNotifyTake(pdTRUE, 0);   // clear notifications from before this connect
 
         // Instance is connected
         if (inst->ev) {
 
             xEventGroupSetBits(inst->ev, CASTER_READY_BIT);
         }
+
+        ESP_LOGI(TAG, "[%d] Connected to %s:%u/%s", inst->index, host ? host : "", port, mp ? mp : "");
+
+        uart_nmea("$PESP,NTRIP,SRV,CONNECTED,%d,%s:%u,%s", inst->index, host ? host : "", port, mp ? mp : "");
+
+        if (inst->led) {
+
+            inst->led->active = true;
+        }
+
+        // Arm the caster watchdog from the handshake on; the backoff reset
+        // deliberately waits for the first ACCEPTED bytes (a handshake that
+        // dies right after must keep backing off, or the fleet hammers a
+        // struggling caster in lockstep).
+        supervisor_note_caster_tx(0);
 
         // Monitoring after connected
         ntrip_server_log_connect_monitoring(inst);
@@ -662,13 +715,10 @@ static void ntrip_server_task(void *ctx){
         // probe (recv) keeps detecting a half-open socket like before (the
         // stock bug: a GNSS stall meant no send ever failed, so a dead caster
         // socket was never noticed -> the station went dark).
-        ntrip_tx_reset_conn(&inst->tx, &g_frame_ring, ntrip_now_ms());
-        ulTaskNotifyTake(pdTRUE, 0);   // clear notifications from before this connect
-
-        inst->reconnect_req = false;
+        bool made_progress = false;
         uint32_t last_probe_ms = ntrip_now_ms();
 
-        while (!inst->reconnect_req) {
+        while (inst->reconnect_gen == conn_gen) {
 
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(NTRIP_DRAIN_WAIT_MS));
 
@@ -684,6 +734,17 @@ static void ntrip_server_task(void *ctx){
                                    NTRIP_TX_MAX_SENDS_PER_POLL,
                                    NTRIP_TX_STALE_DROP_MS,
                                    ntrip_server_sock_send, inst);
+
+                if (pr == NTRIP_TX_POLL_PROGRESS && !made_progress) {
+
+                    // First accepted bytes on this connection: NOW the retry
+                    // backoff may reset (not at handshake, see above).
+                    made_progress = true;
+
+                    if (inst->retry) {
+                        retry_reset(inst->retry);
+                    }
+                }
             } while (pr == NTRIP_TX_POLL_PROGRESS && ++spins < NTRIP_DRAIN_MAX_SPINS);
 
             if (pr == NTRIP_TX_POLL_ERROR) {
@@ -697,6 +758,16 @@ static void ntrip_server_task(void *ctx){
                 ESP_LOGW(TAG, "[%d] no send progress for %d ms with %u bytes pending, "
                          "reconnecting", inst->index, NTRIP_TX_PROGRESS_TIMEOUT_MS,
                          (unsigned)ntrip_tx_pending(&inst->tx));
+                break;
+            }
+
+            // A frame that keeps trickling but is past its absolute age limit
+            // ends the CONNECTION; the remainder is never dropped mid-stream
+            // (review 2026-08-01: byte-drip kept the stall clock reset while
+            // the frame grew arbitrarily old).
+            if (ntrip_tx_frame_overdue(&inst->tx, now, NTRIP_TX_FRAME_DEADLINE_MS)) {
+                ESP_LOGW(TAG, "[%d] partially sent frame older than %d ms, closing "
+                         "connection", inst->index, NTRIP_TX_FRAME_DEADLINE_MS);
                 break;
             }
 
@@ -734,24 +805,36 @@ static void ntrip_server_on_frame(void *ctx, const uint8_t *frame, uint16_t len,
 
     (void)ctx;
 
+    // A CRC-valid frame is the ONLY thing that counts as "the receiver is
+    // alive": command echoes and serial garbage must not feed the watchdog
+    // (review 2026-08-01). No valid frame for TH_GNSS -> supervisor re-runs
+    // the UM980 config; still nothing -> wedge rung reboots. That removes the
+    // customer's manual power cycle.
+    supervisor_note_gnss_rx();
+
     ntrip_ring_push(&g_frame_ring, frame, len, now);
 }
 
-// UART data on the default event loop. This path touches no socket: it parses
-// the byte stream, pushes complete CRC-valid frames into the shared ring, and
-// notifies the connected instances' server tasks. Everything here is bounded;
-// a stalled caster socket cannot back up into this handler (that was the core
-// defect of the rejected 2026-07-31 queue design).
-static void ntrip_server_uart_handler(void* handler_args,esp_event_base_t base,int32_t length,
-    void* buffer) {
+// Called SYNCHRONOUSLY from uart_task for every UART chunk. This is the whole
+// RTCM data path: parse, push complete CRC-valid frames into the shared ring,
+// wake the connected instances. No socket, no allocation, no event-loop heap
+// copy whose failure could silently swallow a chunk (review 2026-08-01,
+// esp_event_post returns ESP_ERR_NO_MEM under heap pressure and the old
+// handler path ignored it). The esp_event path still exists for the other
+// UART consumers; RTCM no longer depends on it.
+void ntrip_server_ingest_uart(const uint8_t *data, size_t len) {
 
-    (void)handler_args;
-    (void)base;
+    if (!g_ring_mutex || !data || len == 0) return;   // not initialized yet
 
-    if (length <= 0 || !buffer) return;
+    uint32_t frames_before = g_frame_ring.next_seq;   // sole writer: this task
 
-    rtcm_parser_feed(&g_rtcm_parser, (const uint8_t *)buffer, (size_t)length,
+    rtcm_parser_feed(&g_rtcm_parser, data, len,
                      ntrip_now_ms(), ntrip_server_on_frame, NULL);
+
+    // DATA_READY / keep-alive / wake-ups are driven by complete valid frames,
+    // not by raw bytes: garbage must neither hold a mountpoint open nor wake
+    // the drain tasks (review 2026-08-01).
+    if (g_frame_ring.next_seq == frames_before) return;
 
     if (g_instances_mutex){
 
@@ -777,40 +860,6 @@ static void ntrip_server_uart_handler(void* handler_args,esp_event_base_t base,i
         xSemaphoreGive(g_instances_mutex);
 
     }
-
-}
-
-static void ensure_uart_handler_registered(void) {
-
-    if (!g_instances_mutex) {
-
-        g_instances_mutex = xSemaphoreCreateMutex();
-
-        if (!g_instances_mutex) {
-
-            ESP_LOGE(TAG, "Failed to create g_instances_mutex in ensure_uart_handler_registered");
-
-        }
-    }
-
-    if(g_instances_mutex){
-
-        // Protection against race conditions when registering the handler
-        xSemaphoreTake(g_instances_mutex, portMAX_DELAY);
-
-        if (!s_uart_handler_registered) {
-
-            uart_register_read_handler(ntrip_server_uart_handler);
-
-            s_uart_handler_registered = true;
-
-            ESP_LOGI(TAG, "UART read handler for NTRIP registered");
-        }
-
-        xSemaphoreGive(g_instances_mutex);
-
-    }
-
 
 }
 
@@ -844,10 +893,12 @@ void ntrip_server_init() {
 
         rtcm_parser_init(&g_rtcm_parser);
         ntrip_ring_init(&g_frame_ring, ring_lock_hook, ring_unlock_hook, g_ring_mutex);
-    }
 
-    // UART-Handler EINMAL registrieren
-    ensure_uart_handler_registered();
+        // uart_task feeds ntrip_server_ingest_uart() directly from here on;
+        // there is deliberately NO esp_event handler in the RTCM path.
+        ESP_LOGI(TAG, "RTCM ingest ready (direct UART feed, %d ring slots)",
+                 RTCM_RING_SLOTS);
+    }
 
     for (int i = 0; i < MAX_NTRIP_SERVERS; i++) {
 
@@ -914,25 +965,7 @@ void ntrip_server_init() {
 
                     ESP_LOGE(TAG, "Failed to create NTRIP server task for index %d", i);
 
-                    // Instance remove from global array
-                    xSemaphoreTake(g_instances_mutex, portMAX_DELAY);
-
-                    for (size_t k = 0; k < g_instance_count; ++k) {
-
-                        if (g_instances[k] == inst) {
-
-                            for (size_t j = k + 1; j < g_instance_count; ++j) {
-
-                                g_instances[j - 1] = g_instances[j];
-                            }
-
-                            g_instances[--g_instance_count] = NULL;
-
-                            break;
-                        }
-                    }
-
-                    xSemaphoreGive(g_instances_mutex);
+                    ntrip_server_deregister_instance(inst);
 
                     free(inst);
             }
@@ -947,7 +980,7 @@ void ntrip_server_reconnect_all(void) {
     xSemaphoreTake(g_instances_mutex, portMAX_DELAY);
     for (size_t k = 0; k < g_instance_count; ++k) {
         ntrip_instance_t *inst = g_instances[k];
-        if (inst) inst->reconnect_req = true;
+        if (inst) inst->reconnect_gen++;   // requests survive DNS/handshake
     }
     xSemaphoreGive(g_instances_mutex);
 }

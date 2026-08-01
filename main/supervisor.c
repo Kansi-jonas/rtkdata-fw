@@ -90,7 +90,13 @@ static inline uint32_t age_s(int64_t t) { return (uint32_t)((now_us() - t) / 100
 void supervisor_note_gnss_rx(void) { s_t_gnss = now_us(); s_gnss_seen = true; }
 
 void supervisor_note_caster_tx(int bytes) {
-    if (bytes > 0) { s_t_caster = now_us(); s_caster_seen = true; }
+    /* bytes==0 arms the watchdog at handshake time: from then on "no caster
+     * progress" is a judgeable fault instead of a permanent blind spot
+     * (review 2026-08-01: the watchdog never engaged on a connection that
+     * never got a single byte out). */
+    (void)bytes;
+    s_t_caster = now_us();
+    s_caster_seen = true;
 }
 
 void supervisor_note_sta_ip(bool up) {

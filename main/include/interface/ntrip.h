@@ -20,6 +20,10 @@
 void ntrip_server_init();
 void ntrip_server_reconnect_all(void);
 
+// Synchronous RTCM ingest, called from uart_task for every UART chunk. Safe
+// to call before ntrip_server_init (no-op until initialized).
+void ntrip_server_ingest_uart(const uint8_t *data, size_t len);
+
 bool ntrip_response_ok(void *response);
 bool ntrip_response_sourcetable_ok(void *response);
 
