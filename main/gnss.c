@@ -26,6 +26,7 @@
 #include <freertos/task.h>
 #include <esp_log.h>
 #include <esp_event.h>
+#include <esp_timer.h>
 #include <driver/gpio.h>
 #include "nvs.h"
 
@@ -138,6 +139,23 @@ static void gnss_reset_pulse(void) {
 #define GNSS_KEY_BASE  "base"
 typedef struct { double lat, lon, h; } gnss_base_fix_t;
 
+/* The idempotence gate in gnss_set_fixed_base must know whether the RUNNING
+ * receiver has ACKed the persisted coordinate in THIS boot: an NVS match alone
+ * proves what we WANTED, not what the receiver IS. Without this flag a failed
+ * boot restore left NVS populated and the NVS-only gate then skipped the very
+ * IE re-push that would have repaired the receiver, until the next reboot
+ * (v1.1.2 audit 2026-08-01). */
+static bool s_base_acked = false;
+
+/* Bounded retry: a receiver that keeps failing the apply must not be re-poked
+ * on every heartbeat reply (a SUCCESSFUL redundant "mode base" stalls RTCM for
+ * ~18 s, and even NACK storms are UART noise during configuration). One
+ * attempt per cooldown for the SAME target coordinate; a NEW coordinate is
+ * always applied immediately. */
+#define GNSS_BASE_RETRY_COOLDOWN_US (60LL * 1000 * 1000)
+static int64_t s_base_fail_us = 0;
+static gnss_base_fix_t s_base_fail_coord;
+
 // Reject Null-Island and out-of-range coords: never apply garbage as a fixed base
 // (it would broadcast a wrong 1005 to every rover). Mirrors the LH-side guards.
 static bool gnss_coord_valid(double lat, double lon) {
@@ -201,9 +219,21 @@ void config_gnss_base(void) {
     if (gnss_load_fixed_base(&lat, &lon, &h)) {
         char cmd[96];
         snprintf(cmd, sizeof(cmd), "mode base %.9f %.9f %.4f\r\n", lat, lon, h);
-        if (send_cmd_acked(cmd, ACK_RETRIES)) ok++;
-        ESP_LOGI(TAG, "restored FIXED base from NVS: %.9f %.9f %.4f", lat, lon, h);
-        uart_nmea("$PESP,RTK,GNSS,BASEMODE,FIXED");
+        if (send_cmd_acked(cmd, ACK_RETRIES)) {
+            ok++;
+            s_base_acked = true;
+            ESP_LOGI(TAG, "restored FIXED base from NVS: %.9f %.9f %.4f", lat, lon, h);
+            uart_nmea("$PESP,RTK,GNSS,BASEMODE,FIXED");
+        } else {
+            // Receiver base mode is now UNKNOWN (it may still be surveying or
+            // hold a stale mode). s_base_acked stays false so the next IE
+            // coordinate push re-applies instead of being idempotence-skipped
+            // on the NVS match (v1.1.2 audit 2026-08-01). The old code logged
+            // "restored" and BASEMODE,FIXED even on a NACK.
+            s_base_acked = false;
+            ESP_LOGE(TAG, "FIXED base restore NOT acked; receiver base mode unknown");
+            uart_nmea("$PESP,RTK,GNSS,BASEMODE,RESTOREFAIL");
+        }
     } else {
         if (send_cmd_acked("mode base time 300 1.5\r\n", ACK_RETRIES)) ok++;  // VERIFY syntax on first hw
         ESP_LOGI(TAG, "no persisted fixed base -> provisional survey-in");
@@ -231,13 +261,30 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
     // many seconds for zero gain (measured 2026-08-01: an 18+ s stall right
     // after boot that tripped the liveness watchdog into a needless receiver
     // reset). Epsilons: ~0.1 mm in position, 0.5 mm in height.
+    //
+    // s_base_acked is load-bearing (v1.1.2 audit 2026-08-01): the NVS match
+    // alone only proves what we INTENDED. If the boot restore was NACKed, the
+    // receiver's real mode is unknown and the IE re-push MUST go through.
     double cur_lat, cur_lon, cur_h;
-    if (gnss_load_fixed_base(&cur_lat, &cur_lon, &cur_h) &&
-        fabs(cur_lat - lat_deg) < 1e-9 &&
-        fabs(cur_lon - lon_deg) < 1e-9 &&
-        fabs(cur_h - height_m) < 5e-4) {
-        ESP_LOGI(TAG, "fixed base unchanged, skipping re-apply");
+    bool unchanged = gnss_load_fixed_base(&cur_lat, &cur_lon, &cur_h) &&
+                     fabs(cur_lat - lat_deg) < 1e-9 &&
+                     fabs(cur_lon - lon_deg) < 1e-9 &&
+                     fabs(cur_h - height_m) < 5e-4;
+    if (unchanged && s_base_acked) {
+        // Debug level: with the once-per-boot latch in provisioning removed,
+        // this is the steady-state path on every heartbeat reply.
+        ESP_LOGD(TAG, "fixed base unchanged and receiver-acked, skipping re-apply");
         return true;
+    }
+
+    // Bounded retry: one attempt per cooldown for the SAME coordinate that
+    // just failed; a genuinely new coordinate always goes through at once.
+    if (s_base_fail_us != 0 &&
+        fabs(s_base_fail_coord.lat - lat_deg) < 1e-9 &&
+        fabs(s_base_fail_coord.lon - lon_deg) < 1e-9 &&
+        fabs(s_base_fail_coord.h - height_m) < 5e-4 &&
+        (esp_timer_get_time() - s_base_fail_us) < GNSS_BASE_RETRY_COOLDOWN_US) {
+        return false;
     }
 
     char cmd[96];
@@ -245,9 +292,21 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
     snprintf(cmd, sizeof(cmd), "mode base %.9f %.9f %.4f\r\n", lat_deg, lon_deg, height_m);
 
     s_capturing = true;
-    bool ok = send_cmd_acked(cmd, ACK_RETRIES);
+    bool acked = send_cmd_acked(cmd, ACK_RETRIES);
+    bool ok = acked;
     if (ok) ok = send_cmd_acked("saveconfig\r\n", ACK_RETRIES);
     s_capturing = false;
+
+    // The mode-base ACK is the receiver-state confirmation the idempotence
+    // gate keys on; saveconfig only affects persistence across a receiver
+    // power cycle and is retried via the cooldown path when it fails.
+    s_base_acked = acked;
+    if (!ok) {
+        s_base_fail_us = esp_timer_get_time();
+        s_base_fail_coord = (gnss_base_fix_t){ lat_deg, lon_deg, height_m };
+    } else {
+        s_base_fail_us = 0;
+    }
 
     // Persist so a reboot/recovery re-applies this fixed coord instead of re-surveying.
     if (ok) gnss_save_fixed_base(lat_deg, lon_deg, height_m);

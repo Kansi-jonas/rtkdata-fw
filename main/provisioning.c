@@ -61,7 +61,7 @@ static char  s_token[96]     = {0};
 static char  s_enroll_key[80] = {0};   // per-device 64-hex enroll key from NVS
 static uint8_t s_key_ver      = 1;     // which master version derived it
 static int   s_poll_s        = DEFAULT_POLL_S;
-static bool  s_fixed_base_set = false;
+static bool  s_fixed_base_set = false; // log-edge only; idempotence lives in gnss_set_fixed_base
 
 /* last status (for /rtk/status), guarded by a mutex */
 static SemaphoreHandle_t s_mtx;
@@ -328,16 +328,27 @@ static void apply_reply(cJSON *root) {
             s_st.pos_lat = lat = la->valuedouble;
             s_st.pos_lon = lon = lo->valuedouble;
             s_st.pos_h   = h   = cJSON_IsNumber(he) ? he->valuedouble : 0.0;
-            want_fix = !s_fixed_base_set;   // only push the fixed base once
+            want_fix = true;
         }
     }
     xSemaphoreGive(s_mtx);
 
-    /* IE returned a converged position -> set the fixed base (outside the lock) */
+    /* IE returned a converged position -> hand it to the GNSS module (outside
+     * the lock) on EVERY reply. The module is idempotent (skips an unchanged
+     * coordinate the receiver already ACKed, with a bounded retry cooldown),
+     * so this is cheap in steady state. The old once-per-boot latch here
+     * blocked exactly the two repairs that matter: re-applying after a NACKed
+     * boot restore, and adopting a CORRECTED IE coordinate before the next
+     * reboot (v1.1.2 audit 2026-08-01). s_fixed_base_set is now only the
+     * log-edge detector. */
     if (want_fix) {
         if (gnss_set_fixed_base(lat, lon, h)) {
-            s_fixed_base_set = true;
-            ESP_LOGI(TAG, "fixed base applied from IE position");
+            if (!s_fixed_base_set) {
+                s_fixed_base_set = true;
+                ESP_LOGI(TAG, "fixed base applied from IE position");
+            }
+        } else {
+            s_fixed_base_set = false;   // re-log when the next apply succeeds
         }
     }
 
