@@ -15,6 +15,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Host tests (tx core, 128+ checks)
+        run: |
+          gcc -std=c99 -O2 -Wall -Wextra -Werror -Imain/include \
+            -o /tmp/test_core tests/host/test_ntrip_tx_core.c \
+            main/interface/ntrip_tx_core.c
+          /tmp/test_core
+          gcc -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Imain/include -o /tmp/test_core_san tests/host/test_ntrip_tx_core.c \
+            main/interface/ntrip_tx_core.c
+          /tmp/test_core_san
+
       - name: ESP-IDF build (v5.3.1, esp32)
         uses: espressif/esp-idf-ci-action@v1
         with:

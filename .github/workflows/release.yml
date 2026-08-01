@@ -23,10 +23,20 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # Checkout defaults to the pushed tag: the release is built from the
+      # EXACT tagged commit. The old explicit `ref: main` shipped whatever main
+      # happened to be at build time; if main had moved after tagging, the
+      # draft contained code that was not the tagged commit.
       - uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
+
+      - name: Host tests (tx core) gate the release
+        run: |
+          gcc -std=c99 -O2 -Wall -Wextra -Werror -Imain/include \
+            -o /tmp/test_core tests/host/test_ntrip_tx_core.c \
+            main/interface/ntrip_tx_core.c
+          /tmp/test_core
 
       - name: Verify FW_VERSION matches the tag
         run: |
