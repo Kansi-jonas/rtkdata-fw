@@ -31,12 +31,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Host tests (tx core) gate the release
+      - name: Host tests gate the release
         run: |
           gcc -std=c99 -O2 -Wall -Wextra -Werror -Imain/include \
             -o /tmp/test_core tests/host/test_ntrip_tx_core.c \
             main/interface/ntrip_tx_core.c
           /tmp/test_core
+          gcc -std=c99 -O2 -Wall -Wextra -Werror -Imain/include \
+            -o /tmp/test_tj tests/host/test_telemetry_json.c main/telemetry_json.c
+          /tmp/test_tj
 
       - name: Verify FW_VERSION matches the tag
         run: |

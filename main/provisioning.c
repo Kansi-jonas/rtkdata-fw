@@ -36,6 +36,7 @@
 #include "wifi.h"
 #include "gnss.h"
 #include "supervisor.h"
+#include "telemetry_json.h"
 #include "interface/ntrip.h"
 
 #define TAG "PROVISION"
@@ -368,24 +369,55 @@ static void heartbeat(void) {
 
     uint32_t nonce = esp_random();
     char canon[160];
+    // The HMAC canon stays device_id|uptime|nonce ON PURPOSE: extending the
+    // health payload must never invalidate old-IE/new-FW or new-IE/old-FW
+    // pairings mid-rollout.
     snprintf(canon, sizeof(canon), "%s|%u|%u", s_device_id, (unsigned)h.uptime_s, (unsigned)nonce);
     char hmac[65];
     // Heartbeat is keyed with the per-station token issued at enroll; it only
     // runs once state >= PROVISIONING, so s_token is always set here.
     hmac_sha256_hex(s_token, canon, hmac);
 
-    char body[640];
-    snprintf(body, sizeof(body),
+    // Send-path telemetry rides inside `health`, so the IE persists it via its
+    // existing last_health_json passthrough with zero server changes. All or
+    // nothing: if the block ever failed to build, the beat goes out WITHOUT it
+    // rather than truncated (telemetry_json.h contract).
+    ntrip_tx_totals_t totals;
+    ntrip_server_tx_totals(&totals);
+
+    static char tx_json[TELEMETRY_TX_JSON_MAX];
+    const char *tx_sep = ",";
+    if (telemetry_tx_json(tx_json, sizeof(tx_json), &totals,
+                          (unsigned long)uart_event_post_drops()) < 0) {
+        tx_json[0] = '\0';
+        tx_sep = "";
+        ESP_LOGW(TAG, "tx telemetry omitted from heartbeat (did not fit)");
+    }
+
+    // Single writer (this task); static keeps ~1.4 KB off the task stack.
+    static char body[1536];
+    int n = snprintf(body, sizeof(body),
         "{\"device_id\":\"%s\",\"station_token\":\"%s\",\"uptime\":%u,"
-        "\"health\":{\"gnss_silent_s\":%u,\"caster_silent_s\":%u,\"ip_down_s\":%u,"
+        "\"health\":{\"fw\":\"%s\","
+        "\"gnss_silent_s\":%u,\"caster_silent_s\":%u,\"ip_down_s\":%u,"
         "\"gnss_ok\":%s,\"caster_ok\":%s,\"link_ok\":%s,"
-        "\"rec_gnss\":%u,\"rec_caster\":%u,\"rec_wifi\":%u,\"reboots\":%u},"
+        "\"rec_gnss\":%u,\"rec_caster\":%u,\"rec_wifi\":%u,\"reboots\":%u%s%s},"
         "\"nonce\":%u,\"hmac\":\"%s\"}",
         s_device_id, s_token, (unsigned)h.uptime_s,
+        FW_VERSION,
         (unsigned)h.gnss_silent_s, (unsigned)h.caster_silent_s, (unsigned)h.ip_down_s,
         h.gnss_ok ? "true" : "false", h.caster_ok ? "true" : "false", h.link_ok ? "true" : "false",
         (unsigned)h.recoveries_gnss, (unsigned)h.recoveries_caster, (unsigned)h.recoveries_wifi,
-        (unsigned)h.reboots_supervised, (unsigned)nonce, hmac);
+        (unsigned)h.reboots_supervised, tx_sep, tx_json,
+        (unsigned)nonce, hmac);
+
+    if (n <= 0 || (size_t)n >= sizeof(body)) {
+        // A truncated body would fail the IE's JSON parse at best and poison
+        // the stored health blob at worst. Skip this beat loudly; the next one
+        // runs in ie_poll_s seconds.
+        ESP_LOGE(TAG, "heartbeat body overflow (%d bytes), beat skipped", n);
+        return;
+    }
 
     char url[160];
     snprintf(url, sizeof(url), "https://%s/api/edge/heartbeat", s_ie_host);

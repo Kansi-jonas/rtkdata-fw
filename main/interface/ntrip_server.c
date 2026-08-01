@@ -863,6 +863,34 @@ void ntrip_server_ingest_uart(const uint8_t *data, size_t len) {
 
 }
 
+// RTCM ingest (parser + ring). Idempotent. MUST run right after uart_init(),
+// long BEFORE the data plane: GNSS liveness is noted per valid frame in this
+// path, and the supervisor's 30 s boot grace must never expire just because
+// the OTA window delayed ntrip_server_init(). (Found 2026-08-01 via the new
+// heartbeat telemetry: a slow OTA check let the supervisor hardware-reset a
+// perfectly healthy receiver four times in a row.)
+void ntrip_server_ingest_init(void) {
+
+    if (g_ring_mutex) return;
+
+    g_ring_mutex = xSemaphoreCreateMutex();
+
+    if (!g_ring_mutex) {
+
+        ESP_LOGE(TAG, "Failed to create g_ring_mutex, RTCM ingest disabled");
+
+        return;
+    }
+
+    rtcm_parser_init(&g_rtcm_parser);
+    ntrip_ring_init(&g_frame_ring, ring_lock_hook, ring_unlock_hook, g_ring_mutex);
+
+    // uart_task feeds ntrip_server_ingest_uart() directly from here on;
+    // there is deliberately NO esp_event handler in the RTCM path.
+    ESP_LOGI(TAG, "RTCM ingest ready (direct UART feed, %d ring slots)",
+             RTCM_RING_SLOTS);
+}
+
 void ntrip_server_init() {
 
     if (!g_instances_mutex){
@@ -878,27 +906,10 @@ void ntrip_server_init() {
 
     }
 
-    // RTCM ingest (parser + ring) MUST exist before the UART handler can run.
-    // All statically allocated; only the mutex can fail.
-    if (!g_ring_mutex) {
+    // Normally already done right after uart_init(); harmless if not.
+    ntrip_server_ingest_init();
 
-        g_ring_mutex = xSemaphoreCreateMutex();
-
-        if (!g_ring_mutex) {
-
-            ESP_LOGE(TAG, "Failed to create g_ring_mutex, NTRIP disabled");
-
-            return;
-        }
-
-        rtcm_parser_init(&g_rtcm_parser);
-        ntrip_ring_init(&g_frame_ring, ring_lock_hook, ring_unlock_hook, g_ring_mutex);
-
-        // uart_task feeds ntrip_server_ingest_uart() directly from here on;
-        // there is deliberately NO esp_event handler in the RTCM path.
-        ESP_LOGI(TAG, "RTCM ingest ready (direct UART feed, %d ring slots)",
-                 RTCM_RING_SLOTS);
-    }
+    if (!g_ring_mutex) return;   // ingest init failed; no instances without it
 
     for (int i = 0; i < MAX_NTRIP_SERVERS; i++) {
 
@@ -1027,6 +1038,52 @@ size_t ntrip_server_tx_stats(ntrip_tx_stats_t *out, size_t max) {
     xSemaphoreGive(g_instances_mutex);
 
     return n;
+}
+
+// Heartbeat summary: ingest + sender totals. Same tearing caveat as above,
+// acceptable for diagnostics. Mutexes are taken sequentially, never nested.
+void ntrip_server_tx_totals(ntrip_tx_totals_t *out) {
+
+    if (!out) return;
+
+    memset(out, 0, sizeof(*out));
+
+    ntrip_ingest_stats_t ing;
+    ntrip_server_ingest_stats(&ing);
+    out->frames_ok       = ing.frames_ok;
+    out->bytes_ok        = ing.bytes_ok;
+    out->bytes_discarded = ing.bytes_discarded;
+    out->crc_errors      = ing.crc_errors;
+
+    if (!g_instances_mutex) return;
+
+    xSemaphoreTake(g_instances_mutex, portMAX_DELAY);
+
+    for (size_t k = 0; k < g_instance_count; ++k) {
+
+        ntrip_instance_t *inst = g_instances[k];
+
+        if (!inst) continue;
+
+        const ntrip_tx_t *tx = &inst->tx;
+
+        out->instances++;
+        if (inst->ev && (xEventGroupGetBits(inst->ev) & CASTER_READY_BIT)) {
+            out->connected++;
+        }
+        out->accepted_to_lwip    += tx->accepted_to_lwip;
+        out->sent_frames         += tx->sent_frames;
+        out->dropped_bytes       += tx->dropped_bytes;
+        out->skipped_bytes       += tx->skipped_bytes;
+        out->dropped_stale_bytes += tx->dropped_stale_bytes;
+        out->eagain_count        += tx->eagain_count;
+        out->reconnects          += tx->reconnects;
+        if (tx->max_queue_age_ms > out->max_queue_age_ms) {
+            out->max_queue_age_ms = tx->max_queue_age_ms;
+        }
+    }
+
+    xSemaphoreGive(g_instances_mutex);
 }
 
 void ntrip_server_ingest_stats(ntrip_ingest_stats_t *out) {
