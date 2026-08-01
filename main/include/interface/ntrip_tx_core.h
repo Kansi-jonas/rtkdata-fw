@@ -34,6 +34,10 @@
 #define NTRIP_TX_MAX_SENDS_PER_POLL 2
 #define NTRIP_TX_STALE_DROP_MS      2000
 #define NTRIP_TX_PROGRESS_TIMEOUT_MS 5000
+/* A partially sent frame older than this ends the CONNECTION (the remainder
+ * is never discarded mid-stream; the peer gets a clean close instead of a
+ * frame that trickled for ages and is stale on arrival). */
+#define NTRIP_TX_FRAME_DEADLINE_MS  10000
 
 /* ---------------------------------------------------------------- CRC24Q -- */
 
@@ -116,6 +120,7 @@ typedef struct {
     uint8_t  current[RTCM_MAX_FRAME_B];
     uint16_t current_len;
     uint16_t current_off;
+    uint32_t current_received_ms;  /* ring timestamp of the current frame */
     uint32_t last_progress_ms;
 
     /* cumulative over the device lifetime, 64-bit on purpose */
@@ -151,6 +156,12 @@ ntrip_tx_poll_result_t ntrip_tx_poll(ntrip_tx_t *tx, ntrip_ring_t *ring,
 /* True when a partially sent frame has made no progress for timeout_ms. */
 bool ntrip_tx_stalled(const ntrip_tx_t *tx, uint32_t now_ms,
                       uint32_t timeout_ms);
+
+/* True when a partially sent frame is older (since UART receive) than
+ * deadline_ms even though bytes may still be trickling out. The caller must
+ * end the connection; the remainder is never dropped mid-stream. */
+bool ntrip_tx_frame_overdue(const ntrip_tx_t *tx, uint32_t now_ms,
+                            uint32_t deadline_ms);
 
 /* Abandon the current frame (connection is going away): counts the unsent
  * remainder into dropped_bytes. Idempotent. */

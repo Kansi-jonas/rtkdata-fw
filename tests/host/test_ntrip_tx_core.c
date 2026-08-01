@@ -609,6 +609,88 @@ static void test_property_byte_balance(void) {
            (unsigned long long)p.bytes_discarded);
 }
 
+/* Review 2026-08-01: after a long idle connection, loading the first new
+ * frame must restart the progress clock; otherwise the very first EAGAIN
+ * trips the stall check and forces a needless reconnect. */
+static void test_idle_then_eagain_no_false_stall(void) {
+    ntrip_ring_t ring;
+    ntrip_tx_t tx;
+    mock_send_t m;
+    uint8_t f[128];
+    uint16_t l = make_frame(f, 94, 70);
+
+    ntrip_ring_init(&ring, NULL, NULL, NULL);
+    ntrip_tx_init(&tx);
+    ntrip_tx_reset_conn(&tx, &ring, 0);       /* connect at t=0 */
+
+    /* ten quiet minutes, then a frame arrives and the socket pushes back */
+    ntrip_ring_push(&ring, f, l, 600000);
+    mock_init(&m);
+    mock_script(&m, 1, 0);                    /* EAGAIN */
+
+    ntrip_tx_poll_result_t r =
+        ntrip_tx_poll(&tx, &ring, 600000, 2, 0, mock_send, &m);
+    CHECK(r == NTRIP_TX_POLL_WOULDBLOCK);
+    CHECK(!ntrip_tx_stalled(&tx, 600100, NTRIP_TX_PROGRESS_TIMEOUT_MS));
+    /* the stall check still works relative to the copy time */
+    CHECK(ntrip_tx_stalled(&tx, 606000, NTRIP_TX_PROGRESS_TIMEOUT_MS));
+}
+
+/* Review 2026-08-01: a frame that keeps trickling single bytes resets the
+ * stall clock forever; the absolute frame deadline must catch it so the
+ * caller ends the connection (never discarding the remainder mid-stream). */
+static void test_partial_frame_deadline(void) {
+    ntrip_ring_t ring;
+    ntrip_tx_t tx;
+    mock_send_t m;
+    uint8_t f[128];
+    uint16_t l = make_frame(f, 94, 71);
+
+    ntrip_ring_init(&ring, NULL, NULL, NULL);
+    ntrip_tx_init(&tx);
+    ntrip_tx_reset_conn(&tx, &ring, 0);
+    ntrip_ring_push(&ring, f, l, 1000);
+
+    /* one byte accepted every 4 s: stall check never fires */
+    uint32_t t = 1000;
+    for (int i = 0; i < 4; i++) {
+        mock_init(&m);
+        mock_script(&m, 0, 1);
+        mock_script(&m, 1, 0);
+        ntrip_tx_poll(&tx, &ring, t, 2, 0, mock_send, &m);
+        CHECK(!ntrip_tx_stalled(&tx, t, NTRIP_TX_PROGRESS_TIMEOUT_MS));
+        t += 4000;
+    }
+    /* but the absolute deadline catches the overdue frame */
+    CHECK(!ntrip_tx_frame_overdue(&tx, 9000, NTRIP_TX_FRAME_DEADLINE_MS));
+    CHECK(ntrip_tx_frame_overdue(&tx, t, NTRIP_TX_FRAME_DEADLINE_MS));
+    /* and a fully sent frame is never overdue */
+    mock_init(&m);
+    ntrip_tx_poll(&tx, &ring, t, 4, 0, mock_send, &m);
+    CHECK(!ntrip_tx_frame_overdue(&tx, t + 60000, NTRIP_TX_FRAME_DEADLINE_MS));
+}
+
+/* Review 2026-08-01: complete frames waiting in the ring at reconnect time
+ * must show up in the byte balance as skipped, not vanish. */
+static void test_reconnect_counts_waiting_frames(void) {
+    ntrip_ring_t ring;
+    ntrip_tx_t tx;
+    uint8_t f[64];
+    uint16_t l = make_frame(f, 44, 72);   /* 50 bytes */
+
+    ntrip_ring_init(&ring, NULL, NULL, NULL);
+    ntrip_tx_init(&tx);
+    ntrip_tx_reset_conn(&tx, &ring, 0);
+
+    for (int i = 0; i < 3; i++) ntrip_ring_push(&ring, f, l, 100);
+
+    /* connection dies before anything was sent */
+    ntrip_tx_reset_conn(&tx, &ring, 200);
+    CHECK_EQ_U64(tx.skipped_frames, 3);
+    CHECK_EQ_U64(tx.skipped_bytes, 3u * l);
+    CHECK_EQ_U64(tx.copied_bytes + tx.skipped_bytes, ring.cum_bytes);
+}
+
 static void test_progress_timeout_wraparound(void) {
     ntrip_tx_t tx;
     ntrip_tx_init(&tx);
@@ -632,6 +714,9 @@ int main(void) {
     test_stale_frame_drop();
     test_ten_instances();
     test_property_byte_balance();
+    test_idle_then_eagain_no_false_stall();
+    test_partial_frame_deadline();
+    test_reconnect_counts_waiting_frames();
     test_progress_timeout_wraparound();
 
     printf("%d checks, %d failures\n", g_checks, g_fails);

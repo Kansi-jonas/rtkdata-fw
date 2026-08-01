@@ -190,6 +190,13 @@ void ntrip_tx_reset_conn(ntrip_tx_t *tx, ntrip_ring_t *ring, uint32_t now_ms) {
     ntrip_tx_abort(tx);
 
     ring_lock(ring);
+    /* Complete frames that were waiting in the ring will never be sent on
+     * the new connection; count them, they must not vanish from the byte
+     * balance (review 2026-08-01, finding "waiting frames uncounted"). */
+    if (tx->cursor_seq < ring->next_seq) {
+        tx->skipped_frames += ring->next_seq - tx->cursor_seq;
+        tx->skipped_bytes += ring->cum_bytes - tx->cum_through;
+    }
     tx->cursor_seq = ring->next_seq;   /* start with the next NEW frame */
     tx->cum_through = ring->cum_bytes;
     ring_unlock(ring);
@@ -209,6 +216,12 @@ bool ntrip_tx_stalled(const ntrip_tx_t *tx, uint32_t now_ms,
                       uint32_t timeout_ms) {
     if (tx->current_off >= tx->current_len) return false;   /* nothing pending */
     return (uint32_t)(now_ms - tx->last_progress_ms) > timeout_ms;
+}
+
+bool ntrip_tx_frame_overdue(const ntrip_tx_t *tx, uint32_t now_ms,
+                            uint32_t deadline_ms) {
+    if (tx->current_off >= tx->current_len) return false;   /* nothing pending */
+    return (uint32_t)(now_ms - tx->current_received_ms) > deadline_ms;
 }
 
 /* Copy the next eligible frame from the ring into tx->current.
@@ -248,6 +261,12 @@ static bool tx_copy_next(ntrip_tx_t *tx, ntrip_ring_t *ring, uint32_t now_ms,
         memcpy(tx->current, s->data, s->len);
         tx->current_len = s->len;
         tx->current_off = 0;
+        tx->current_received_ms = s->received_ms;
+        /* The progress clock measures THIS transmission, not the idle time
+         * before it: without the restart, the first EAGAIN after a long
+         * quiet period would trip the stall check instantly (review
+         * 2026-08-01, finding "idle then EAGAIN reconnects"). */
+        tx->last_progress_ms = now_ms;
         tx->copied_bytes += s->len;
         tx->cum_through = s->cum_bytes;
         tx->cursor_seq++;
