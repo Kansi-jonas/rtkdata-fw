@@ -39,6 +39,9 @@ static const int delays_count = sizeof(delays) / sizeof(int);
 
 retry_delay_handle_t retry_init(bool first_instant, uint8_t short_count, int short_delay, int max_delay) {
     retry_delay_handle_t handle = malloc(sizeof(struct retry_delay));
+    // OOM here must surface as NULL (callers have fallbacks), not as a
+    // null-pointer write (review 2026-08-01)
+    if (handle == NULL) return NULL;
     *handle = (struct retry_delay) {
             .attempts = 0,
 
@@ -60,6 +63,12 @@ retry_delay_handle_t retry_init(bool first_instant, uint8_t short_count, int sho
 }
 
 int retry_delay(retry_delay_handle_t handle) {
+    // NULL handle (retry_init OOM): behave like a fixed 2 s backoff so every
+    // caller stays safe without its own guard
+    if (handle == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return 0;
+    }
     int attempts = handle->attempts;
     int delay;
     if (attempts == 0 && handle->first_instant) {
@@ -87,5 +96,6 @@ int retry_delay(retry_delay_handle_t handle) {
 }
 
 void retry_reset(retry_delay_handle_t handle) {
+    if (handle == NULL) return;
     handle->attempts = 0;
 }
