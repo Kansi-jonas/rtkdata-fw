@@ -609,6 +609,16 @@ esp_err_t drv_uart_usbc_read_set_cb(const drv_uart_read_cb_t cb)
 
 int drv_uart_usbc_send(const uint8_t *data, const uint16_t len)
 {
+    // The console UART may not exist yet. app_main installs log_vprintf
+    // (main.c) long before drv_uart_usbc_init() creates usbc_mutex_send and
+    // installs the driver below, so ANY early ESP_LOGx lands here first:
+    // xSemaphoreTake(NULL) trips configASSERT (assertions are enabled) and
+    // uart_write_bytes on an uninstalled port is invalid. Drop the console
+    // copy until the port is up; log.c has already captured the line in the
+    // web-log ring buffer, so nothing is lost (v1.1.2 audit 2026-08-01: the
+    // ingest-before-uart reorder made this path reachable on every boot).
+    if (usbc_mutex_send == NULL) return 0;
+
     app_mutex_take(usbc_mutex_send, portMAX_DELAY);
     const int txBytes = uart_write_bytes(USBC_PORT, (const char *)data, len);
 
