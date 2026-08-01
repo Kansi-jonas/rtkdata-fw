@@ -168,7 +168,13 @@ static void uart_task(void *ctx) {
         // full buffer otherwise (stack smash)
         int32_t len = uart_read_bytes(uart_port, buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(50));
         if (len < 0) {
+            // uart_read_bytes returns -1 on a driver error. Without this
+            // continue the negative length fell through: stream_stats got a
+            // negative delta, ntrip_server_ingest_uart received (size_t)-1 as
+            // the chunk length, and buffer[len] below wrote buffer[-1]
+            // (stack corruption; v1.1.2 audit 2026-08-01).
             ESP_LOGE(TAG, "Error reading from UART");
+            continue;
         } else if (len == 0) {
             continue;
         }
