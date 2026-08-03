@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings and the exec bit: a CRLF checkout makes
+# bash fail on the shebang/set line ("set: pipefail"), and a lost exec bit made
+# the CI QEMU gate exit 126 while the release job still produced a draft
+# (2026-08-03).
+*.sh text eol=lf

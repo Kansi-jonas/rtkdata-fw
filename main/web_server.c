@@ -1044,6 +1044,23 @@ static esp_err_t ntrip_tx_stats_get_handler(httpd_req_t *req) {
     cJSON_AddNumberToObject(ingest, "uart_event_post_drops", uart_event_post_drops());
     cJSON_AddNumberToObject(ingest, "uart_read_errors", uart_read_errors());
 
+    // Required-set freshness: which production messages the receiver is
+    // actually producing right now, per type. "any CRC-valid frame" is not
+    // health (review 2026-08-03).
+    ntrip_msg_freshness_t fresh;
+    ntrip_server_msg_freshness(&fresh);
+    cJSON *reqages = cJSON_AddObjectToObject(ingest, "required_age_ms");
+    for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
+        char key[8];
+        snprintf(key, sizeof(key), "%u", (unsigned)fresh.type[i]);
+        if (fresh.age_ms[i] == UINT32_MAX) {
+            cJSON_AddNullToObject(reqages, key);
+        } else {
+            cJSON_AddNumberToObject(reqages, key, fresh.age_ms[i]);
+        }
+    }
+    cJSON_AddBoolToObject(ingest, "required_all_fresh", fresh.all_fresh);
+
     cJSON *arr = cJSON_AddArrayToObject(root, "instances");
     for (size_t i = 0; i < n; i++) {
         cJSON *o = cJSON_CreateObject();

@@ -323,12 +323,18 @@ static void apply_reply(cJSON *root) {
         cJSON *la = cJSON_GetObjectItem(pos, "lat");
         cJSON *lo = cJSON_GetObjectItem(pos, "lon");
         cJSON *he = cJSON_GetObjectItem(pos, "h");
-        if (cJSON_IsBool(v) && cJSON_IsTrue(v) && cJSON_IsNumber(la) && cJSON_IsNumber(lo)) {
+        // A missing or non-numeric height must NOT silently become 0.0: that
+        // would program a base at exactly sea level from a backend schema
+        // drift (review 2026-08-03). No height, no fixed-base push.
+        if (cJSON_IsBool(v) && cJSON_IsTrue(v) && cJSON_IsNumber(la) &&
+            cJSON_IsNumber(lo) && cJSON_IsNumber(he)) {
             s_st.pos_valid = true;
             s_st.pos_lat = lat = la->valuedouble;
             s_st.pos_lon = lon = lo->valuedouble;
-            s_st.pos_h   = h   = cJSON_IsNumber(he) ? he->valuedouble : 0.0;
+            s_st.pos_h   = h   = he->valuedouble;
             want_fix = true;
+        } else if (cJSON_IsBool(v) && cJSON_IsTrue(v)) {
+            ESP_LOGW(TAG, "IE position lacks numeric lat/lon/h; not applying");
         }
     }
     xSemaphoreGive(s_mtx);

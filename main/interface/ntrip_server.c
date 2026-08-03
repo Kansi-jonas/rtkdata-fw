@@ -730,12 +730,19 @@ static void ntrip_server_task(void *ctx){
             int spins = 0;
 
             do {
+                // Judge progress by ACCEPTED BYTES, not by the terminal poll
+                // status: a positive short send followed by EAGAIN returns
+                // WOULDBLOCK and hid real progress, so a connection that moved
+                // data for hours could still carry an escalated backoff into
+                // its next reconnect (review 2026-08-03).
+                uint64_t before = inst->tx.accepted_to_lwip;
+
                 pr = ntrip_tx_poll(&inst->tx, &g_frame_ring, now,
                                    NTRIP_TX_MAX_SENDS_PER_POLL,
                                    NTRIP_TX_STALE_DROP_MS,
                                    ntrip_server_sock_send, inst);
 
-                if (pr == NTRIP_TX_POLL_PROGRESS && !made_progress) {
+                if (inst->tx.accepted_to_lwip > before && !made_progress) {
 
                     // First accepted bytes on this connection: NOW the retry
                     // backoff may reset (not at handshake, see above).
@@ -800,10 +807,66 @@ static void ntrip_server_task(void *ctx){
 
 // -----------------------------------------------------------UART-----------------------------------------------------------------//
 
+// The production set, and the age budget each type may reach before the
+// stream counts as degraded. 1005/1033 are 10 s messages, the MSMs are 1 Hz;
+// budgets are ~3x their nominal interval so a single miss is not a fault.
+const uint16_t ntrip_required_msgs[NTRIP_REQUIRED_MSG_COUNT] = { 1005, 1033, 1077, 1087 };
+static const uint32_t s_required_budget_ms[NTRIP_REQUIRED_MSG_COUNT] = { 30000, 30000, 5000, 5000 };
+
+// Last-seen timestamp per required type. Written only by the UART ingest
+// task, read by diagnostics/OTA: uint32 ms stores are atomic on this target.
+static uint32_t s_msg_last_ms[NTRIP_REQUIRED_MSG_COUNT];
+static bool     s_msg_seen[NTRIP_REQUIRED_MSG_COUNT];
+
+// A receiver reset starts a NEW epoch: whatever it emitted before proves
+// nothing about what it emits now. Without this, 30 s-budget types (1005,
+// 1033) stayed "fresh" across a reset and the OTA gate could confirm an epoch
+// that never produced them (review 2026-08-03).
+void ntrip_server_msg_epoch_reset(void) {
+    for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
+        s_msg_seen[i] = false;
+        s_msg_last_ms[i] = 0;
+    }
+}
+
+void ntrip_server_msg_freshness(ntrip_msg_freshness_t *out) {
+
+    if (!out) return;
+
+    uint32_t now = ntrip_now_ms();
+    out->all_fresh = true;
+
+    for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
+        out->type[i] = ntrip_required_msgs[i];
+        if (!s_msg_seen[i]) {
+            out->age_ms[i] = UINT32_MAX;
+            out->fresh[i]  = false;
+        } else {
+            uint32_t age = now - s_msg_last_ms[i];
+            out->age_ms[i] = age;
+            out->fresh[i]  = (age <= s_required_budget_ms[i]);
+        }
+        if (!out->fresh[i]) out->all_fresh = false;
+    }
+}
+
 static void ntrip_server_on_frame(void *ctx, const uint8_t *frame, uint16_t len,
     uint32_t now) {
 
     (void)ctx;
+
+    // Message-type bookkeeping for the required-set health contract. The type
+    // is the first 12 bits of the payload (frame[3..4]).
+    if (len >= 6) {
+        uint16_t mtype = (uint16_t)(((uint16_t)frame[3] << 4) | (frame[4] >> 4));
+        for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
+            if (ntrip_required_msgs[i] == mtype) {
+                s_msg_last_ms[i] = now;
+                s_msg_seen[i] = true;
+                break;
+            }
+        }
+    }
 
     // A CRC-valid frame is the ONLY thing that counts as "the receiver is
     // alive": command echoes and serial garbage must not feed the watchdog
@@ -1064,6 +1127,16 @@ void ntrip_server_tx_totals(ntrip_tx_totals_t *out) {
     out->bytes_ok        = ing.bytes_ok;
     out->bytes_discarded = ing.bytes_discarded;
     out->crc_errors      = ing.crc_errors;
+
+    ntrip_msg_freshness_t fresh;
+    ntrip_server_msg_freshness(&fresh);
+    // req_missing counts required types that are unusable RIGHT NOW: never
+    // seen OR stale past their budget. Counting only "never seen" understated
+    // a receiver that had gone quiet (review 2026-08-03).
+    out->req_fresh = fresh.all_fresh;
+    for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
+        if (!fresh.fresh[i]) out->req_missing++;
+    }
 
     if (!g_instances_mutex) return;
 

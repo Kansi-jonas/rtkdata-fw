@@ -59,6 +59,17 @@ jobs:
           target: esp32
           path: '.'
 
+      # The SAME gate the branch build runs, on the bytes this job is about to
+      # attach. Without it a red branch build could still produce a draft
+      # (observed 2026-08-03), which defeats the point of having a boot gate.
+      - name: QEMU boot smoke test on the release image
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.1
+          target: esp32
+          path: '.'
+          command: bash tools/qemu-smoke.sh build
+
       - name: Draft GitHub Release (review, then Publish to go live)
         uses: softprops/action-gh-release@v2
         with:

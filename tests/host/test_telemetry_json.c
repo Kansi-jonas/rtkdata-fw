@@ -32,6 +32,8 @@ static void test_known_values(void) {
     t.max_queue_age_ms = 250;
     t.instances = 1;
     t.connected = 1;
+    t.req_fresh = true;
+    t.req_missing = 0;
 
     char buf[TELEMETRY_TX_JSON_MAX];
     int n = telemetry_tx_json(buf, sizeof(buf), &t, 3);
@@ -43,13 +45,15 @@ static void test_known_values(void) {
         "\"crc_errors\":1,\"accepted_to_lwip\":1200,\"sent_frames\":6,"
         "\"dropped_bytes\":0,\"skipped_bytes\":0,\"dropped_stale_bytes\":0,"
         "\"eagain\":2,\"reconnects\":1,\"max_queue_age_ms\":250,"
-        "\"instances\":1,\"connected\":1,\"uart_event_post_drops\":3}";
+        "\"instances\":1,\"connected\":1,\"uart_event_post_drops\":3,"
+        "\"req_fresh\":true,\"req_missing\":0}";
     CHECK(strcmp(buf, expect) == 0);
 }
 
 static void test_worst_case_bound(void) {
     ntrip_tx_totals_t t;
     memset(&t, 0xFF, sizeof(t));   /* every counter at its maximum */
+    t.req_fresh = true;            /* 0xFF is not a valid _Bool (UBSan) */
 
     char buf[TELEMETRY_TX_JSON_MAX];
     int n = telemetry_tx_json(buf, sizeof(buf), &t, 0xFFFFFFFFul);

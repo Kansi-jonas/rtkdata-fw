@@ -53,7 +53,10 @@ jobs:
           esp_idf_version: v5.3.1
           target: esp32
           path: '.'
-          command: tools/qemu-smoke.sh build
+          # Invoke through bash: relying on the file's exec bit made this step
+          # fail with "Permission denied" (exit 126) on 2026-08-03, and the
+          # release job built a draft anyway because it never ran QEMU.
+          command: bash tools/qemu-smoke.sh build
 
       - name: Collect OTA artifacts
         run: |

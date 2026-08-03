@@ -63,6 +63,33 @@ typedef struct {
     uint64_t ring_cum_bytes;
 } ntrip_ingest_stats_t;
 
+// The production message set a healthy base MUST emit. "Any CRC-valid frame"
+// is not receiver health: a stream of 1077 alone (or of 1005/1033 metadata
+// only) would otherwise pass every gate while GLONASS or the observation set
+// is silently gone (review 2026-08-03).
+//
+// 1230 is deliberately NOT here: the UM980 on R4.10Build11833 rejects the
+// command outright (measured), so requiring it would make every station in
+// this fleet permanently unhealthy. It stays configured, and its absence is
+// telemetered via the config ok/total ratio, not enforced here.
+#define NTRIP_REQUIRED_MSG_COUNT 4
+extern const uint16_t ntrip_required_msgs[NTRIP_REQUIRED_MSG_COUNT];
+
+// Per-required-type age since the last CRC-valid frame of that type, in ms.
+// UINT32_MAX means "never seen since boot".
+typedef struct {
+    uint16_t type[NTRIP_REQUIRED_MSG_COUNT];
+    uint32_t age_ms[NTRIP_REQUIRED_MSG_COUNT];
+    bool     fresh[NTRIP_REQUIRED_MSG_COUNT];   // seen AND within budget
+    bool     all_fresh;      // every required type seen within its budget
+} ntrip_msg_freshness_t;
+
+void ntrip_server_msg_freshness(ntrip_msg_freshness_t *out);
+
+// Drop all freshness evidence: call whenever the receiver is reset, since a
+// new epoch has to re-prove the required set from scratch.
+void ntrip_server_msg_epoch_reset(void);
+
 size_t ntrip_server_tx_stats(ntrip_tx_stats_t *out, size_t max);
 void ntrip_server_ingest_stats(ntrip_ingest_stats_t *out);
 
@@ -88,6 +115,8 @@ typedef struct {
     uint32_t max_queue_age_ms;      // max across instances
     uint32_t instances;
     uint32_t connected;
+    bool     req_fresh;             // every required RTCM type within budget
+    uint32_t req_missing;           // how many required types are stale/unseen
 } ntrip_tx_totals_t;
 
 void ntrip_server_tx_totals(ntrip_tx_totals_t *out);

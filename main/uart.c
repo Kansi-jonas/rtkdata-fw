@@ -25,6 +25,7 @@
 
 #include "uart.h"
 #include "config.h"
+#include "gnss.h"
 #include "interface/ntrip.h"
 #include "interface/socket_server.h"
 #include "tasks.h"
@@ -194,10 +195,19 @@ static void uart_task(void *ctx) {
         // a chunk could vanish mid-frame).
         ntrip_server_ingest_uart(buffer, (size_t)len);
 
+        // GNSS command/ACK capture is control traffic and equally synchronous:
+        // it must not depend on the best-effort fanout below.
+        gnss_ingest_uart(buffer, (size_t)len);
+
         // The event bus still serves the OTHER consumers (gnss config
-        // capture, socket_client/server forwarding). A failed post no longer
-        // touches RTCM, but it is counted instead of ignored.
-        esp_err_t perr = esp_event_post(UART_EVENT_READ, len, &buffer, len, portMAX_DELAY);
+        // capture, socket_client/server forwarding). BEST EFFORT with a zero
+        // wait: those handlers run on the default event loop and the optional
+        // socket ones do blocking writes, so a slow secondary TCP client could
+        // fill the 32-slot queue and block THIS task in esp_event_post - the
+        // sole reader of the GNSS UART, whose 4 KB RX buffer holds only ~0.36 s
+        // at line rate (review 2026-08-03). Dropping a fanout copy is always
+        // better than losing receiver bytes; drops are counted.
+        esp_err_t perr = esp_event_post(UART_EVENT_READ, len, &buffer, len, 0);
         if (perr != ESP_OK) {
             s_event_post_drops++;
             if (s_event_post_drops == 1 || (s_event_post_drops % 100) == 0) {

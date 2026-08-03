@@ -33,6 +33,7 @@
 #include "gnss.h"
 #include "uart.h"
 #include "supervisor.h"
+#include "interface/ntrip.h"
 
 #define TAG "GNSS"
 
@@ -53,19 +54,18 @@ static volatile size_t s_cap_len = 0;
 static volatile bool s_capturing = false;
 static portMUX_TYPE s_cap_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static void gnss_uart_capture(void *arg, esp_event_base_t base, int32_t id, void *data) {
-    (void)arg; (void)base;
-    // GNSS liveness is noted per CRC-valid RTCM frame in the NTRIP ingest
-    // path now, NOT per raw byte batch: command echoes or serial garbage must
-    // not keep a receiver "alive" that produces no usable corrections
-    // (review 2026-08-01). The supervisor's gnss_recover then re-runs this
-    // config, and the wedge rung reboots if that never helps.
-    if (!s_capturing || data == NULL) return;
-    int len = (int)id;                          // uart_task posts len as the event id
-    const uint8_t *d = (const uint8_t *)data;
+/* Called SYNCHRONOUSLY from uart_task for every chunk. The command/ACK path is
+ * authoritative control traffic and must never be lossy: it used to ride the
+ * esp_event bus, and when that fanout was made best-effort (timeout 0) to stop
+ * a slow secondary socket from blocking the sole UART reader, ACKs became
+ * droppable too - a successful "mode base" could read as four failed attempts
+ * (review 2026-08-03, self-inflicted regression). Bounded work under a
+ * spinlock, no allocation, no event queue. */
+void gnss_ingest_uart(const uint8_t *data, size_t len) {
+    if (!s_capturing || data == NULL || len == 0) return;
     portENTER_CRITICAL(&s_cap_mux);
-    if (s_cap_len + (size_t)len >= CAP_SZ) s_cap_len = 0;   // keep the newest
-    for (int i = 0; i < len && s_cap_len < CAP_SZ - 1; i++) s_cap[s_cap_len++] = (char)d[i];
+    if (s_cap_len + len >= CAP_SZ) s_cap_len = 0;   // keep the newest
+    for (size_t i = 0; i < len && s_cap_len < CAP_SZ - 1; i++) s_cap[s_cap_len++] = (char)data[i];
     s_cap[s_cap_len] = '\0';
     portEXIT_CRITICAL(&s_cap_mux);
 }
@@ -76,14 +76,68 @@ static void cap_reset(void) {
     portEXIT_CRITICAL(&s_cap_mux);
 }
 
-static bool cap_contains(const char *needle) {
-    static char tmp[CAP_SZ];
+/* Binary-safe search: RTCM bytes share this buffer with the ASCII response,
+ * and a legal 0x00 BEFORE the response must not truncate the haystack the way
+ * strstr did (review 2026-08-03: an applied command could read as a timeout).
+ * Returns the offset just past the match, or -1. */
+static int cap_find_from(const char *hay, size_t n, size_t from, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || n < nlen) return -1;
+    for (size_t i = from; i + nlen <= n; i++) {
+        if (hay[i] == needle[0] && memcmp(hay + i, needle, nlen) == 0) {
+            return (int)(i + nlen);
+        }
+    }
+    return -1;
+}
+
+static size_t cap_snapshot(char *dst) {
     portENTER_CRITICAL(&s_cap_mux);
     size_t n = s_cap_len;
-    memcpy(tmp, s_cap, n + 1);
+    memcpy(dst, s_cap, n);
     portEXIT_CRITICAL(&s_cap_mux);
-    return strstr(tmp, needle) != NULL;
+    return n;
 }
+
+static bool cap_contains(const char *needle) {
+    static char tmp[CAP_SZ];
+    size_t n = cap_snapshot(tmp);
+    return cap_find_from(tmp, n, 0, needle) >= 0;
+}
+
+/* CORRELATED response lookup. The UM980 echoes the command in its reply:
+ *   $command,<command text>,response: OK*<crc>
+ * Matching a bare "response: OK" anywhere in the capture let a late reply to
+ * command A confirm command B, and with OK(A) and FAIL(B) both buffered the
+ * generic OK won (review 2026-08-03). We now require the verdict to follow
+ * the echo of THIS command. Returns 1 = acked, 0 = rejected, -1 = no verdict
+ * for this command yet. */
+static int cap_verdict_for(const char *cmd_trimmed) {
+    static char tmp[CAP_SZ];
+    size_t n = cap_snapshot(tmp);
+
+    int after_echo = cap_find_from(tmp, n, 0, cmd_trimmed);
+    if (after_echo < 0) return -1;                 // our echo has not arrived
+
+    int ok   = cap_find_from(tmp, n, (size_t)after_echo, "response: OK");
+    int fail = cap_find_from(tmp, n, (size_t)after_echo, "PARSING FAIL");
+
+    if (ok >= 0 && (fail < 0 || ok < fail)) return 1;
+    if (fail >= 0) return 0;
+    return -1;
+}
+
+/* One transaction owner at a time: the supervisor (gnss_recover) and the
+ * provisioning heartbeat (gnss_set_fixed_base) run on different tasks but
+ * share the capture buffer and the generic-OK detector. Without this lock,
+ * one task's "response: OK" can confirm the OTHER task's command, or a reset
+ * can land between a command and its ACK (review 2026-08-03, P0). Recursive:
+ * gnss_recover -> config_gnss_base nests. The full command-echo correlation
+ * and a dedicated GNSS control task remain tracked architectural work; this
+ * lock removes the cross-task interleaving today. */
+static SemaphoreHandle_t s_txn = NULL;
+static void txn_take(void) { if (s_txn) xSemaphoreTakeRecursive(s_txn, portMAX_DELAY); }
+static void txn_give(void) { if (s_txn) xSemaphoreGiveRecursive(s_txn); }
 
 /* ---- ACK-gated command send ------------------------------------------- */
 
@@ -91,26 +145,35 @@ static bool send_cmd_acked(const char *cmd, int retries) {
     int show = (int)strlen(cmd);
     while (show > 0 && (cmd[show - 1] == '\r' || cmd[show - 1] == '\n')) show--;  // trim CRLF for logs
 
+    // The command text without CRLF, which is exactly what the receiver echoes
+    // back inside "$command,<text>,response: ...".
+    char echo[96];
+    int  elen = show < (int)sizeof(echo) - 1 ? show : (int)sizeof(echo) - 1;
+    memcpy(echo, cmd, (size_t)elen);
+    echo[elen] = '\0';
+
     for (int attempt = 0; attempt <= retries; attempt++) {
         cap_reset();
         drv_uart_gnss_send((uint8_t *)cmd, strlen(cmd));
 
         for (int waited = 0; waited < ACK_TIMEOUT_MS; waited += ACK_POLL_MS) {
             vTaskDelay(pdMS_TO_TICKS(ACK_POLL_MS));
-            if (cap_contains("response: OK")) {
-                // A command response IS receiver liveness: during (re)config the
-                // RTCM output is intentionally stopped, and the frame-based
-                // watchdog must not count silence WE caused (2026-08-01: it
-                // hardware-reset a healthy receiver mid-configuration).
-                supervisor_note_gnss_rx();
+
+            int verdict = cap_verdict_for(echo);
+            if (verdict < 0) continue;              // no verdict for THIS command yet
+
+            // A command response IS receiver liveness: during (re)config the
+            // RTCM output is intentionally stopped, and the frame-based
+            // watchdog must not count silence WE caused (2026-08-01: it
+            // hardware-reset a healthy receiver mid-configuration).
+            supervisor_note_gnss_rx();
+
+            if (verdict == 1) {
                 ESP_LOGI(TAG, "ack: %.*s", show, cmd);
                 return true;
             }
-            if (cap_contains("PARSING FAIL")) {            // matches the "FAILD" typo too
-                supervisor_note_gnss_rx();                 // rejected, but alive
-                ESP_LOGW(TAG, "rejected: %.*s", show, cmd);
-                return false;                              // won't pass on retry
-            }
+            ESP_LOGW(TAG, "rejected: %.*s", show, cmd);
+            return false;                          // won't pass on retry
         }
         ESP_LOGW(TAG, "no ack (attempt %d/%d): %.*s", attempt + 1, retries + 1, show, cmd);
     }
@@ -119,7 +182,12 @@ static bool send_cmd_acked(const char *cmd, int retries) {
 
 /* ---- hardware reset --------------------------------------------------- */
 
+static void gnss_receiver_epoch_invalidate(void);   // defined with the latch below
+
 static void gnss_reset_pulse(void) {
+    // A hardware reset erases whatever the receiver had applied. Every piece
+    // of evidence about the OLD epoch must die with it (review 2026-08-03).
+    gnss_receiver_epoch_invalidate();
     gpio_set_direction(GPIO_GNSS_RESET, GPIO_MODE_OUTPUT);
     gpio_pullup_en(GPIO_GNSS_RESET);
     gpio_set_level(GPIO_GNSS_RESET, 0);
@@ -149,6 +217,8 @@ typedef struct { double lat, lon, h; } gnss_base_fix_t;
 static bool           s_base_acked_valid = false;
 static gnss_base_fix_t s_base_acked_coord;
 
+static void gnss_base_ack_invalidate(void) { s_base_acked_valid = false; }
+
 /* Bounded retry: a receiver that keeps failing the apply must not be re-poked
  * on every heartbeat reply (a SUCCESSFUL redundant "mode base" stalls RTCM for
  * ~18 s, and even NACK storms are UART noise during configuration). One
@@ -158,11 +228,29 @@ static gnss_base_fix_t s_base_acked_coord;
 static int64_t s_base_fail_us = 0;
 static gnss_base_fix_t s_base_fail_coord;
 
+/* Everything we believe about the RUNNING receiver, dropped at once: the
+ * ACKed-coordinate latch (else the idempotence gate skips a needed re-apply),
+ * the failure cooldown (a fresh epoch deserves an immediate attempt), and the
+ * required-RTCM freshness evidence (the new epoch must re-prove that it emits
+ * the production set before anything calls it healthy). */
+static void gnss_receiver_epoch_invalidate(void) {
+    gnss_base_ack_invalidate();
+    s_base_fail_us = 0;
+    ntrip_server_msg_epoch_reset();
+}
+
 // Reject Null-Island and out-of-range coords: never apply garbage as a fixed base
 // (it would broadcast a wrong 1005 to every rover). Mirrors the LH-side guards.
 static bool gnss_coord_valid(double lat, double lon) {
     if (lat == 0.0 && lon == 0.0) return false;
     return lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0;
+}
+
+// Height gets its own guard: a backend schema drift that maps a missing
+// height to 0.0 must not program a base at exactly sea level (review
+// 2026-08-03). Dead Sea to high mountain, ellipsoidal.
+static bool gnss_height_valid(double h) {
+    return isfinite(h) && h >= -500.0 && h <= 9000.0;
 }
 
 static bool gnss_load_fixed_base(double *lat, double *lon, double *h) {
@@ -172,17 +260,32 @@ static bool gnss_load_fixed_base(double *lat, double *lon, double *h) {
     size_t sz = sizeof(b);
     esp_err_t err = nvs_get_blob(nh, GNSS_KEY_BASE, &b, &sz);
     nvs_close(nh);
-    if (err != ESP_OK || sz != sizeof(b) || !gnss_coord_valid(b.lat, b.lon)) return false;
+    if (err != ESP_OK || sz != sizeof(b) || !gnss_coord_valid(b.lat, b.lon) ||
+        !gnss_height_valid(b.h)) return false;
     *lat = b.lat; *lon = b.lon; *h = b.h;
     return true;
 }
 
-static void gnss_save_fixed_base(double lat, double lon, double h) {
+// Persist failures must be VISIBLE: a silently failed save leaves NVS stale
+// while the receiver runs the new coordinate, and the next boot restores the
+// old one (review 2026-08-03).
+static bool gnss_save_fixed_base(double lat, double lon, double h) {
     nvs_handle_t nh;
-    if (nvs_open(GNSS_NVS_NS, NVS_READWRITE, &nh) != ESP_OK) return;
+    if (nvs_open(GNSS_NVS_NS, NVS_READWRITE, &nh) != ESP_OK) {
+        ESP_LOGE(TAG, "fixed-base NVS open failed; coordinate NOT persisted");
+        return false;
+    }
     gnss_base_fix_t b = { lat, lon, h };
-    if (nvs_set_blob(nh, GNSS_KEY_BASE, &b, sizeof(b)) == ESP_OK) nvs_commit(nh);
+    esp_err_t err = nvs_set_blob(nh, GNSS_KEY_BASE, &b, sizeof(b));
+    if (err == ESP_OK) err = nvs_commit(nh);
     nvs_close(nh);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "fixed-base NVS save failed (%s); coordinate NOT persisted",
+                 esp_err_to_name(err));
+        uart_nmea("$PESP,RTK,GNSS,PERSISTFAIL");
+        return false;
+    }
+    return true;
 }
 
 /* ---- reference-base configuration ------------------------------------- */
@@ -208,6 +311,7 @@ void config_gnss_base(void) {
         // persisted precise coordinate (fixed) vs a fresh device (survey-in).
     };
     ESP_LOGI(TAG, "configuring UM980 reference base (ACK-gated)");
+    txn_take();
     s_capturing = true;
     int seq_n = (int)(sizeof(seq) / sizeof(seq[0]));
     int ok = 0, total = seq_n + 2;   // + base-mode + saveconfig
@@ -239,7 +343,11 @@ void config_gnss_base(void) {
         }
     } else {
         // Same honesty as the FIXED branch above: only report SURVEYIN when the
-        // receiver actually acked it (v1.1.2 audit 2026-08-01).
+        // receiver actually acked it (v1.1.2 audit 2026-08-01). Either way the
+        // receiver is NOT on a fixed coordinate anymore: the truth latch must
+        // fall, or a later identical IE push is wrongly skipped (review
+        // 2026-08-03, P0).
+        gnss_base_ack_invalidate();
         if (send_cmd_acked("mode base time 300 1.5\r\n", ACK_RETRIES)) {  // VERIFY syntax on first hw
             ok++;
             ESP_LOGI(TAG, "no persisted fixed base -> provisional survey-in");
@@ -254,16 +362,20 @@ void config_gnss_base(void) {
     s_capturing = false;
     ESP_LOGI(TAG, "UM980 base config: %d/%d commands acked", ok, total);
     uart_nmea("$PESP,RTK,GNSS,CONFIG,%d,%d", ok, total);
+    txn_give();
 }
 
 bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
     // Never apply a garbage coordinate as the fixed base (it would be broadcast as
     // the 1005 to every rover). Reject Null-Island / out-of-range outright.
-    if (!gnss_coord_valid(lat_deg, lon_deg)) {
-        ESP_LOGE(TAG, "rejecting invalid fixed base %.9f %.9f", lat_deg, lon_deg);
+    if (!gnss_coord_valid(lat_deg, lon_deg) || !gnss_height_valid(height_m)) {
+        ESP_LOGE(TAG, "rejecting invalid fixed base %.9f %.9f h=%.4f",
+                 lat_deg, lon_deg, height_m);
         uart_nmea("$PESP,RTK,GNSS,FIXEDBASE,0");
         return false;
     }
+
+    txn_take();
 
     // Idempotence gate: the IE re-pushes the coordinate on heartbeat replies,
     // and boot already applied the NVS-persisted one. Re-sending "mode base"
@@ -296,6 +408,7 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
             fabs(nv_h - height_m) >= 5e-4) {
             gnss_save_fixed_base(lat_deg, lon_deg, height_m);
         }
+        txn_give();
         return true;
     }
 
@@ -306,6 +419,7 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
         fabs(s_base_fail_coord.lon - lon_deg) < 1e-9 &&
         fabs(s_base_fail_coord.h - height_m) < 5e-4 &&
         (esp_timer_get_time() - s_base_fail_us) < GNSS_BASE_RETRY_COOLDOWN_US) {
+        txn_give();
         return false;
     }
 
@@ -341,14 +455,17 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
 
     ESP_LOGI(TAG, "fixed base %.9f %.9f %.4f -> %s", lat_deg, lon_deg, height_m, ok ? "OK" : "FAILED");
     uart_nmea("$PESP,RTK,GNSS,FIXEDBASE,%d", ok ? 1 : 0);
+    txn_give();
     return ok;
 }
 
 void gnss_recover(void) {
     ESP_LOGW(TAG, "GNSS recover: hardware reset + reconfigure");
     uart_nmea("$PESP,RTK,GNSS,RECOVER");
+    txn_take();
     gnss_reset_pulse();
     config_gnss_base();
+    txn_give();
 }
 
 /* Query + log the UM980 firmware version (VERSIONA). The #VERSIONA response
@@ -357,6 +474,7 @@ void gnss_recover(void) {
  * the station). VERSIONA is a one-shot query, so it still answers after the
  * "unlog com1" in config_gnss_base. */
 void gnss_log_version(void) {
+    txn_take();
     s_capturing = true;
     cap_reset();
     drv_uart_gnss_send((uint8_t *)"VERSIONA\r\n", 10);
@@ -373,13 +491,21 @@ void gnss_log_version(void) {
     for (size_t i = 0; i < n; i++) if (tmp[i] == '\r' || tmp[i] == '\n') tmp[i] = ' ';
     ESP_LOGI(TAG, "UM980 VERSIONA: %s", n ? tmp : "(no response)");
     uart_nmea("$PESP,RTK,GNSS,VER,%s", n ? tmp : "none");
+    txn_give();
 }
 
 void gnss_init(void) {
-    // Register the response-capture handler once (coexists with the NTRIP forwarder).
-    uart_register_read_handler(gnss_uart_capture);
+    // The transaction lock exists before anything can race for the receiver
+    // (supervisor and provisioning start later, but order must not matter).
+    s_txn = xSemaphoreCreateRecursiveMutex();
+    if (!s_txn) ESP_LOGE(TAG, "gnss txn mutex creation failed; transactions unserialized");
 
+    // No event-bus registration: uart_task calls gnss_ingest_uart() directly,
+    // so ACK capture cannot be dropped by a saturated event queue.
+
+    txn_take();
     gnss_reset_pulse();
     config_gnss_base();
     gnss_log_version();     // log the UM980 firmware (inventory + partner config)
+    txn_give();
 }

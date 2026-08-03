@@ -90,13 +90,21 @@ static inline uint32_t age_s(int64_t t) { return (uint32_t)((now_us() - t) / 100
 void supervisor_note_gnss_rx(void) { s_t_gnss = now_us(); s_gnss_seen = true; }
 
 void supervisor_note_caster_tx(int bytes) {
-    /* bytes==0 arms the watchdog at handshake time: from then on "no caster
-     * progress" is a judgeable fault instead of a permanent blind spot
-     * (review 2026-08-01: the watchdog never engaged on a connection that
-     * never got a single byte out). */
-    (void)bytes;
-    s_t_caster = now_us();
-    s_caster_seen = true;
+    /* bytes>0 is progress and refreshes the liveness timestamp.
+     *
+     * bytes==0 is the handshake ARMING the watchdog: it makes "no caster
+     * progress" judgeable from now on (before, a connection that never sent a
+     * byte was a permanent blind spot). It must NOT refresh the timestamp on
+     * an already-armed watchdog: a reconnect loop of bare handshakes would
+     * otherwise keep the caster looking alive forever while zero payload
+     * moved (review 2026-08-03). */
+    if (bytes > 0) {
+        s_t_caster = now_us();
+        s_caster_seen = true;
+    } else if (!s_caster_seen) {
+        s_t_caster = now_us();
+        s_caster_seen = true;
+    }
 }
 
 void supervisor_note_sta_ip(bool up) {

@@ -28,7 +28,9 @@ int telemetry_tx_json(char *dst, size_t cap, const ntrip_tx_totals_t *t,
         "\"max_queue_age_ms\":%lu,"
         "\"instances\":%lu,"
         "\"connected\":%lu,"
-        "\"uart_event_post_drops\":%lu"
+        "\"uart_event_post_drops\":%lu,"
+        "\"req_fresh\":%s,"
+        "\"req_missing\":%lu"
         "}",
         (unsigned long long)t->frames_ok,
         (unsigned long long)t->bytes_ok,
@@ -44,7 +46,9 @@ int telemetry_tx_json(char *dst, size_t cap, const ntrip_tx_totals_t *t,
         (unsigned long)t->max_queue_age_ms,
         (unsigned long)t->instances,
         (unsigned long)t->connected,
-        uart_event_post_drops);
+        uart_event_post_drops,
+        t->req_fresh ? "true" : "false",
+        (unsigned long)t->req_missing);
 
     /* n >= sizeof(local) cannot happen by the documented bound; checked
      * anyway so a future field addition fails loudly in tests, not quietly

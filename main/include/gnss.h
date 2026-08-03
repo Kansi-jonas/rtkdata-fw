@@ -27,6 +27,10 @@ void gnss_log_version(void);
 // acknowledged. Called by the provisioning client once the position converges.
 bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m);
 
+// Synchronous command/response capture, called from uart_task for every UART
+// chunk. Cheap no-op unless a transaction is capturing.
+void gnss_ingest_uart(const uint8_t *data, size_t len);
+
 // Hardware-reset + reconfigure the UM980. Registered as the supervisor's GNSS
 // recovery action (fires when no GNSS bytes have arrived for a while).
 void gnss_recover(void);

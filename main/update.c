@@ -92,10 +92,16 @@ void send_update_completed() {
 #define OTA_CONFIRM_CHECK_MS      (10 * 1000)
 #define OTA_CONFIRM_STABLE_N      3
 #define OTA_CONFIRM_DEADLINE_MS   (30 * 60 * 1000)
-#define OTA_CONFIRM_MIN_FRAMES    60ULL          /* ~10 s of MSM at ~7 Hz */
-#define OTA_CONFIRM_MIN_TX_BYTES  10240ULL       /* caster accepted >= 10 KiB */
+/* DELTAS per check interval, not cumulative totals since boot: a stream that
+ * died after meeting a lifetime threshold once would otherwise keep passing
+ * (review 2026-08-03, P0). */
+#define OTA_CONFIRM_MIN_FRAME_DELTA 10ULL        /* new CRC-valid frames / 10 s */
+#define OTA_CONFIRM_MIN_BYTE_DELTA  2048ULL      /* new bytes accepted / 10 s */
 #define OTA_CONFIRM_UNPROV_MS     (10 * 60 * 1000)
 #define OTA_CONFIRM_MIN_HEAP_B    20480
+/* "did not crash" is a separate question from "data plane works". Long enough
+ * that a deterministic late crash cannot keep resetting the counter. */
+#define OTA_BOOTLOOP_CLEAR_MS     (45 * 60 * 1000)
 
 // true iff 'cand' is a strictly newer dotted version than 'cur' ("1.0.2">"1.0.1").
 // Prevents downgrades (channel older than the running build) re-flashing in a
@@ -411,10 +417,20 @@ esp_err_t update_SPIFFS(const char *url) {
         }else{
 
             int content_length = esp_http_client_fetch_headers(http_client);
+            int http_status    = esp_http_client_get_status_code(http_client);
 
-            if (content_length <= 0) {
+            if (http_status != 200) {
+
+                // Without this a 404 body was happily written over the staging
+                // partition and then copied across the live web UI
+                // (review 2026-08-03).
+                ESP_LOGE(TAG, "www.bin HTTP status %d (expected 200)", http_status);
+                err = ESP_FAIL;
+
+            }else if (content_length <= 0) {
 
                 ESP_LOGE(TAG, "Content length error");
+                err = ESP_FAIL;
 
             }else{
 
@@ -429,10 +445,14 @@ esp_err_t update_SPIFFS(const char *url) {
                 }else{
 
                         int     data_read       = 0;
-                        int     offset          = 0; 
+                        int     offset          = 0;
                         char    buffer[1024];
 
-                        esp_err_t err = esp_partition_erase_range(partition, 0, partition->size);
+                        // NO shadowing declaration here: a local `esp_err_t err`
+                        // used to hide every erase/write/copy failure from the
+                        // caller, which then rebooted onto a half-written web
+                        // partition and reported success (review 2026-08-03).
+                        err = esp_partition_erase_range(partition, 0, partition->size);
 
                         if (err != ESP_OK) {
 
@@ -475,6 +495,16 @@ esp_err_t update_SPIFFS(const char *url) {
                             if (data_read < 0) {
 
                                 ESP_LOGE(TAG, "File download to SPIFFS failed, data read %i",data_read);
+                                err = ESP_FAIL;
+                            }else if (offset != content_length) {
+
+                                // Short download: the staging copy is truncated.
+                                // Erasing the LIVE www partition for this would
+                                // destroy the web UI with no way back (an app
+                                // rollback does not restore a data partition).
+                                ESP_LOGE(TAG, "www.bin truncated: %d of %d bytes; "
+                                         "NOT touching the live www partition",
+                                         offset, content_length);
                                 err = ESP_FAIL;
                             }else{
 
@@ -667,7 +697,14 @@ cJSON* ota_fetch_json_from_url(){
 
     esp_http_client_handle_t http_client = esp_http_client_init(&http_config);
 
-    // GET HTTP-Request 
+    // Under heap pressure init returns NULL and every call below would
+    // dereference it (review 2026-08-03).
+    if (http_client == NULL) {
+        ESP_LOGE(TAG, "manifest fetch: HTTP client init failed (heap?)");
+        return NULL;
+    }
+
+    // GET HTTP-Request
     esp_http_client_set_method(http_client, HTTP_METHOD_GET);
 
     esp_err_t err = esp_http_client_open(http_client, 0);
@@ -688,10 +725,11 @@ cJSON* ota_fetch_json_from_url(){
 
             if (response == NULL) {
 
+                // No cleanup here: the single cleanup at the end of the
+                // function owns the handle. Doing both was a double free on
+                // the OOM path (review 2026-08-03).
                 ESP_LOGE(TAG, "Memory allocation failed for response");
 
-                esp_http_client_cleanup(http_client);
-   
             }else{
 
                 int data_read  = esp_http_client_read_response(http_client, response, content_length);
@@ -873,25 +911,55 @@ void ota_mark_valid_task(void *pvParameter) {
     const char *path = "semantic";
     bool healthy = false;
     bool have_prev = false;
+    bool bootloop_cleared = false;
     uint32_t prev_rec_gnss = 0;
+    uint64_t prev_frames = 0, prev_bytes = 0;
     int stable = 0;
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(OTA_CONFIRM_CHECK_MS));
         int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
 
+        // The boot-loop counter answers "does this firmware CRASH?", which is
+        // independent of whether the caster is reachable. Clear it once the
+        // image has survived long enough that a crash loop is ruled out, or a
+        // long caster outage plus a few reboots would erase otadata and drop a
+        // healthy device to the factory app (review 2026-08-03). The window is
+        // deliberately LONGER than any plausible deterministic crash point: a
+        // 120 s clear let a regression that crashes at 121 s reset the counter
+        // on every boot and never reach the factory fallback.
+        if (!bootloop_cleared && elapsed_ms >= OTA_BOOTLOOP_CLEAR_MS) {
+            nvs_handle_t bh;
+            if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &bh) == ESP_OK) {
+                nvs_set_u8(bh, OTA_KEY_BOOTLOOP, 0);
+                nvs_commit(bh);
+                nvs_close(bh);
+            }
+            bootloop_cleared = true;
+        }
+
         ntrip_tx_totals_t t;
         ntrip_server_tx_totals(&t);
         supervisor_health_t h;
         supervisor_health(&h);
+        ntrip_msg_freshness_t fresh;
+        ntrip_server_msg_freshness(&fresh);
 
-        bool gnss_ok    = t.frames_ok >= OTA_CONFIRM_MIN_FRAMES;
-        bool no_new_rec = have_prev && (h.recoveries_gnss == prev_rec_gnss);
+        uint64_t d_frames = (t.frames_ok        > prev_frames) ? t.frames_ok        - prev_frames : 0;
+        uint64_t d_bytes  = (t.accepted_to_lwip > prev_bytes)  ? t.accepted_to_lwip - prev_bytes  : 0;
+        bool no_new_rec   = have_prev && (h.recoveries_gnss == prev_rec_gnss);
+
+        prev_frames   = t.frames_ok;
+        prev_bytes    = t.accepted_to_lwip;
         prev_rec_gnss = h.recoveries_gnss;
         have_prev = true;
-        bool caster_good = (t.instances > 0) &&
-                           (t.accepted_to_lwip >= OTA_CONFIRM_MIN_TX_BYTES) &&
-                           h.caster_ok;
+
+        // Health is: the receiver is producing the REQUIRED message set right
+        // now, those frames are moving to the caster right now, and no
+        // recovery fired in between. Cumulative totals and a caster timestamp
+        // refreshed by bare handshakes both passed a dead stream before.
+        bool gnss_ok     = (d_frames >= OTA_CONFIRM_MIN_FRAME_DELTA) && fresh.all_fresh;
+        bool caster_good = (t.instances > 0) && (d_bytes >= OTA_CONFIRM_MIN_BYTE_DELTA);
 
         stable = (gnss_ok && no_new_rec && caster_good) ? stable + 1 : 0;
 
@@ -914,12 +982,38 @@ void ota_mark_valid_task(void *pvParameter) {
     }
 
     if (!healthy) {
-        // Deliberately: no counter reset, no confirmation. A pending-verify
-        // image will be rolled back by the bootloader on the next reboot.
-        ESP_LOGE(TAG, "data plane never met the health contract within %d min; "
-                 "image stays unconfirmed (pending-verify would roll back)",
-                 OTA_CONFIRM_DEADLINE_MS / 60000);
-        uart_nmea("$PESP,OTA,UNCONFIRMED,%s", FW_VERSION);
+        // "Firmware is broken" and "the outside world is unreachable" are
+        // DIFFERENT states (review 2026-08-03). Rolling back a locally sound
+        // image because the caster was down for 30 minutes would turn an
+        // infrastructure incident into a fleet-wide downgrade, so the rollback
+        // requires evidence that the fault is LOCAL: the receiver is not
+        // producing the required RTCM set. If GNSS is fine and only the
+        // network leg failed, we stay unconfirmed and keep retrying: the image
+        // is still pending-verify, so a later crash or reboot still rolls back.
+        ntrip_msg_freshness_t fresh_final;
+        ntrip_server_msg_freshness(&fresh_final);
+        bool local_fault = !fresh_final.all_fresh;
+
+        ESP_LOGE(TAG, "health contract not met within %d min (local_fault=%d)",
+                 OTA_CONFIRM_DEADLINE_MS / 60000, (int)local_fault);
+        uart_nmea("$PESP,OTA,UNCONFIRMED,%s,%d", FW_VERSION, (int)local_fault);
+
+        const esp_partition_t *run = esp_ota_get_running_partition();
+        esp_ota_img_states_t st;
+        if (local_fault && run &&
+            esp_ota_get_state_partition(run, &st) == ESP_OK &&
+            st == ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGE(TAG, "local data-plane fault -> rolling back to the previous image");
+            uart_nmea("$PESP,OTA,ROLLBACK,%s", FW_VERSION);
+            vTaskDelay(pdMS_TO_TICKS(200));            // let the NMEA flush
+            // Returns (instead of rebooting) when there is no rollback-able
+            // image; that must not look like success.
+            esp_err_t rb = esp_ota_mark_app_invalid_rollback_and_reboot();
+            ESP_LOGE(TAG, "rollback did not happen: %s", esp_err_to_name(rb));
+            uart_nmea("$PESP,OTA,ROLLBACKFAIL,%s", FW_VERSION);
+        }
+        // Stay unconfirmed. Nothing is reset, so the anti-brick counters keep
+        // their meaning for the next boot.
         vTaskDelete(NULL);
         return;
     }
@@ -927,8 +1021,21 @@ void ota_mark_valid_task(void *pvParameter) {
     nvs_handle_t h;
     if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
         nvs_set_u8(h, OTA_KEY_BOOTLOOP, 0);
-        nvs_erase_key(h, OTA_KEY_FAILVER);
-        nvs_erase_key(h, OTA_KEY_FAILCNT);
+
+        // The per-version download-attempt counter may ONLY be cleared when
+        // THIS image is the version it was counting, i.e. when we just
+        // confirmed a pending-verify image. Clearing it while running a
+        // healthy OLD image reset the 3-attempt protection every day, so a
+        // permanently broken release artifact was re-downloaded forever
+        // (review 2026-08-03).
+        const esp_partition_t *run = esp_ota_get_running_partition();
+        esp_ota_img_states_t st;
+        bool pending = run && esp_ota_get_state_partition(run, &st) == ESP_OK &&
+                       st == ESP_OTA_IMG_PENDING_VERIFY;
+        if (pending) {
+            nvs_erase_key(h, OTA_KEY_FAILVER);
+            nvs_erase_key(h, OTA_KEY_FAILCNT);
+        }
         nvs_commit(h);
         nvs_close(h);
     }
