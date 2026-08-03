@@ -10,7 +10,8 @@ void ota_update_init();
 void ota_boot_check(void);
 void ota_boot_check_blocking(void);   // boot OTA check on a 16K-stack task (anti stack-smash)
 void ota_boot_loop_guard(void);       // call early in app_main: crash-loop -> factory fallback
-void ota_mark_valid_task(void *pvParameter);  // health-confirm task (cancels rollback)
+void ota_mark_valid_task(void *pvParameter);
+void ota_bootloop_clear_task(void *pvParameter);  // health-confirm task (cancels rollback)
 void ota_check_newupdate(void *pvParameter);
 void ota_schedule_check_newupdate(void *pvParameter);
 

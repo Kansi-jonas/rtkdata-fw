@@ -273,6 +273,9 @@ void app_main()
     // bootloader rolls back (OTA image) or the boot-loop guard falls back to
     // factory. Runs on every boot; also resets the crash-loop + fail counters.
     xTaskCreate(&ota_mark_valid_task, "ota_confirm", 4096, NULL, 4, NULL);
+    // Separate clock, separate question: "did we crash?" is not "does the
+    // data plane work?" (review 2026-08-03).
+    xTaskCreate(&ota_bootloop_clear_task, "ota_bootloop", 2560, NULL, 4, NULL);
 
     // Daily OTA poll: lightweight manifest check; reboots ONLY when a newer
     // version is published (then ota_boot_check_blocking installs it at full

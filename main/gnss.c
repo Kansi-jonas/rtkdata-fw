@@ -31,6 +31,7 @@
 #include "nvs.h"
 
 #include "gnss.h"
+#include "gnss_ack.h"
 #include "uart.h"
 #include "supervisor.h"
 #include "interface/ntrip.h"
@@ -105,26 +106,15 @@ static bool cap_contains(const char *needle) {
     return cap_find_from(tmp, n, 0, needle) >= 0;
 }
 
-/* CORRELATED response lookup. The UM980 echoes the command in its reply:
- *   $command,<command text>,response: OK*<crc>
- * Matching a bare "response: OK" anywhere in the capture let a late reply to
- * command A confirm command B, and with OK(A) and FAIL(B) both buffered the
- * generic OK won (review 2026-08-03). We now require the verdict to follow
- * the echo of THIS command. Returns 1 = acked, 0 = rejected, -1 = no verdict
- * for this command yet. */
-static int cap_verdict_for(const char *cmd_trimmed) {
+/* Correlated verdict lookup, implemented and host-tested in gnss_ack.c. The
+ * receiver uses two grammars that put the command on OPPOSITE sides of the
+ * verdict, so this cannot be done with a single "find the command, then look
+ * for OK/FAIL" scan - that version missed every real reject
+ * (review 2026-08-03, tests/host/test_gnss_ack.c). */
+static gnss_ack_verdict_t cap_verdict_for(const char *cmd_trimmed) {
     static char tmp[CAP_SZ];
     size_t n = cap_snapshot(tmp);
-
-    int after_echo = cap_find_from(tmp, n, 0, cmd_trimmed);
-    if (after_echo < 0) return -1;                 // our echo has not arrived
-
-    int ok   = cap_find_from(tmp, n, (size_t)after_echo, "response: OK");
-    int fail = cap_find_from(tmp, n, (size_t)after_echo, "PARSING FAIL");
-
-    if (ok >= 0 && (fail < 0 || ok < fail)) return 1;
-    if (fail >= 0) return 0;
-    return -1;
+    return gnss_ack_scan(tmp, n, cmd_trimmed);
 }
 
 /* One transaction owner at a time: the supervisor (gnss_recover) and the
@@ -159,8 +149,8 @@ static bool send_cmd_acked(const char *cmd, int retries) {
         for (int waited = 0; waited < ACK_TIMEOUT_MS; waited += ACK_POLL_MS) {
             vTaskDelay(pdMS_TO_TICKS(ACK_POLL_MS));
 
-            int verdict = cap_verdict_for(echo);
-            if (verdict < 0) continue;              // no verdict for THIS command yet
+            gnss_ack_verdict_t verdict = cap_verdict_for(echo);
+            if (verdict == GNSS_ACK_NONE) continue;   // no verdict for THIS command yet
 
             // A command response IS receiver liveness: during (re)config the
             // RTCM output is intentionally stopped, and the frame-based
@@ -168,7 +158,7 @@ static bool send_cmd_acked(const char *cmd, int retries) {
             // hardware-reset a healthy receiver mid-configuration).
             supervisor_note_gnss_rx();
 
-            if (verdict == 1) {
+            if (verdict == GNSS_ACK_OK) {
                 ESP_LOGI(TAG, "ack: %.*s", show, cmd);
                 return true;
             }

@@ -193,11 +193,13 @@ static void uart_task(void *ctx) {
         // frame ring (review 2026-08-01: esp_event_post returns
         // ESP_ERR_NO_MEM under heap pressure and the result was ignored, so
         // a chunk could vanish mid-frame).
-        ntrip_server_ingest_uart(buffer, (size_t)len);
-
-        // GNSS command/ACK capture is control traffic and equally synchronous:
-        // it must not depend on the best-effort fanout below.
+        // Control traffic FIRST: the GNSS command/ACK capture is a bounded
+        // memcpy under a spinlock, while the RTCM ingest below can wait on
+        // g_instances_mutex. Running it second delayed the authoritative
+        // capture behind an unrelated lock (review 2026-08-03).
         gnss_ingest_uart(buffer, (size_t)len);
+
+        ntrip_server_ingest_uart(buffer, (size_t)len);
 
         // The event bus still serves the OTHER consumers (gnss config
         // capture, socket_client/server forwarding). BEST EFFORT with a zero

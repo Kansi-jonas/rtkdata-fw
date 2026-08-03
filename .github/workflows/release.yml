@@ -40,6 +40,9 @@ jobs:
           gcc -std=c99 -O2 -Wall -Wextra -Werror -Imain/include \
             -o /tmp/test_tj tests/host/test_telemetry_json.c main/telemetry_json.c
           /tmp/test_tj
+          gcc -std=c99 -O2 -Wall -Wextra -Werror -Imain/include \
+            -o /tmp/test_ack tests/host/test_gnss_ack.c main/gnss_ack.c
+          /tmp/test_ack
 
       - name: Verify FW_VERSION matches the tag
         run: |

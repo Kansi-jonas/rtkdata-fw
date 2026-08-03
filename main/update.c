@@ -199,6 +199,7 @@ esp_err_t ota_update_firmware(const char *url) {
             if (!update_partition) {
 
                 ESP_LOGE(TAG, "No OTA partition found");
+                err = ESP_FAIL;
 
             }else{
 
@@ -206,10 +207,19 @@ esp_err_t ota_update_firmware(const char *url) {
                     update_partition->subtype, update_partition->address);
 
                 int content_length = esp_http_client_fetch_headers(http_client);
+                int http_status    = esp_http_client_get_status_code(http_client);
 
-                if (content_length <= 0) {
+                if (http_status != 200) {
+
+                    // Unchecked before: a 404/500 body was written into the OTA
+                    // slot as if it were firmware (review 2026-08-03).
+                    ESP_LOGE(TAG, "firmware HTTP status %d (expected 200)", http_status);
+                    err = ESP_FAIL;
+
+                }else if (content_length <= 0) {
 
                     ESP_LOGE(TAG, "Content length error");
+                    err = ESP_FAIL;
 
                 }else{
 
@@ -259,11 +269,23 @@ esp_err_t ota_update_firmware(const char *url) {
 
                         if (data_read < 0) {
 
+                            // The result was discarded here, so the earlier
+                            // ESP_OK from esp_http_client_open survived and the
+                            // caller treated an aborted download as a success:
+                            // it then updated www and rebooted, leaving the OLD
+                            // app with a NEW web partition (review 2026-08-03).
                             ESP_LOGE(TAG, "OTA data read error");
 
                             esp_ota_end(ota_handle);
+                            err = ESP_FAIL;
 
-                        }else if(!downloadBreak){
+                        }else if (downloadBreak) {
+
+                            ESP_LOGE(TAG, "OTA download aborted");
+                            esp_ota_end(ota_handle);
+                            err = ESP_FAIL;
+
+                        }else{
 
                             // ota write successfull end
                             err = esp_ota_end(ota_handle);
@@ -911,7 +933,7 @@ void ota_mark_valid_task(void *pvParameter) {
     const char *path = "semantic";
     bool healthy = false;
     bool have_prev = false;
-    bool bootloop_cleared = false;
+    bool outage_logged = false;
     uint32_t prev_rec_gnss = 0;
     uint64_t prev_frames = 0, prev_bytes = 0;
     int stable = 0;
@@ -919,24 +941,6 @@ void ota_mark_valid_task(void *pvParameter) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(OTA_CONFIRM_CHECK_MS));
         int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
-
-        // The boot-loop counter answers "does this firmware CRASH?", which is
-        // independent of whether the caster is reachable. Clear it once the
-        // image has survived long enough that a crash loop is ruled out, or a
-        // long caster outage plus a few reboots would erase otadata and drop a
-        // healthy device to the factory app (review 2026-08-03). The window is
-        // deliberately LONGER than any plausible deterministic crash point: a
-        // 120 s clear let a regression that crashes at 121 s reset the counter
-        // on every boot and never reach the factory fallback.
-        if (!bootloop_cleared && elapsed_ms >= OTA_BOOTLOOP_CLEAR_MS) {
-            nvs_handle_t bh;
-            if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &bh) == ESP_OK) {
-                nvs_set_u8(bh, OTA_KEY_BOOTLOOP, 0);
-                nvs_commit(bh);
-                nvs_close(bh);
-            }
-            bootloop_cleared = true;
-        }
 
         ntrip_tx_totals_t t;
         ntrip_server_tx_totals(&t);
@@ -978,74 +982,74 @@ void ota_mark_valid_task(void *pvParameter) {
             break;
         }
 
-        if (elapsed_ms >= OTA_CONFIRM_DEADLINE_MS) break;
-    }
+        if (elapsed_ms >= OTA_CONFIRM_DEADLINE_MS) {
 
-    if (!healthy) {
-        // "Firmware is broken" and "the outside world is unreachable" are
-        // DIFFERENT states (review 2026-08-03). Rolling back a locally sound
-        // image because the caster was down for 30 minutes would turn an
-        // infrastructure incident into a fleet-wide downgrade, so the rollback
-        // requires evidence that the fault is LOCAL: the receiver is not
-        // producing the required RTCM set. If GNSS is fine and only the
-        // network leg failed, we stay unconfirmed and keep retrying: the image
-        // is still pending-verify, so a later crash or reboot still rolls back.
-        ntrip_msg_freshness_t fresh_final;
-        ntrip_server_msg_freshness(&fresh_final);
-        bool local_fault = !fresh_final.all_fresh;
+            // Deadline reached without health. "Firmware is broken" and "the
+            // outside world is unreachable" are DIFFERENT states (review
+            // 2026-08-03): rolling back a locally sound image because the
+            // caster was down for 30 minutes would turn an infrastructure
+            // incident into a fleet-wide downgrade.
+            //
+            // LOCAL fault (the receiver is not producing the required RTCM
+            // set) -> roll back now.
+            // EXTERNAL fault (GNSS fine, only the network leg missing) -> keep
+            // looping. The image stays pending-verify, so it is still rolled
+            // back by a crash or reboot, but if the caster returns in minute
+            // 31 this task is still here to confirm it. Exiting here made that
+            // confirmation impossible forever.
+            ntrip_msg_freshness_t fresh_final;
+            ntrip_server_msg_freshness(&fresh_final);
+            bool local_fault = !fresh_final.all_fresh;
 
-        ESP_LOGE(TAG, "health contract not met within %d min (local_fault=%d)",
-                 OTA_CONFIRM_DEADLINE_MS / 60000, (int)local_fault);
-        uart_nmea("$PESP,OTA,UNCONFIRMED,%s,%d", FW_VERSION, (int)local_fault);
+            if (!local_fault) {
+                if (!outage_logged) {
+                    ESP_LOGW(TAG, "health contract not met within %d min, but GNSS is "
+                             "healthy: treating as an EXTERNAL outage, staying "
+                             "unconfirmed and retrying",
+                             OTA_CONFIRM_DEADLINE_MS / 60000);
+                    uart_nmea("$PESP,OTA,UNCONFIRMED,%s,0", FW_VERSION);
+                    outage_logged = true;
+                }
+                continue;
+            }
 
-        const esp_partition_t *run = esp_ota_get_running_partition();
-        esp_ota_img_states_t st;
-        if (local_fault && run &&
-            esp_ota_get_state_partition(run, &st) == ESP_OK &&
-            st == ESP_OTA_IMG_PENDING_VERIFY) {
-            ESP_LOGE(TAG, "local data-plane fault -> rolling back to the previous image");
-            uart_nmea("$PESP,OTA,ROLLBACK,%s", FW_VERSION);
-            vTaskDelay(pdMS_TO_TICKS(200));            // let the NMEA flush
-            // Returns (instead of rebooting) when there is no rollback-able
-            // image; that must not look like success.
-            esp_err_t rb = esp_ota_mark_app_invalid_rollback_and_reboot();
-            ESP_LOGE(TAG, "rollback did not happen: %s", esp_err_to_name(rb));
-            uart_nmea("$PESP,OTA,ROLLBACKFAIL,%s", FW_VERSION);
+            ESP_LOGE(TAG, "local data-plane fault after %d min",
+                     OTA_CONFIRM_DEADLINE_MS / 60000);
+            uart_nmea("$PESP,OTA,UNCONFIRMED,%s,1", FW_VERSION);
+
+            const esp_partition_t *run = esp_ota_get_running_partition();
+            esp_ota_img_states_t st;
+            if (run && esp_ota_get_state_partition(run, &st) == ESP_OK &&
+                st == ESP_OTA_IMG_PENDING_VERIFY) {
+                ESP_LOGE(TAG, "rolling back to the previous image");
+                uart_nmea("$PESP,OTA,ROLLBACK,%s", FW_VERSION);
+                vTaskDelay(pdMS_TO_TICKS(200));            // let the NMEA flush
+                // Returns (instead of rebooting) when there is no rollback-able
+                // image; that must not look like success.
+                esp_err_t rb = esp_ota_mark_app_invalid_rollback_and_reboot();
+                ESP_LOGE(TAG, "rollback did not happen: %s", esp_err_to_name(rb));
+                uart_nmea("$PESP,OTA,ROLLBACKFAIL,%s", FW_VERSION);
+            }
+            // Nothing confirmed, nothing reset: the anti-brick counters keep
+            // their meaning for the next boot.
+            vTaskDelete(NULL);
+            return;
         }
-        // Stay unconfirmed. Nothing is reset, so the anti-brick counters keep
-        // their meaning for the next boot.
-        vTaskDelete(NULL);
-        return;
     }
 
-    nvs_handle_t h;
-    if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, OTA_KEY_BOOTLOOP, 0);
-
-        // The per-version download-attempt counter may ONLY be cleared when
-        // THIS image is the version it was counting, i.e. when we just
-        // confirmed a pending-verify image. Clearing it while running a
-        // healthy OLD image reset the 3-attempt protection every day, so a
-        // permanently broken release artifact was re-downloaded forever
-        // (review 2026-08-03).
-        const esp_partition_t *run = esp_ota_get_running_partition();
-        esp_ota_img_states_t st;
-        bool pending = run && esp_ota_get_state_partition(run, &st) == ESP_OK &&
-                       st == ESP_OTA_IMG_PENDING_VERIFY;
-        if (pending) {
-            nvs_erase_key(h, OTA_KEY_FAILVER);
-            nvs_erase_key(h, OTA_KEY_FAILCNT);
-        }
-        nvs_commit(h);
-        nvs_close(h);
-    }
-
+    // Order matters: CONFIRM FIRST, clear the attempt counter only after the
+    // confirmation actually succeeded. Clearing first meant a failing
+    // mark-valid left the device with no retry budget for this version
+    // (review 2026-08-03).
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t state;
+    bool confirmed = false;
+
     if (running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
         state == ESP_OTA_IMG_PENDING_VERIFY) {
         esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
         if (err == ESP_OK) {
+            confirmed = true;
             ESP_LOGI(TAG, "OTA image confirmed by %s health -> rollback cancelled", path);
             uart_nmea("$PESP,OTA,CONFIRMED,%s", FW_VERSION);
         } else {
@@ -1054,6 +1058,44 @@ void ota_mark_valid_task(void *pvParameter) {
     } else {
         ESP_LOGI(TAG, "firmware healthy (%s contract; not a pending-verify image, "
                  "nothing to confirm)", path);
+    }
+
+    // The per-version download-attempt counter may ONLY be cleared once THIS
+    // version is confirmed valid. Clearing it while running a healthy OLD
+    // image reset the 3-attempt protection every day, so a permanently broken
+    // release artifact was re-downloaded forever (review 2026-08-03).
+    if (confirmed) {
+        nvs_handle_t h;
+        if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_key(h, OTA_KEY_FAILVER);
+            nvs_erase_key(h, OTA_KEY_FAILCNT);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+// Boot-loop counter clear, deliberately its OWN task on its OWN clock.
+//
+// It answers exactly one question: "did this image survive long enough that a
+// crash loop is ruled out?" Tying it to data-plane health made it depend on
+// the caster (a long outage plus a few reboots dropped a healthy device to
+// factory), and clearing it on the healthy path let a regression that crashes
+// at second 41 reset the counter on every boot, so the factory fallback was
+// never reached. The window must therefore be longer than any plausible
+// deterministic crash point AND independent of every other timer here.
+void ota_bootloop_clear_task(void *pvParameter) {
+    (void)pvParameter;
+    vTaskDelay(pdMS_TO_TICKS(OTA_BOOTLOOP_CLEAR_MS));
+
+    nvs_handle_t h;
+    if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, OTA_KEY_BOOTLOOP, 0);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "survived %d min without a crash -> boot-loop counter cleared",
+                 OTA_BOOTLOOP_CLEAR_MS / 60000);
     }
     vTaskDelete(NULL);
 }
