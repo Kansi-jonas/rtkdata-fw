@@ -922,19 +922,32 @@ void ota_boot_loop_guard(void) {
         nvs_commit(h);
     }
 
+    // A freshly installed image is PENDING_VERIFY on its first boot, which
+    // means the reboot we just came from WAS an OTA install. The firmware that
+    // performed it is the OLD one and cannot be expected to set our marker:
+    // measured on the bench 2026-08-03, a clean 1.0.6 -> 1.1.4 update was
+    // counted as "3 consecutive CRASH boot(s)". A pending-verify image is also
+    // already covered by the bootloader's own rollback if it crashes, so the
+    // boot-loop counter is not the safety net here.
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    esp_ota_img_states_t rst;
+    bool just_installed = run && esp_ota_get_state_partition(run, &rst) == ESP_OK &&
+                          rst == ESP_OTA_IMG_PENDING_VERIFY;
+
     bool crash_like = (rr == ESP_RST_PANIC) || (rr == ESP_RST_INT_WDT) ||
                       (rr == ESP_RST_TASK_WDT) || (rr == ESP_RST_WDT) ||
                       (rr == ESP_RST_BROWNOUT) || (rr == ESP_RST_UNKNOWN) ||
-                      (rr == ESP_RST_SW && !planned);
+                      (rr == ESP_RST_SW && !planned && !just_installed);
 
     uint8_t boots = 0;
     nvs_get_u8(h, OTA_KEY_BOOTLOOP, &boots);
 
     if (!crash_like) {
         nvs_close(h);
-        ESP_LOGI(TAG, "boot-loop guard: reset reason %d%s is not a fault, "
-                 "not counted (streak stays %u)",
-                 (int)rr, planned ? " (planned)" : "", boots);
+        ESP_LOGI(TAG, "boot-loop guard: reset reason %d%s%s is not a fault, "
+                 "not counted (streak stays %u)", (int)rr,
+                 planned ? " (planned)" : "",
+                 just_installed ? " (fresh OTA image)" : "", boots);
         return;
     }
 
