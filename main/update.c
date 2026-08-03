@@ -17,6 +17,9 @@
 #include "tasks.h"
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
+#include "esp_timer.h"
+#include "supervisor.h"
+#include "interface/ntrip.h"
 #include "esp_partition.h"
 #include "nvs.h"
 #include "uart.h"
@@ -61,7 +64,7 @@ void send_update_completed() {
  *                       stop retrying it and boot the current FW (device usable).
  *   bootloop          : consecutive boots that never reached a healthy run.
  *                       MAX_BOOT_LOOPS in a row -> fall back to the FACTORY app.
- * Both are reset by ota_mark_valid_task after OTA_HEALTHY_MS of stable uptime.
+ * Both are reset by ota_mark_valid_task once the semantic health contract holds.
  * Paired with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE: a freshly-OTA'd image boots
  * PENDING_VERIFY and the bootloader auto-reverts it if it crashes before the
  * health task confirms it. */
@@ -71,7 +74,28 @@ void send_update_completed() {
 #define OTA_KEY_BOOTLOOP "bootloop"
 #define MAX_OTA_ATTEMPTS 3
 #define MAX_BOOT_LOOPS   5
-#define OTA_HEALTHY_MS   (60 * 1000)
+
+/* Semantic health confirmation (review 2026-08-01, finding A2): a pure
+ * elapsed-time confirm made rollback ineffective, because a live-but-broken
+ * data plane (device up, receiver being reset, nothing reaching the caster)
+ * still cancelled rollback after 60 s. The image is now confirmed only after
+ * the data plane PROVED itself:
+ *   - the parser produced CRC-valid RTCM frames (receiver alive and decoded),
+ *   - the caster accepted a meaningful amount of bytes and the supervisor's
+ *     caster watchdog is content,
+ *   - no GNSS recovery fired between consecutive checks,
+ * held for OTA_CONFIRM_STABLE_N consecutive checks. A device with NO enabled
+ * uploader can never meet the caster condition; it confirms via the explicit
+ * unprovisioned exception (long uptime + sane heap) so a bench/spare unit does
+ * not oscillate between images. If health is never reached, the image stays
+ * PENDING_VERIFY and the next reboot rolls back - which is the point. */
+#define OTA_CONFIRM_CHECK_MS      (10 * 1000)
+#define OTA_CONFIRM_STABLE_N      3
+#define OTA_CONFIRM_DEADLINE_MS   (30 * 60 * 1000)
+#define OTA_CONFIRM_MIN_FRAMES    60ULL          /* ~10 s of MSM at ~7 Hz */
+#define OTA_CONFIRM_MIN_TX_BYTES  10240ULL       /* caster accepted >= 10 KiB */
+#define OTA_CONFIRM_UNPROV_MS     (10 * 60 * 1000)
+#define OTA_CONFIRM_MIN_HEAP_B    20480
 
 // true iff 'cand' is a strictly newer dotted version than 'cur' ("1.0.2">"1.0.1").
 // Prevents downgrades (channel older than the running build) re-flashing in a
@@ -796,8 +820,8 @@ void ota_boot_check_blocking(void) {
 // after MAX_BOOT_LOOPS in a row it forces a boot into the FACTORY app (the
 // bench-flashed known-good image) by erasing the OTA-select data, so the device
 // can never stay stuck in a crash-loop regardless of cause. ota_mark_valid_task
-// resets the counter after OTA_HEALTHY_MS of stable uptime. Fail-safe: any NVS
-// error just returns (never blocks boot).
+// resets the counter once the semantic health contract holds. Fail-safe: any
+// NVS error just returns (never blocks boot).
 void ota_boot_loop_guard(void) {
     nvs_handle_t h;
     if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
@@ -836,15 +860,69 @@ void ota_boot_loop_guard(void) {
 }
 
 // Anti-brick health-confirm task. Spawn ONCE at the end of app_main (after the
-// data plane is up). After OTA_HEALTHY_MS of stable uptime it (1) resets the
-// crash-loop + download-failure counters and (2) if the running image is a
-// freshly-OTA'd one pending verification, confirms it valid so the bootloader
-// keeps it. If the firmware crashes before reaching here, it never confirms ->
-// the bootloader rolls back (OTA image) or the boot-loop guard falls back to
-// factory on the next boot.
+// data plane is up). Once the data plane meets the SEMANTIC health contract
+// (see the OTA_CONFIRM_* block) it (1) resets the crash-loop +
+// download-failure counters and (2) if the running image is a freshly-OTA'd
+// one pending verification, confirms it valid so the bootloader keeps it.
+// If health is never reached, nothing is confirmed: the bootloader rolls back
+// the OTA image on the next reboot, and the boot-loop guard keeps counting.
 void ota_mark_valid_task(void *pvParameter) {
     (void)pvParameter;
-    vTaskDelay(pdMS_TO_TICKS(OTA_HEALTHY_MS));
+
+    const int64_t t0 = esp_timer_get_time();
+    const char *path = "semantic";
+    bool healthy = false;
+    bool have_prev = false;
+    uint32_t prev_rec_gnss = 0;
+    int stable = 0;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(OTA_CONFIRM_CHECK_MS));
+        int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
+
+        ntrip_tx_totals_t t;
+        ntrip_server_tx_totals(&t);
+        supervisor_health_t h;
+        supervisor_health(&h);
+
+        bool gnss_ok    = t.frames_ok >= OTA_CONFIRM_MIN_FRAMES;
+        bool no_new_rec = have_prev && (h.recoveries_gnss == prev_rec_gnss);
+        prev_rec_gnss = h.recoveries_gnss;
+        have_prev = true;
+        bool caster_good = (t.instances > 0) &&
+                           (t.accepted_to_lwip >= OTA_CONFIRM_MIN_TX_BYTES) &&
+                           h.caster_ok;
+
+        stable = (gnss_ok && no_new_rec && caster_good) ? stable + 1 : 0;
+
+        if (stable >= OTA_CONFIRM_STABLE_N) {
+            healthy = true;
+            break;
+        }
+
+        // Explicit exception: no uploader configured (bench/spare unit). It can
+        // never satisfy the caster leg; after a long stable-uptime window with
+        // sane heap it confirms so it does not oscillate between images.
+        if (t.instances == 0 && elapsed_ms >= OTA_CONFIRM_UNPROV_MS &&
+            esp_get_free_heap_size() > OTA_CONFIRM_MIN_HEAP_B) {
+            healthy = true;
+            path = "unprovisioned";
+            break;
+        }
+
+        if (elapsed_ms >= OTA_CONFIRM_DEADLINE_MS) break;
+    }
+
+    if (!healthy) {
+        // Deliberately: no counter reset, no confirmation. A pending-verify
+        // image will be rolled back by the bootloader on the next reboot.
+        ESP_LOGE(TAG, "data plane never met the health contract within %d min; "
+                 "image stays unconfirmed (pending-verify would roll back)",
+                 OTA_CONFIRM_DEADLINE_MS / 60000);
+        uart_nmea("$PESP,OTA,UNCONFIRMED,%s", FW_VERSION);
+        vTaskDelete(NULL);
+        return;
+    }
 
     nvs_handle_t h;
     if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
@@ -861,14 +939,14 @@ void ota_mark_valid_task(void *pvParameter) {
         state == ESP_OTA_IMG_PENDING_VERIFY) {
         esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "OTA image confirmed healthy after %ds -> rollback cancelled", OTA_HEALTHY_MS / 1000);
+            ESP_LOGI(TAG, "OTA image confirmed by %s health -> rollback cancelled", path);
             uart_nmea("$PESP,OTA,CONFIRMED,%s", FW_VERSION);
         } else {
             ESP_LOGE(TAG, "esp_ota_mark_app_valid failed: %s", esp_err_to_name(err));
         }
     } else {
-        ESP_LOGI(TAG, "firmware healthy after %ds (not a pending-verify image; nothing to confirm)",
-                 OTA_HEALTHY_MS / 1000);
+        ESP_LOGI(TAG, "firmware healthy (%s contract; not a pending-verify image, "
+                 "nothing to confirm)", path);
     }
     vTaskDelete(NULL);
 }
