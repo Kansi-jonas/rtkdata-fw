@@ -42,9 +42,18 @@ echo "qemu-smoke: merging flash image from $BUILD_DIR"
 echo "qemu-smoke: booting (timeout ${TIMEOUT_S}s)"
 # QEMU exits via timeout, so a non-zero status here is expected and ignored;
 # the assertions below are the gate.
+#
+# Serial goes to a FILE, not stdio. With -nographic QEMU multiplexes the
+# monitor and the serial port onto stdio, and when the container has a TTY
+# (the esp-idf-ci-action runs `docker run -t`) nothing reaches a redirected
+# stdout: the CI run on 2026-08-03 captured zero bytes and the assertions
+# below then reported a phantom "early crash loop". -display none + -monitor
+# none + -serial file: is TTY-independent, and stdin is closed so QEMU can
+# never wait on a terminal.
 timeout "$TIMEOUT_S" qemu-system-xtensa \
-    -nographic -machine esp32 -m 4M \
-    -drive file="$FLASH_BIN",if=mtd,format=raw >"$LOG" 2>&1 || true
+    -machine esp32 -m 4M -display none -monitor none \
+    -serial file:"$LOG" \
+    -drive file="$FLASH_BIN",if=mtd,format=raw </dev/null >/dev/null 2>&1 || true
 
 fail() { echo "qemu-smoke: FAIL: $1" >&2; echo "--- judged boot prefix (last 40 lines) ---" >&2; tail -40 "$PREFIX" >&2; exit 1; }
 
@@ -54,6 +63,17 @@ trap 'rm -f "$FLASH_BIN" "$LOG" "$PREFIX"' EXIT
 # Match the phy_init LOG TAG ("phy_init: phy_version ..."), not the bare word:
 # the bootloader's partition-table dump also lists a partition called phy_init.
 sed '/phy_init: /q' "$LOG" >"$PREFIX"
+
+# 0. No output at all is an environment failure, NOT a firmware verdict. Saying
+#    "early crash loop" for an empty log sent us hunting a firmware bug that did
+#    not exist (2026-08-03); name the real problem instead.
+if [ ! -s "$LOG" ]; then
+    echo "qemu-smoke: FAIL: qemu produced NO serial output in ${TIMEOUT_S}s." >&2
+    echo "  This is an emulator/environment problem, not a firmware verdict." >&2
+    echo "  Check that qemu-system-xtensa exists and supports '-machine esp32'." >&2
+    qemu-system-xtensa --version 2>&1 | head -2 >&2 || echo "  qemu-system-xtensa not runnable" >&2
+    exit 1
+fi
 
 # 1. A panic, assert or abort before the radio wall is fatal.
 if grep -qE 'Guru Meditation|assert failed|abort\(\) was called|CORRUPT HEAP|stack protection fault' "$PREFIX"; then
