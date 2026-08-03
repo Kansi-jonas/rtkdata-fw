@@ -1,5 +1,5 @@
 {
-  "version": "1.1.5",
+  "version": "1.1.4",
   "channel": "bench-staging",
   "notes": "ISOLATED BENCH CHANNEL - never promoted, never polled by a field device. Only the USB-flashed bench loader (v1.0.6 with UPDATE_SERVER_URL pointed here) reads this. Its purpose is to exercise the OTA path end to end against the exact candidate bytes: download, PENDING_VERIFY, semantic health confirmation, and active rollback on a local fault. app-only on purpose: www.bin is byte-identical to the production channel (SHA-256 CAEECD4B8092DA2E9FDE8E6E268124AF204C5A6F9C1F5FC388FBD6D54C046A81), and app+www is not one transaction, so an unchanged web UI must not be put at risk. Candidate SHA-256 is in rtkdata-fw.bin.sha256; only that exact artifact may ever be promoted to stable.",
   "update_files_urls": [
