@@ -49,23 +49,33 @@ gnss_ack_verdict_t gnss_ack_scan(const char *buf, size_t n, const char *cmd) {
         }
         size_t end = (size_t)star;
 
-        int fail = find_at(buf, end, body, "PARSING FAIL");
-        if (fail >= 0) {
-            /* failure: $command,response: PARSING FAILD NO MATCHING FUNC <cmd>*
-             * The command sits AFTER the verdict, at the end of the record. */
-            int func = find_at(buf, end, (size_t)fail, "NO MATCHING FUNC ");
+        /* The documented failure form has no echo, so "response:" follows the
+         * prefix directly and there is no comma to anchor on. */
+        bool no_echo = (end - body) >= 9 && memcmp(buf + body, "response:", 9) == 0;
+        int  resp    = no_echo ? (int)body : find_at(buf, end, body, ",response:");
+
+        if (no_echo) {
+            int func = find_at(buf, end, body, "NO MATCHING FUNC");
             if (func >= 0) {
-                size_t cstart = (size_t)func + strlen("NO MATCHING FUNC ");
-                if (cstart <= end && span_equals(buf + cstart, end - cstart, cmd)) {
+                size_t cstart = (size_t)func + strlen("NO MATCHING FUNC");
+                while (cstart < end && buf[cstart] == ' ') cstart++;
+                if (span_equals(buf + cstart, end - cstart, cmd)) {
                     verdict = GNSS_ACK_REJECTED;
                 }
             }
-        } else {
-            /* success: $command,<cmd>,response: OK*
-             * The command sits BETWEEN the prefix and ",response:". */
-            int resp = find_at(buf, end, body, ",response:");
-            if (resp >= 0 && span_equals(buf + body, (size_t)resp - body, cmd)) {
-                if (find_at(buf, end, (size_t)resp, "OK") >= 0) {
+        } else if (resp >= 0) {
+            /* Measured on the device (UM980 R4.10Build11833, 2026-08-03): the
+             * command is echoed between "$command," and ",response:" in BOTH
+             * outcomes, and only the verdict text after it differs:
+             *   $command,rtcm1077,com1,1,response: OK*7a
+             *   $command,rtcm1230,com1,10,response: PARSING FAILD NO MATCHING FUNC  RTCM1230*11
+             * The repo's research note claims the failure form omits the echo
+             * and carries the command at the end instead; the hardware does
+             * not do that. Trusting the note cost one release cycle. */
+            if (span_equals(buf + body, (size_t)resp - body, cmd)) {
+                if (find_at(buf, end, (size_t)resp, "PARSING FAIL") >= 0) {
+                    verdict = GNSS_ACK_REJECTED;
+                } else if (find_at(buf, end, (size_t)resp, "OK") >= 0) {
                     verdict = GNSS_ACK_OK;
                 }
             }

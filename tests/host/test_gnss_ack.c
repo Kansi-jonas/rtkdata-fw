@@ -28,13 +28,18 @@ static int g_fails = 0;
     } \
 } while (0)
 
-/* Real captures (boot log 2026-08-03). */
+/* Real captures (bench, UM980 R4.10Build11833, 2026-08-03). */
 static const char OK_VERSIONA[] =
     "$command,VERSIONA,response: OK*45\r\n";
 static const char OK_RTCM1077[] =
     "$command,rtcm1077,com1,1,response: OK*7a\r\n";
-/* The documented failure grammar: verdict first, command last. */
+/* VERBATIM from the device, including the double space and the uppercased
+ * trailing token. Note the command IS echoed before ",response:" here, which
+ * contradicts docs/UM980-config-research.md. The hardware wins. */
 static const char FAIL_RTCM1230[] =
+    "$command,rtcm1230,com1,10,response: PARSING FAILD NO MATCHING FUNC  RTCM1230*11\r\n";
+/* The documented-but-unobserved form, supported as a fallback. */
+static const char FAIL_DOCFORM[] =
     "$command,response: PARSING FAILD NO MATCHING FUNC rtcm1230,com1,10*3b\r\n";
 
 static void test_success_grammar(void) {
@@ -46,10 +51,19 @@ static void test_success_grammar(void) {
 }
 
 static void test_failure_grammar(void) {
-    /* The regression that shipped: this MUST be a reject, not a timeout. */
+    /* The regression that shipped twice: this MUST be a reject, not a timeout. */
     CHECK_V(FAIL_RTCM1230, strlen(FAIL_RTCM1230), "rtcm1230,com1,10", GNSS_ACK_REJECTED);
     /* and it is not a verdict about some other command */
     CHECK_V(FAIL_RTCM1230, strlen(FAIL_RTCM1230), "rtcm1077,com1,1", GNSS_ACK_NONE);
+
+    /* the documented form still parses, for other firmware builds */
+    CHECK_V(FAIL_DOCFORM, strlen(FAIL_DOCFORM), "rtcm1230,com1,10", GNSS_ACK_REJECTED);
+    CHECK_V(FAIL_DOCFORM, strlen(FAIL_DOCFORM), "rtcm1077,com1,1", GNSS_ACK_NONE);
+
+    /* a reject must never read as OK just because "OK" appears elsewhere */
+    const char fail_with_ok_word[] =
+        "$command,MASK 10.0,response: PARSING FAILD NO MATCHING FUNC  MASKOK*01\r\n";
+    CHECK_V(fail_with_ok_word, strlen(fail_with_ok_word), "MASK 10.0", GNSS_ACK_REJECTED);
 }
 
 static void test_cross_command_confusion(void) {

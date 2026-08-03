@@ -165,7 +165,30 @@ static bool send_cmd_acked(const char *cmd, int retries) {
             ESP_LOGW(TAG, "rejected: %.*s", show, cmd);
             return false;                          // won't pass on retry
         }
-        ESP_LOGW(TAG, "no ack (attempt %d/%d): %.*s", attempt + 1, retries + 1, show, cmd);
+        // "No ack" without the actual reply is unactionable: it hides whether
+        // the receiver said nothing, said something we fail to parse, or said
+        // it in a grammar we do not know. Dump the printable capture once per
+        // command so the response format is evidence, not an assumption
+        // (that assumption was wrong twice; review 2026-08-03).
+        if (attempt == retries) {
+            static char raw[CAP_SZ];
+            size_t rn = cap_snapshot(raw);
+            char esc[192];
+            size_t e = 0;
+            for (size_t i = 0; i < rn && e < sizeof(esc) - 5; i++) {
+                unsigned char c = (unsigned char)raw[i];
+                if (c >= 0x20 && c < 0x7F) {
+                    esc[e++] = (char)c;
+                } else {
+                    e += (size_t)snprintf(esc + e, sizeof(esc) - e, "<%02X>", c);
+                }
+            }
+            esc[e] = '\0';
+            ESP_LOGW(TAG, "no ack for '%.*s'; capture (%u B): %s",
+                     show, cmd, (unsigned)rn, rn ? esc : "(empty)");
+        } else {
+            ESP_LOGW(TAG, "no ack (attempt %d/%d): %.*s", attempt + 1, retries + 1, show, cmd);
+        }
     }
     return false;
 }
