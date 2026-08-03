@@ -74,8 +74,10 @@ void uart_unregister_write_handler(esp_event_handler_t event_handler) {
 static int uart_port = -1;
 static bool uart_log_forward = false;
 static volatile uint32_t s_event_post_drops = 0;
+static volatile uint32_t s_read_errors = 0;
 
 uint32_t uart_event_post_drops(void) { return s_event_post_drops; }
+uint32_t uart_read_errors(void) { return s_read_errors; }
 
 static stream_stats_handle_t stream_stats;
 
@@ -173,7 +175,11 @@ static void uart_task(void *ctx) {
             // negative delta, ntrip_server_ingest_uart received (size_t)-1 as
             // the chunk length, and buffer[len] below wrote buffer[-1]
             // (stack corruption; v1.1.2 audit 2026-08-01).
-            ESP_LOGE(TAG, "Error reading from UART");
+            s_read_errors++;
+            if (s_read_errors == 1 || (s_read_errors % 100) == 0) {
+                ESP_LOGE(TAG, "uart_read_bytes error (%lu total)",
+                         (unsigned long)s_read_errors);
+            }
             continue;
         } else if (len == 0) {
             continue;

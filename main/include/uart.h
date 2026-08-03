@@ -14,6 +14,10 @@ void uart_init();
 // path is fed directly and is NOT affected; this counts the secondary path).
 uint32_t uart_event_post_drops(void);
 
+// uart_read_bytes() driver errors (negative returns), counted instead of
+// corrupting memory.
+uint32_t uart_read_errors(void);
+
 int uart_log(char *buffer, size_t len);
 int uart_nmea(const char *fmt, ...);
 int uart_write(char *buffer, size_t len);

@@ -1042,6 +1042,7 @@ static esp_err_t ntrip_tx_stats_get_handler(httpd_req_t *req) {
     cJSON_AddNumberToObject(ingest, "ring_pushed_frames", (double)ing.ring_pushed_frames);
     cJSON_AddNumberToObject(ingest, "ring_cum_bytes", (double)ing.ring_cum_bytes);
     cJSON_AddNumberToObject(ingest, "uart_event_post_drops", uart_event_post_drops());
+    cJSON_AddNumberToObject(ingest, "uart_read_errors", uart_read_errors());
 
     cJSON *arr = cJSON_AddArrayToObject(root, "instances");
     for (size_t i = 0; i < n; i++) {
