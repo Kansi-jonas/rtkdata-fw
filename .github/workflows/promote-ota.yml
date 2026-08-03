@@ -42,7 +42,13 @@ jobs:
           set -euo pipefail
           # Was a warning, so a mismatched binary could still reach the fleet
           # and re-flash in a loop (update.c compares with an exact strcmp).
-          if ! strings dl/rtkdata-fw.bin | grep -qx "$VER"; then
+          #
+          # NOT "strings ... | grep -q": under `set -o pipefail` the early exit
+          # of grep sends SIGPIPE to strings, the pipeline returns 141 and a
+          # perfectly good release FAILS to promote (measured 2026-08-03).
+          # Materialise first, then match.
+          strings dl/rtkdata-fw.bin > /tmp/fwstrings.txt
+          if ! grep -qxF "$VER" /tmp/fwstrings.txt; then
             echo "::error::FW_VERSION string '$VER' not found in the release binary"
             exit 1
           fi

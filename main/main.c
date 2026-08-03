@@ -88,6 +88,7 @@ static void reset_button_task() {
 
                     config_reset();
 
+                    ota_note_planned_reboot();   // user action, not a crash
                     esp_restart();
 
                     duration_counter = 0;

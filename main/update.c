@@ -72,6 +72,7 @@ void send_update_completed() {
 #define OTA_KEY_FAILVER  "fail_ver"
 #define OTA_KEY_FAILCNT  "fail_cnt"
 #define OTA_KEY_BOOTLOOP "bootloop"
+#define OTA_KEY_PLANNED  "planned_rb"   /* the next SW reset was intentional */
 #define MAX_OTA_ATTEMPTS 3
 #define MAX_BOOT_LOOPS   5
 
@@ -704,6 +705,7 @@ esp_err_t updateFirmware(cJSON *files_json) {
     if (ok) {
         ESP_LOGI(TAG, "OTA update completed -> restarting into the new image");
         uart_nmea("$PESP,OTA,INSTALLED,restarting");
+        ota_note_planned_reboot();
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();          // no return on success
     }
@@ -890,27 +892,49 @@ void ota_boot_check_blocking(void) {
 // can never stay stuck in a crash-loop regardless of cause. ota_mark_valid_task
 // resets the counter once the semantic health contract holds. Fail-safe: any
 // NVS error just returns (never blocks boot).
+void ota_note_planned_reboot(void) {
+    nvs_handle_t h;
+    if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, OTA_KEY_PLANNED, 1);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 void ota_boot_loop_guard(void) {
-    // Only CRASH-like resets count. A power cut, a user power-cycle or our own
-    // controlled reboot (OTA install, supervisor recovery) is not evidence
-    // that the image is broken, and counting them meant five ordinary reboots
-    // inside the clear window could drop a healthy device to the factory app.
-    // The bench log showed a plain POWERON counted as "boot 3"
-    // (review 2026-08-03).
+    // What counts as evidence that THIS image is broken:
+    //   - crash resets (panic, watchdogs, brownout, unknown), and
+    //   - software resets we did NOT plan.
+    // The second half matters because the supervisor recovers via
+    // esp_restart(), which produces ESP_RST_SW: excluding all SW resets
+    // (as the previous version did) meant a reproducible supervisor reboot
+    // loop never reached the factory fallback. Planned restarts (OTA install,
+    // user action) leave an explicit NVS marker instead of being guessed from
+    // the hardware reason (review 2026-08-03).
     esp_reset_reason_t rr = esp_reset_reason();
-    bool crash_like = (rr == ESP_RST_PANIC) || (rr == ESP_RST_INT_WDT) ||
-                      (rr == ESP_RST_TASK_WDT) || (rr == ESP_RST_WDT) ||
-                      (rr == ESP_RST_BROWNOUT) || (rr == ESP_RST_UNKNOWN);
 
     nvs_handle_t h;
     if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+
+    uint8_t planned = 0;
+    nvs_get_u8(h, OTA_KEY_PLANNED, &planned);
+    if (planned) {                       // one-shot: consume it
+        nvs_set_u8(h, OTA_KEY_PLANNED, 0);
+        nvs_commit(h);
+    }
+
+    bool crash_like = (rr == ESP_RST_PANIC) || (rr == ESP_RST_INT_WDT) ||
+                      (rr == ESP_RST_TASK_WDT) || (rr == ESP_RST_WDT) ||
+                      (rr == ESP_RST_BROWNOUT) || (rr == ESP_RST_UNKNOWN) ||
+                      (rr == ESP_RST_SW && !planned);
+
     uint8_t boots = 0;
     nvs_get_u8(h, OTA_KEY_BOOTLOOP, &boots);
 
     if (!crash_like) {
         nvs_close(h);
-        ESP_LOGI(TAG, "boot-loop guard: reset reason %d is not crash-like, "
-                 "not counted (streak stays %u)", (int)rr, boots);
+        ESP_LOGI(TAG, "boot-loop guard: reset reason %d%s is not a fault, "
+                 "not counted (streak stays %u)",
+                 (int)rr, planned ? " (planned)" : "", boots);
         return;
     }
 
@@ -954,6 +978,7 @@ void ota_boot_loop_guard(void) {
         nvs_commit(h);
         nvs_close(h);
     }
+    ota_note_planned_reboot();
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();   // bootloader now selects the factory app
 }
@@ -1233,6 +1258,7 @@ void ota_schedule_check_newupdate(void *pvParameter){
                     }
                     cJSON_Delete(jsonFile);
                     if (newer) {
+                        ota_note_planned_reboot();
                         vTaskDelay(pdMS_TO_TICKS(300));
                         esp_restart();   // boot OTA check downloads + applies with full heap
                     }

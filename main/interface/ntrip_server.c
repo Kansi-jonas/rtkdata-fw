@@ -822,6 +822,7 @@ static const uint32_t s_required_budget_ms[NTRIP_REQUIRED_MSG_COUNT] = { 30000, 
 static uint32_t s_msg_last_ms[NTRIP_REQUIRED_MSG_COUNT];
 static uint32_t s_msg_epoch[NTRIP_REQUIRED_MSG_COUNT];   // 0 = never seen
 static volatile uint32_t s_epoch = 1;                    // current receiver epoch
+static volatile uint32_t s_epoch_started_ms = 0;         // when it began
 
 // A receiver reset starts a NEW epoch: whatever it emitted before proves
 // nothing about what it emits now. Without this, 30 s-budget types (1005,
@@ -833,9 +834,18 @@ static volatile uint32_t s_epoch = 1;                    // current receiver epo
 static volatile bool s_ingest_reset_req = false;
 
 void ntrip_server_msg_epoch_reset(void) {
-    // Two stores, no lock. Everything stamped with an older epoch is dead by
-    // definition, so a concurrent UART write cannot resurrect stale evidence.
-    // The parser flush is deferred to its owning task.
+    // The epoch TAG alone is not enough: the writer reads s_epoch when it
+    // stamps a sample, so a pre-reset frame that happens to be processed just
+    // after the bump would be stamped with the NEW epoch and look fresh
+    // (review 2026-08-03, and my "race-free" claim before it was wrong).
+    //
+    // The monotonic clock settles it without a lock: record WHEN the epoch
+    // started, and require a sample to be newer than that. A pre-reset frame
+    // carries a pre-reset timestamp no matter which tag it ends up with, so it
+    // can never revive the new epoch. Order matters: publish the start time
+    // BEFORE the epoch, so a reader that sees the new epoch always sees a
+    // start time that is at least as new.
+    s_epoch_started_ms = ntrip_now_ms();
     s_epoch++;
     if (s_epoch == 0) s_epoch = 1;      // 0 means "never seen"
     s_ingest_reset_req = true;
@@ -847,19 +857,23 @@ void ntrip_server_msg_freshness(ntrip_msg_freshness_t *out) {
 
     uint32_t now = ntrip_now_ms();
     uint32_t epoch = s_epoch;           // snapshot once for a coherent verdict
+    uint32_t since = s_epoch_started_ms;
     out->all_fresh = true;
 
     for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
         out->type[i] = ntrip_required_msgs[i];
         // Read the timestamp BEFORE its epoch tag: if a concurrent write lands
         // in between, the tag we compare is the newer one and the sample is
-        // rejected. The failure mode is a spurious "not fresh", never a
-        // spurious "fresh", which is the safe direction for a gate that
-        // decides between confirming and rolling back an image.
+        // rejected.
         uint32_t last = s_msg_last_ms[i];
         uint32_t tag  = s_msg_epoch[i];
 
-        if (tag != epoch) {
+        // Both conditions: the sample must belong to the current epoch AND be
+        // newer than that epoch's start. The tag alone is forgeable by a
+        // pre-reset frame processed after the bump; the timestamp is not.
+        bool in_epoch = (tag == epoch) && ((int32_t)(last - since) > 0);
+
+        if (!in_epoch) {
             out->age_ms[i] = UINT32_MAX;
             out->fresh[i]  = false;
         } else {
@@ -869,6 +883,12 @@ void ntrip_server_msg_freshness(ntrip_msg_freshness_t *out) {
         }
         if (!out->fresh[i]) out->all_fresh = false;
     }
+
+    // If a reset landed while we were reading, the snapshot is not coherent.
+    // Report "not fresh" rather than a mixed verdict: for a gate that chooses
+    // between confirming and rolling back an image, the safe error is always
+    // "cannot prove health".
+    if (s_epoch != epoch) out->all_fresh = false;
 }
 
 static void ntrip_server_on_frame(void *ctx, const uint8_t *frame, uint16_t len,

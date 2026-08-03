@@ -11,7 +11,13 @@ void ota_boot_check(void);
 void ota_boot_check_blocking(void);   // boot OTA check on a 16K-stack task (anti stack-smash)
 void ota_boot_loop_guard(void);       // call early in app_main: crash-loop -> factory fallback
 void ota_mark_valid_task(void *pvParameter);
-void ota_bootloop_clear_task(void *pvParameter);  // health-confirm task (cancels rollback)
+void ota_bootloop_clear_task(void *pvParameter);
+
+// Call immediately before an INTENTIONAL esp_restart() (OTA install, user
+// action). The next boot then knows the software reset was planned and does
+// not count it as a crash. A FAULT-driven restart (supervisor recovery) must
+// NOT call this: those are exactly the loops the guard has to catch.
+void ota_note_planned_reboot(void);  // health-confirm task (cancels rollback)
 void ota_check_newupdate(void *pvParameter);
 void ota_schedule_check_newupdate(void *pvParameter);
 

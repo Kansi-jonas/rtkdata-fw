@@ -28,19 +28,26 @@ static int g_fails = 0;
     } \
 } while (0)
 
-/* Real captures (bench, UM980 R4.10Build11833, 2026-08-03). */
+/* CAPTURED VERBATIM from the bench (UM980 R4.10Build11833, 2026-08-03), copied
+ * out of the firmware's own capture dump. Note the command IS echoed before
+ * ",response:" in the failure case too, which contradicts
+ * docs/UM980-config-research.md; the hardware wins. */
 static const char OK_VERSIONA[] =
     "$command,VERSIONA,response: OK*45\r\n";
-static const char OK_RTCM1077[] =
-    "$command,rtcm1077,com1,1,response: OK*7a\r\n";
-/* VERBATIM from the device, including the double space and the uppercased
- * trailing token. Note the command IS echoed before ",response:" here, which
- * contradicts docs/UM980-config-research.md. The hardware wins. */
 static const char FAIL_RTCM1230[] =
     "$command,rtcm1230,com1,10,response: PARSING FAILD NO MATCHING FUNC  RTCM1230*11\r\n";
-/* The documented-but-unobserved form, supported as a fallback. */
+
+/* CONSTRUCTED fixtures. Their checksums are COMPUTED with the algorithm the
+ * two captures above establish (XOR over the record including the leading
+ * '$'), not invented: an earlier version of this file carried a hand-typed
+ * "*7a" that no device would ever emit, and labelled it a real capture. If a
+ * checksum here is ever wrong the parser rejects the record and the test
+ * fails, which is exactly the intended safety net. */
+static const char OK_RTCM1077[] =
+    "$command,rtcm1077,com1,1,response: OK*36\r\n";
+/* The documented-but-unobserved echo-less form, supported as a fallback. */
 static const char FAIL_DOCFORM[] =
-    "$command,response: PARSING FAILD NO MATCHING FUNC rtcm1230,com1,10*3b\r\n";
+    "$command,response: PARSING FAILD NO MATCHING FUNC rtcm1230,com1,10*15\r\n";
 
 static void test_success_grammar(void) {
     CHECK_V(OK_VERSIONA, strlen(OK_VERSIONA), "VERSIONA", GNSS_ACK_OK);
@@ -62,7 +69,7 @@ static void test_failure_grammar(void) {
 
     /* a reject must never read as OK just because "OK" appears elsewhere */
     const char fail_with_ok_word[] =
-        "$command,MASK 10.0,response: PARSING FAILD NO MATCHING FUNC  MASKOK*01\r\n";
+        "$command,MASK 10.0,response: PARSING FAILD NO MATCHING FUNC  MASKOK*7b\r\n";
     CHECK_V(fail_with_ok_word, strlen(fail_with_ok_word), "MASK 10.0", GNSS_ACK_REJECTED);
 }
 
@@ -132,12 +139,12 @@ static void test_partial_records(void) {
 static void test_prefix_commands_not_confused(void) {
     /* "rtcm1077,com1,1" must not be satisfied by a record for
      * "rtcm1077,com1,10" (exact span comparison, not a prefix match). */
-    const char ok10[] = "$command,rtcm1077,com1,10,response: OK*11\r\n";
+    const char ok10[] = "$command,rtcm1077,com1,10,response: OK*06\r\n";
     CHECK_V(ok10, strlen(ok10), "rtcm1077,com1,1", GNSS_ACK_NONE);
     CHECK_V(ok10, strlen(ok10), "rtcm1077,com1,10", GNSS_ACK_OK);
 
     const char fail10[] =
-        "$command,response: PARSING FAILD NO MATCHING FUNC rtcm1077,com1,10*22\r\n";
+        "$command,response: PARSING FAILD NO MATCHING FUNC rtcm1077,com1,10*14\r\n";
     CHECK_V(fail10, strlen(fail10), "rtcm1077,com1,1", GNSS_ACK_NONE);
     CHECK_V(fail10, strlen(fail10), "rtcm1077,com1,10", GNSS_ACK_REJECTED);
 }
@@ -146,8 +153,8 @@ static void test_last_verdict_wins(void) {
     /* A retry that first failed and then succeeded must read as OK. */
     char buf[512];
     int n = snprintf(buf, sizeof(buf),
-        "$command,response: PARSING FAILD NO MATCHING FUNC MASK 10.0*01\r\n"
-        "$command,MASK 10.0,response: OK*02\r\n");
+        "$command,response: PARSING FAILD NO MATCHING FUNC MASK 10.0*67\r\n"
+        "$command,MASK 10.0,response: OK*75\r\n");
     CHECK_V(buf, (size_t)n, "MASK 10.0", GNSS_ACK_OK);
 }
 
@@ -156,34 +163,53 @@ static void test_no_false_ok(void) {
     const char not_ok[] = "$command,MASK 10.0,response: NOT OK*00\r\n";
     CHECK_V(not_ok, strlen(not_ok), "MASK 10.0", GNSS_ACK_NONE);
 
-    const char nok[] = "$command,MASK 10.0,response: NOK*00\r\n";
+    const char nok[] = "$command,MASK 10.0,response: NOK*3b\r\n";
     CHECK_V(nok, strlen(nok), "MASK 10.0", GNSS_ACK_NONE);
 
-    const char okish[] = "$command,MASK 10.0,response: OKAY*00\r\n";
+    const char okish[] = "$command,MASK 10.0,response: OKAY*6d\r\n";
     CHECK_V(okish, strlen(okish), "MASK 10.0", GNSS_ACK_NONE);
 
     /* an unknown verdict must not be guessed into an approval */
-    const char weird[] = "$command,MASK 10.0,response: BUSY*00\r\n";
+    const char weird[] = "$command,MASK 10.0,response: BUSY*6c\r\n";
     CHECK_V(weird, strlen(weird), "MASK 10.0", GNSS_ACK_NONE);
 
     /* a record is incomplete until BOTH checksum digits arrived */
     const char star_only[] = "$command,MASK 10.0,response: OK*";
     CHECK_V(star_only, strlen(star_only), "MASK 10.0", GNSS_ACK_NONE);
 
-    const char one_nibble[] = "$command,MASK 10.0,response: OK*0";
+    const char one_nibble[] = "$command,MASK 10.0,response: OK*7";
     CHECK_V(one_nibble, strlen(one_nibble), "MASK 10.0", GNSS_ACK_NONE);
 
-    const char two_nibbles[] = "$command,MASK 10.0,response: OK*0a";
-    CHECK_V(two_nibbles, strlen(two_nibbles), "MASK 10.0", GNSS_ACK_OK);
+    const char correct_sum[] = "$command,MASK 10.0,response: OK*75";
+    CHECK_V(correct_sum, strlen(correct_sum), "MASK 10.0", GNSS_ACK_OK);
 
     /* a non-hex pair is not a checksum */
     const char bad_hex[] = "$command,MASK 10.0,response: OK*zz\r\n";
     CHECK_V(bad_hex, strlen(bad_hex), "MASK 10.0", GNSS_ACK_NONE);
 
+    /* a WRONG checksum is a corrupt record, not a verdict. This is the case
+     * the previous "structure only" version could not catch: a line damaged in
+     * transit could approve a command that was never applied. */
+    const char wrong_sum[] = "$command,MASK 10.0,response: OK*0a\r\n";
+    CHECK_V(wrong_sum, strlen(wrong_sum), "MASK 10.0", GNSS_ACK_NONE);
+
+    const char wrong_sum_fail[] =
+        "$command,rtcm1230,com1,10,response: PARSING FAILD NO MATCHING FUNC  RTCM1230*12\r\n";
+    CHECK_V(wrong_sum_fail, strlen(wrong_sum_fail), "rtcm1230,com1,10", GNSS_ACK_NONE);
+
     /* a "*" inside the verdict text must not terminate the record early */
     const char star_in_text[] =
-        "$command,MASK 10.0,response: PARSING FAILD NO MATCHING FUNC  M*SK*7f\r\n";
+        "$command,MASK 10.0,response: PARSING FAILD NO MATCHING FUNC  M*SK*14\r\n";
     CHECK_V(star_in_text, strlen(star_in_text), "MASK 10.0", GNSS_ACK_REJECTED);
+}
+
+/* The checksum algorithm itself, pinned against the two real captures so a
+ * future "simplification" cannot silently drop the '$'. */
+static void test_checksum_convention(void) {
+    /* dropping the '$' from the XOR gives 61 for this record, not 45 */
+    const char wrong_convention[] = "$command,VERSIONA,response: OK*61\r\n";
+    CHECK_V(wrong_convention, strlen(wrong_convention), "VERSIONA", GNSS_ACK_NONE);
+    CHECK_V(OK_VERSIONA, strlen(OK_VERSIONA), "VERSIONA", GNSS_ACK_OK);
 }
 
 static void test_degenerate_inputs(void) {
@@ -203,6 +229,7 @@ int main(void) {
     test_prefix_commands_not_confused();
     test_last_verdict_wins();
     test_no_false_ok();
+    test_checksum_convention();
     test_degenerate_inputs();
     printf("%d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

@@ -25,6 +25,7 @@
 #include <uart.h>
 #include <tasks.h>
 #include "config.h"
+#include "update.h"
 #include "esp_netif_ip_addr.h" // makeItCompileable
 
 static const char *TAG = "CONFIG";
@@ -902,6 +903,10 @@ static void config_restart_task(void *pvParameter) {
     vTaskDelay(pdMS_TO_TICKS(1000));
 
     uart_nmea("$PESP,CFG,RESTARTING");
+
+    // A config-triggered restart is planned, not a crash: mark it so the
+    // boot-loop guard does not count it (review 2026-08-03).
+    ota_note_planned_reboot();
 
     vTaskDelay(pdMS_TO_TICKS(1000));
 

@@ -28,17 +28,33 @@ static bool is_hex(char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-/* A record is only complete once its "*" is followed by both checksum digits.
- * Measured forms: *45, *11, *7a - always exactly two hex digits.
+static unsigned hex_val(char c) {
+    if (c >= '0' && c <= '9') return (unsigned)(c - '0');
+    if (c >= 'a' && c <= 'f') return (unsigned)(c - 'a' + 10);
+    return (unsigned)(c - 'A' + 10);
+}
+
+/* A record is complete only with "*" plus both checksum digits, and the
+ * checksum must be CORRECT.
  *
- * The checksum VALUE is deliberately not verified: it is not the NMEA XOR our
- * own $PESP sentences use (checked against three real captures on 2026-08-03,
- * XOR reproduces $PESP but not $command), and the actual algorithm is not
- * documented anywhere we trust. Validating it on a guess would repeat exactly
- * the mistake this file exists to correct. Structure is checked, value is not,
- * and that limit is stated rather than hidden. */
-static bool record_complete_at(const char *buf, size_t n, size_t star) {
-    return (star + 2 < n) && is_hex(buf[star + 1]) && is_hex(buf[star + 2]);
+ * The algorithm is XOR over the record INCLUDING the leading '$', which is
+ * where an earlier analysis went wrong: our own $PESP sentences use the
+ * standard NMEA convention that EXCLUDES '$', so a single test with the wrong
+ * convention "disproved" XOR and the check was dropped as unknowable.
+ * Recomputed on the real captures:
+ *   $command,VERSIONA,response: OK                       -> incl. $ = 45  (capture *45)
+ *   $command,rtcm1230,...NO MATCHING FUNC  RTCM1230      -> incl. $ = 11  (capture *11)
+ *   $PESP,RTK,GNSS,CONFIG,13,14                          -> excl. $ = 73  (our own *73)
+ * Both device captures match with the '$' included. */
+static bool record_valid_at(const char *buf, size_t n, size_t rec, size_t star) {
+    if (star + 2 >= n) return false;
+    if (!is_hex(buf[star + 1]) || !is_hex(buf[star + 2])) return false;
+
+    unsigned want = (hex_val(buf[star + 1]) << 4) | hex_val(buf[star + 2]);
+    unsigned got = 0;
+    for (size_t i = rec; i < star; i++) got ^= (unsigned char)buf[i];
+
+    return got == want;
 }
 
 gnss_ack_verdict_t gnss_ack_scan(const char *buf, size_t n, const char *cmd) {
@@ -63,7 +79,7 @@ gnss_ack_verdict_t gnss_ack_scan(const char *buf, size_t n, const char *cmd) {
         for (int s = find_at(buf, n, body, "*"); s >= 0;
              s = find_at(buf, n, (size_t)s + 1, "*")) {
             if (next >= 0 && s > next) break;          /* belongs to a later record */
-            if (record_complete_at(buf, n, (size_t)s)) { star = s; break; }
+            if (record_valid_at(buf, n, (size_t)rec, (size_t)s)) { star = s; break; }
         }
         if (star < 0 || (next >= 0 && next < star)) {
             pos = body;
