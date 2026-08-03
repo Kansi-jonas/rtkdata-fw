@@ -247,8 +247,10 @@ esp_err_t ota_update_firmware(const char *url) {
 
                                 ESP_LOGE(TAG, "OTA write failed: %s", esp_err_to_name(err));
 
-                                esp_ota_end(ota_handle);
-
+                                // No cleanup here: exactly ONE owner below.
+                                // Ending the handle here and again in the
+                                // downloadBreak branch used a freed handle
+                                // (review 2026-08-03).
                                 downloadBreak = true;
 
                                 break;
@@ -267,22 +269,28 @@ esp_err_t ota_update_firmware(const char *url) {
                         
                         }
 
-                        if (data_read < 0) {
+                        // Exactly one cleanup owner, and the right call for the
+                        // outcome: esp_ota_abort() on failure, esp_ota_end()
+                        // only on success (ESP-IDF v5.3 OTA API).
+                        if (data_read < 0 || downloadBreak) {
 
-                            // The result was discarded here, so the earlier
-                            // ESP_OK from esp_http_client_open survived and the
-                            // caller treated an aborted download as a success:
-                            // it then updated www and rebooted, leaving the OLD
-                            // app with a NEW web partition (review 2026-08-03).
-                            ESP_LOGE(TAG, "OTA data read error");
+                            // The result used to be discarded here, so the
+                            // earlier ESP_OK from esp_http_client_open survived
+                            // and the caller treated an aborted download as a
+                            // success: it then updated www and rebooted,
+                            // leaving the OLD app with a NEW web partition
+                            // (review 2026-08-03).
+                            ESP_LOGE(TAG, "OTA download failed (read=%d, write_abort=%d)",
+                                     data_read, (int)downloadBreak);
 
-                            esp_ota_end(ota_handle);
+                            esp_ota_abort(ota_handle);
                             err = ESP_FAIL;
 
-                        }else if (downloadBreak) {
+                        }else if (total_file_write != content_length) {
 
-                            ESP_LOGE(TAG, "OTA download aborted");
-                            esp_ota_end(ota_handle);
+                            ESP_LOGE(TAG, "OTA short download: %d of %d bytes",
+                                     total_file_write, content_length);
+                            esp_ota_abort(ota_handle);
                             err = ESP_FAIL;
 
                         }else{
@@ -883,16 +891,36 @@ void ota_boot_check_blocking(void) {
 // resets the counter once the semantic health contract holds. Fail-safe: any
 // NVS error just returns (never blocks boot).
 void ota_boot_loop_guard(void) {
+    // Only CRASH-like resets count. A power cut, a user power-cycle or our own
+    // controlled reboot (OTA install, supervisor recovery) is not evidence
+    // that the image is broken, and counting them meant five ordinary reboots
+    // inside the clear window could drop a healthy device to the factory app.
+    // The bench log showed a plain POWERON counted as "boot 3"
+    // (review 2026-08-03).
+    esp_reset_reason_t rr = esp_reset_reason();
+    bool crash_like = (rr == ESP_RST_PANIC) || (rr == ESP_RST_INT_WDT) ||
+                      (rr == ESP_RST_TASK_WDT) || (rr == ESP_RST_WDT) ||
+                      (rr == ESP_RST_BROWNOUT) || (rr == ESP_RST_UNKNOWN);
+
     nvs_handle_t h;
     if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
     uint8_t boots = 0;
     nvs_get_u8(h, OTA_KEY_BOOTLOOP, &boots);
+
+    if (!crash_like) {
+        nvs_close(h);
+        ESP_LOGI(TAG, "boot-loop guard: reset reason %d is not crash-like, "
+                 "not counted (streak stays %u)", (int)rr, boots);
+        return;
+    }
+
     boots++;
     nvs_set_u8(h, OTA_KEY_BOOTLOOP, boots);
     nvs_commit(h);
     nvs_close(h);
 
-    ESP_LOGI(TAG, "boot-loop guard: %u consecutive boot(s) without a healthy run", boots);
+    ESP_LOGW(TAG, "boot-loop guard: %u consecutive CRASH boot(s) (reason %d)",
+             boots, (int)rr);
     if (boots < MAX_BOOT_LOOPS) return;
 
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -909,12 +937,23 @@ void ota_boot_loop_guard(void) {
 
     ESP_LOGE(TAG, "crash-loop (%u boots) -> erasing otadata, rebooting into FACTORY app", boots);
     uart_nmea("$PESP,OTA,FACTORYFALLBACK,%u", boots);
+
+    // Erase FIRST, and only clear the counter once the erase actually
+    // succeeded: clearing first meant a failed erase rebooted the same broken
+    // app with a fresh counter, so the fallback could never happen
+    // (review 2026-08-03).
+    esp_err_t er = esp_partition_erase_range(otadata, 0, otadata->size);
+    if (er != ESP_OK) {
+        ESP_LOGE(TAG, "otadata erase failed (%s); keeping the counter so the next "
+                 "boot retries the fallback", esp_err_to_name(er));
+        return;
+    }
+
     if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {   // clean slate for factory
         nvs_set_u8(h, OTA_KEY_BOOTLOOP, 0);
         nvs_commit(h);
         nvs_close(h);
     }
-    esp_partition_erase_range(otadata, 0, otadata->size);
     vTaskDelay(pdMS_TO_TICKS(100));
     esp_restart();   // bootloader now selects the factory app
 }
@@ -1090,12 +1129,19 @@ void ota_bootloop_clear_task(void *pvParameter) {
     vTaskDelay(pdMS_TO_TICKS(OTA_BOOTLOOP_CLEAR_MS));
 
     nvs_handle_t h;
-    if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, OTA_KEY_BOOTLOOP, 0);
-        nvs_commit(h);
+    esp_err_t err = nvs_open(OTA_NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, OTA_KEY_BOOTLOOP, 0);
+        if (err == ESP_OK) err = nvs_commit(h);
         nvs_close(h);
+    }
+    // Reporting success on an ignored NVS error meant the counter silently
+    // kept climbing (review 2026-08-03).
+    if (err == ESP_OK) {
         ESP_LOGI(TAG, "survived %d min without a crash -> boot-loop counter cleared",
                  OTA_BOOTLOOP_CLEAR_MS / 60000);
+    } else {
+        ESP_LOGE(TAG, "boot-loop counter NOT cleared: %s", esp_err_to_name(err));
     }
     vTaskDelete(NULL);
 }

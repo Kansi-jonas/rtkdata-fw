@@ -198,15 +198,20 @@ static bool send_cmd_acked(const char *cmd, int retries) {
 static void gnss_receiver_epoch_invalidate(void);   // defined with the latch below
 
 static void gnss_reset_pulse(void) {
-    // A hardware reset erases whatever the receiver had applied. Every piece
-    // of evidence about the OLD epoch must die with it (review 2026-08-03).
-    gnss_receiver_epoch_invalidate();
     gpio_set_direction(GPIO_GNSS_RESET, GPIO_MODE_OUTPUT);
     gpio_pullup_en(GPIO_GNSS_RESET);
     gpio_set_level(GPIO_GNSS_RESET, 0);
     vTaskDelay(pdMS_TO_TICKS(GNSS_RESET_MS));
     gpio_set_level(GPIO_GNSS_RESET, 1);
     vTaskDelay(pdMS_TO_TICKS(GNSS_RESET_MS));
+
+    // A hardware reset erases whatever the receiver had applied, so every
+    // piece of evidence about the OLD epoch must die with it. Invalidate
+    // AFTER the pulse, not before: bytes that were already in flight when the
+    // reset started would otherwise be stamped into the NEW epoch and make it
+    // look alive before it produced anything (review 2026-08-03).
+    drv_uart_gnss_flush();                  // drop pre-reset bytes still queued
+    gnss_receiver_epoch_invalidate();
 }
 
 /* ---- persisted fixed base (anti reboot-re-survey) ----------------------

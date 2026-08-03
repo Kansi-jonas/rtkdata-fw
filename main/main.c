@@ -272,10 +272,21 @@ void app_main()
     // If the firmware crash-loops before this runs it never confirms -> the
     // bootloader rolls back (OTA image) or the boot-loop guard falls back to
     // factory. Runs on every boot; also resets the crash-loop + fail counters.
-    xTaskCreate(&ota_mark_valid_task, "ota_confirm", 4096, NULL, 4, NULL);
+    // Both anti-brick tasks are load-bearing: if creation fails the device
+    // silently loses its rollback and its factory fallback, so say so loudly
+    // (review 2026-08-03).
+    if (xTaskCreate(&ota_mark_valid_task, "ota_confirm", 4096, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "OTA confirm task NOT created: this image can never be "
+                      "confirmed and will roll back on the next reboot");
+        uart_nmea("$PESP,OTA,NOCONFIRMTASK");
+    }
     // Separate clock, separate question: "did we crash?" is not "does the
     // data plane work?" (review 2026-08-03).
-    xTaskCreate(&ota_bootloop_clear_task, "ota_bootloop", 2560, NULL, 4, NULL);
+    if (xTaskCreate(&ota_bootloop_clear_task, "ota_bootloop", 2560, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "boot-loop clear task NOT created: the crash counter will "
+                      "keep climbing across reboots");
+        uart_nmea("$PESP,OTA,NOBOOTLOOPTASK");
+    }
 
     // Daily OTA poll: lightweight manifest check; reboots ONLY when a newer
     // version is published (then ota_boot_check_blocking installs it at full

@@ -24,6 +24,23 @@ static bool span_equals(const char *s, size_t len, const char *cmd) {
     return len == clen && memcmp(s, cmd, clen) == 0;
 }
 
+static bool is_hex(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+/* A record is only complete once its "*" is followed by both checksum digits.
+ * Measured forms: *45, *11, *7a - always exactly two hex digits.
+ *
+ * The checksum VALUE is deliberately not verified: it is not the NMEA XOR our
+ * own $PESP sentences use (checked against three real captures on 2026-08-03,
+ * XOR reproduces $PESP but not $command), and the actual algorithm is not
+ * documented anywhere we trust. Validating it on a guess would repeat exactly
+ * the mistake this file exists to correct. Structure is checked, value is not,
+ * and that limit is stated rather than hidden. */
+static bool record_complete_at(const char *buf, size_t n, size_t star) {
+    return (star + 2 < n) && is_hex(buf[star + 1]) && is_hex(buf[star + 2]);
+}
+
 gnss_ack_verdict_t gnss_ack_scan(const char *buf, size_t n, const char *cmd) {
     gnss_ack_verdict_t verdict = GNSS_ACK_NONE;
 
@@ -41,8 +58,13 @@ gnss_ack_verdict_t gnss_ack_scan(const char *buf, size_t n, const char *cmd) {
          * "...PARSING FAIL" prefix would otherwise read as a verdict. Stop at
          * the next record start too, so a lost delimiter cannot swallow the
          * following record. */
-        int star = find_at(buf, n, body, "*");
         int next = find_at(buf, n, body, PREFIX);
+        int star = -1;
+        for (int s = find_at(buf, n, body, "*"); s >= 0;
+             s = find_at(buf, n, (size_t)s + 1, "*")) {
+            if (next >= 0 && s > next) break;          /* belongs to a later record */
+            if (record_complete_at(buf, n, (size_t)s)) { star = s; break; }
+        }
         if (star < 0 || (next >= 0 && next < star)) {
             pos = body;
             continue;
@@ -73,9 +95,20 @@ gnss_ack_verdict_t gnss_ack_scan(const char *buf, size_t n, const char *cmd) {
              * and carries the command at the end instead; the hardware does
              * not do that. Trusting the note cost one release cycle. */
             if (span_equals(buf + body, (size_t)resp - body, cmd)) {
-                if (find_at(buf, end, (size_t)resp, "PARSING FAIL") >= 0) {
+                /* Verdict text = everything after ",response:", trimmed.
+                 * Substring matching accepted "NOT OK" as success
+                 * (review 2026-08-03), so success requires the verdict to BE
+                 * "OK", not to contain it. Anything we do not recognise stays
+                 * NONE: an unknown reply must time out loudly, not be guessed
+                 * into an approval. */
+                size_t v = (size_t)resp + strlen(",response:");
+                while (v < end && buf[v] == ' ') v++;
+                size_t vend = end;
+                while (vend > v && (buf[vend - 1] == ' ' || buf[vend - 1] == '\r')) vend--;
+
+                if (v + 12 <= vend && memcmp(buf + v, "PARSING FAIL", 12) == 0) {
                     verdict = GNSS_ACK_REJECTED;
-                } else if (find_at(buf, end, (size_t)resp, "OK") >= 0) {
+                } else if (span_equals(buf + v, vend - v, "OK")) {
                     verdict = GNSS_ACK_OK;
                 }
             }

@@ -151,6 +151,41 @@ static void test_last_verdict_wins(void) {
     CHECK_V(buf, (size_t)n, "MASK 10.0", GNSS_ACK_OK);
 }
 
+/* False positives the first assertion set missed (review 2026-08-03). */
+static void test_no_false_ok(void) {
+    const char not_ok[] = "$command,MASK 10.0,response: NOT OK*00\r\n";
+    CHECK_V(not_ok, strlen(not_ok), "MASK 10.0", GNSS_ACK_NONE);
+
+    const char nok[] = "$command,MASK 10.0,response: NOK*00\r\n";
+    CHECK_V(nok, strlen(nok), "MASK 10.0", GNSS_ACK_NONE);
+
+    const char okish[] = "$command,MASK 10.0,response: OKAY*00\r\n";
+    CHECK_V(okish, strlen(okish), "MASK 10.0", GNSS_ACK_NONE);
+
+    /* an unknown verdict must not be guessed into an approval */
+    const char weird[] = "$command,MASK 10.0,response: BUSY*00\r\n";
+    CHECK_V(weird, strlen(weird), "MASK 10.0", GNSS_ACK_NONE);
+
+    /* a record is incomplete until BOTH checksum digits arrived */
+    const char star_only[] = "$command,MASK 10.0,response: OK*";
+    CHECK_V(star_only, strlen(star_only), "MASK 10.0", GNSS_ACK_NONE);
+
+    const char one_nibble[] = "$command,MASK 10.0,response: OK*0";
+    CHECK_V(one_nibble, strlen(one_nibble), "MASK 10.0", GNSS_ACK_NONE);
+
+    const char two_nibbles[] = "$command,MASK 10.0,response: OK*0a";
+    CHECK_V(two_nibbles, strlen(two_nibbles), "MASK 10.0", GNSS_ACK_OK);
+
+    /* a non-hex pair is not a checksum */
+    const char bad_hex[] = "$command,MASK 10.0,response: OK*zz\r\n";
+    CHECK_V(bad_hex, strlen(bad_hex), "MASK 10.0", GNSS_ACK_NONE);
+
+    /* a "*" inside the verdict text must not terminate the record early */
+    const char star_in_text[] =
+        "$command,MASK 10.0,response: PARSING FAILD NO MATCHING FUNC  M*SK*7f\r\n";
+    CHECK_V(star_in_text, strlen(star_in_text), "MASK 10.0", GNSS_ACK_REJECTED);
+}
+
 static void test_degenerate_inputs(void) {
     CHECK_V(NULL, 0, "x", GNSS_ACK_NONE);
     CHECK_V("", 0, "x", GNSS_ACK_NONE);
@@ -167,6 +202,7 @@ int main(void) {
     test_partial_records();
     test_prefix_commands_not_confused();
     test_last_verdict_wins();
+    test_no_false_ok();
     test_degenerate_inputs();
     printf("%d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

@@ -813,20 +813,32 @@ static void ntrip_server_task(void *ctx){
 const uint16_t ntrip_required_msgs[NTRIP_REQUIRED_MSG_COUNT] = { 1005, 1033, 1077, 1087 };
 static const uint32_t s_required_budget_ms[NTRIP_REQUIRED_MSG_COUNT] = { 30000, 30000, 5000, 5000 };
 
-// Last-seen timestamp per required type. Written only by the UART ingest
-// task, read by diagnostics/OTA: uint32 ms stores are atomic on this target.
+// Last-seen timestamp per required type, tagged with the receiver EPOCH they
+// were observed in. An epoch counter is the only way to make "the receiver was
+// just reset, forget what it told us" race-free against the UART task: the
+// writer stamps the epoch it saw, the reader ignores anything not stamped with
+// the current one, and a frame that was already in flight during the reset can
+// therefore never revive the new epoch (review 2026-08-03).
 static uint32_t s_msg_last_ms[NTRIP_REQUIRED_MSG_COUNT];
-static bool     s_msg_seen[NTRIP_REQUIRED_MSG_COUNT];
+static uint32_t s_msg_epoch[NTRIP_REQUIRED_MSG_COUNT];   // 0 = never seen
+static volatile uint32_t s_epoch = 1;                    // current receiver epoch
 
 // A receiver reset starts a NEW epoch: whatever it emitted before proves
 // nothing about what it emits now. Without this, 30 s-budget types (1005,
 // 1033) stayed "fresh" across a reset and the OTA gate could confirm an epoch
 // that never produced them (review 2026-08-03).
+// Set by the GNSS task, honored by the UART task at the top of the next
+// ingest. The parser belongs to the UART task, so it must reset it itself;
+// having another task memset it mid-parse was the original B1 defect.
+static volatile bool s_ingest_reset_req = false;
+
 void ntrip_server_msg_epoch_reset(void) {
-    for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
-        s_msg_seen[i] = false;
-        s_msg_last_ms[i] = 0;
-    }
+    // Two stores, no lock. Everything stamped with an older epoch is dead by
+    // definition, so a concurrent UART write cannot resurrect stale evidence.
+    // The parser flush is deferred to its owning task.
+    s_epoch++;
+    if (s_epoch == 0) s_epoch = 1;      // 0 means "never seen"
+    s_ingest_reset_req = true;
 }
 
 void ntrip_server_msg_freshness(ntrip_msg_freshness_t *out) {
@@ -834,15 +846,24 @@ void ntrip_server_msg_freshness(ntrip_msg_freshness_t *out) {
     if (!out) return;
 
     uint32_t now = ntrip_now_ms();
+    uint32_t epoch = s_epoch;           // snapshot once for a coherent verdict
     out->all_fresh = true;
 
     for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
         out->type[i] = ntrip_required_msgs[i];
-        if (!s_msg_seen[i]) {
+        // Read the timestamp BEFORE its epoch tag: if a concurrent write lands
+        // in between, the tag we compare is the newer one and the sample is
+        // rejected. The failure mode is a spurious "not fresh", never a
+        // spurious "fresh", which is the safe direction for a gate that
+        // decides between confirming and rolling back an image.
+        uint32_t last = s_msg_last_ms[i];
+        uint32_t tag  = s_msg_epoch[i];
+
+        if (tag != epoch) {
             out->age_ms[i] = UINT32_MAX;
             out->fresh[i]  = false;
         } else {
-            uint32_t age = now - s_msg_last_ms[i];
+            uint32_t age = now - last;
             out->age_ms[i] = age;
             out->fresh[i]  = (age <= s_required_budget_ms[i]);
         }
@@ -861,8 +882,10 @@ static void ntrip_server_on_frame(void *ctx, const uint8_t *frame, uint16_t len,
         uint16_t mtype = (uint16_t)(((uint16_t)frame[3] << 4) | (frame[4] >> 4));
         for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
             if (ntrip_required_msgs[i] == mtype) {
+                // Timestamp first, epoch tag last: a reader that catches this
+                // half-done sees an old tag and discards the sample.
                 s_msg_last_ms[i] = now;
-                s_msg_seen[i] = true;
+                s_msg_epoch[i]   = s_epoch;
                 break;
             }
         }
@@ -888,6 +911,14 @@ static void ntrip_server_on_frame(void *ctx, const uint8_t *frame, uint16_t len,
 void ntrip_server_ingest_uart(const uint8_t *data, size_t len) {
 
     if (!g_ring_mutex || !data || len == 0) return;   // not initialized yet
+
+    // A receiver reset happened: drop the half-parsed frame from the old
+    // epoch so its tail cannot be spliced onto post-reset bytes. Done HERE
+    // because this task owns the parser.
+    if (s_ingest_reset_req) {
+        s_ingest_reset_req = false;
+        rtcm_parser_init(&g_rtcm_parser);
+    }
 
     uint32_t frames_before = g_frame_ring.next_seq;   // sole writer: this task
 

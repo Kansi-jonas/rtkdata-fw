@@ -37,22 +37,42 @@ jobs:
           test -f dl/www.bin
           echo "VER=$VER" >> "$GITHUB_ENV"
 
-      - name: Sanity-check the binary carries this FW_VERSION
+      - name: Verify the binary carries this FW_VERSION
         run: |
           set -euo pipefail
-          if command -v strings >/dev/null && ! strings dl/rtkdata-fw.bin | grep -qx "$VER"; then
-            echo "::warning::FW_VERSION string '$VER' not found in the binary (verify the release was built from a matching config.h)"
+          # Was a warning, so a mismatched binary could still reach the fleet
+          # and re-flash in a loop (update.c compares with an exact strcmp).
+          if ! strings dl/rtkdata-fw.bin | grep -qx "$VER"; then
+            echo "::error::FW_VERSION string '$VER' not found in the release binary"
+            exit 1
           fi
 
       - name: Write the OTA channel (main/ota/)
         run: |
           set -euo pipefail
           cp dl/rtkdata-fw.bin ota/rtkdata-fw.bin
-          cp dl/www.bin        ota/www.bin
-          python3 - "$VER" <<'PY'
+
+          # www.bin is shipped ONLY when it actually changed. App and www are
+          # not one transaction (the boot partition is selected before www is
+          # written), so an unchanged web UI must never be put at risk. For
+          # 1.1.4 the two files are byte-identical to the channel's, which is
+          # why the manifest below is app-only.
+          if cmp -s dl/www.bin ota/www.bin; then
+            echo "www.bin unchanged -> app-only update"
+            WWW_CHANGED=0
+          else
+            echo "www.bin changed -> shipping it too"
+            cp dl/www.bin ota/www.bin
+            WWW_CHANGED=1
+          fi
+
+          python3 - "$VER" "$WWW_CHANGED" <<'PY'
           import json, sys
+          ver, www = sys.argv[1], sys.argv[2] == "1"
+          base = "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/"
           d = json.load(open("ota/release.json"))
-          d["version"] = sys.argv[1]
+          d["version"] = ver
+          d["update_files_urls"] = [base + "rtkdata-fw.bin"] + ([base + "www.bin"] if www else [])
           json.dump(d, open("ota/release.json", "w"), indent=2)
           open("ota/release.json", "a").write("\n")
           PY
