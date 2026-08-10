@@ -1,7 +1,7 @@
 {
-  "version": "1.1.7",
+  "version": "1.1.8",
   "channel": "stable",
-  "notes": "OTA delivery fixes + ellipsoidal mode base. Notes kept short on purpose: the parsed manifest stays in RAM during the install and eats the heap margin.",
+  "notes": "Delivery canary: identical to 1.1.7 except the version string. Proves a 1.1.7 device can install over the air.",
   "update_files_urls": [
     "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/rtkdata-fw.bin"
   ]
