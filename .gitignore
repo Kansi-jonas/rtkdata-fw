@@ -14,3 +14,6 @@ sdkconfig.old
 nvs.bin
 nvs2.bin
 *.nvs.bin
+# Customer delivery packages (large binaries, rebuilt from dist-ship-*)
+customer-package-*/
+dist/
