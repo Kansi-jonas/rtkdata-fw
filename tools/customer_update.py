@@ -69,7 +69,7 @@ def list_ports():
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("RTKdata Basisstation aktualisieren")
+        self.title("RTKdata base station updater")
         self.geometry("720x460")
         self.q = queue.Queue()
         self.busy = False
@@ -77,14 +77,14 @@ class App(tk.Tk):
         top = ttk.Frame(self, padding=10)
         top.pack(fill="x")
 
-        ttk.Label(top, text="1. Gerät per USB anschließen, dann Anschluss wählen:").grid(
+        ttk.Label(top, text="1. Connect the base station by USB, then pick the port:").grid(
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        ttk.Label(top, text="Anschluss:").grid(row=1, column=0, sticky="w")
+        ttk.Label(top, text="Port:").grid(row=1, column=0, sticky="w")
         self.port_cb = ttk.Combobox(top, width=46, state="readonly")
         self.port_cb.grid(row=1, column=1, sticky="w", padx=6)
-        ttk.Button(top, text="Neu suchen", command=self.refresh).grid(row=1, column=2)
+        ttk.Button(top, text="Rescan", command=self.refresh).grid(row=1, column=2)
 
-        self.flash_btn = ttk.Button(top, text="2. Aktualisierung starten", command=self.start)
+        self.flash_btn = ttk.Button(top, text="2. Start update", command=self.start)
         self.flash_btn.grid(row=2, column=0, columnspan=3, sticky="we", pady=(12, 0))
 
         self.status = ttk.Label(self, text="", padding=(10, 4))
@@ -115,51 +115,77 @@ class App(tk.Tk):
         if ports and not self.port_cb.get():
             self.port_cb.current(0)
         if not ports:
-            self.status.config(text="Kein Gerät gefunden. USB-Kabel prüfen, dann 'Neu suchen'.")
+            self.status.config(text="No device found. Check the USB cable, then press Rescan.")
         else:
-            self.status.config(text="Bereit.")
+            self.status.config(text="Ready.")
 
     def start(self):
         if self.busy:
             return
         sel = self.port_cb.get().split()[0] if self.port_cb.get() else ""
         if not sel:
-            self.status.config(text="Bitte zuerst einen Anschluss wählen.")
+            self.status.config(text="Pick a port first.")
             return
         self.busy = True
         self.flash_btn.state(["disabled"])
-        self.status.config(text="Aktualisierung läuft. Gerät NICHT abziehen.")
+        self.status.config(text="Update running. Do NOT unplug the device.")
         threading.Thread(target=self.worker, args=(sel,), daemon=True).start()
 
     def worker(self, port):
         rc = 1
         try:
             app, ota = find_images()
-            cmd = [sys.executable, "-m", "esptool", "--chip", "esp32", "-p", port,
-                   "-b", "460800", "--before", "default-reset", "--after", "hard-reset",
-                   "write-flash", "--flash-mode", "dio", "--flash-size", "16MB",
-                   "--flash-freq", "40m",
-                   APP_OFFSET, app, OTADATA_OFFSET, ota]
-            self.emit("Schreibe Firmware, das dauert etwa eine Minute...")
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, bufsize=1)
-            for line in p.stdout:
-                self.emit(line)
-            rc = p.wait()
+            # esptool runs IN-PROCESS, not as "sys.executable -m esptool".
+            # Inside a PyInstaller bundle sys.executable is this .exe, so the
+            # subprocess form would relaunch the GUI instead of flashing.
+            argv = ["--chip", "esp32", "-p", port,
+                    "-b", "460800", "--before", "default-reset", "--after", "hard-reset",
+                    "write-flash", "--flash-mode", "dio", "--flash-size", "16MB",
+                    "--flash-freq", "40m",
+                    APP_OFFSET, app, OTADATA_OFFSET, ota]
+            self.emit("Writing firmware, this takes about a minute...")
+
+            import contextlib
+            import esptool
+
+            class _Pipe:
+                def __init__(self, emit):
+                    self._emit, self._buf = emit, ""
+
+                def write(self, s):
+                    self._buf += s
+                    while "\n" in self._buf:
+                        line, self._buf = self._buf.split("\n", 1)
+                        self._emit(line)
+
+                def flush(self):
+                    if self._buf:
+                        self._emit(self._buf)
+                        self._buf = ""
+
+            pipe = _Pipe(self.emit)
+            try:
+                with contextlib.redirect_stdout(pipe), contextlib.redirect_stderr(pipe):
+                    esptool.main(argv)
+                rc = 0
+            except SystemExit as e:
+                rc = int(e.code or 0)
+            finally:
+                pipe.flush()
         except FileNotFoundError as e:
-            self.emit(f"FEHLER: Datei fehlt im Paket: {e}")
+            self.emit(f"ERROR: file missing from the package: {e}")
         except Exception as e:  # noqa: BLE001  (surface anything to the customer log)
-            self.emit(f"FEHLER: {e}")
+            self.emit(f"ERROR: {e}")
         finally:
             self.busy = False
             self.flash_btn.state(["!disabled"])
             if rc == 0:
                 self.emit("")
-                self.emit("FERTIG. Das Gerät startet neu und ist nach etwa zwei Minuten wieder online.")
-                self.status.config(text="Erfolgreich aktualisiert.")
+                self.emit("DONE. The device reboots and is back online in about two minutes.")
+                self.status.config(text="Update successful.")
             else:
                 self.status.config(
-                    text="Fehlgeschlagen. USB-Kabel neu einstecken und noch einmal versuchen.")
+                    text="Failed. Unplug and replug the USB cable, then try again.")
 
 
 if __name__ == "__main__":
