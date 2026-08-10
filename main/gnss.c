@@ -315,6 +315,19 @@ void config_gnss_base(void) {
         // to stream MSM7. Do NOT switch to the space form without hardware re-test.
         "unlog com1\r\n",
         "CONFIG SIGNALGROUP 2\r\n",   // enable all bands incl. Galileo E6
+        // MUST precede any "mode base": the UM980 reads the mode-base height as
+        // ALTITUDE (above MSL) by default and adds its internal undulation
+        // before deriving the ECEF it broadcasts in the 1005. We feed the
+        // ELLIPSOIDAL height from CSRS-PPP, so the default made the receiver
+        // place itself N metres too high (measured 2026-08-06 on
+        // RTK14335C5CA838: catalog 34.1504 m ellipsoidal -> broadcast 54.654 m,
+        // delta 20.5036 m = the local undulation). The base then computed its
+        // corrections for a position 20.5 m above its antenna while Lighthouse
+        // served the correct ARP, so every rover inherited that offset and DJI
+        // receivers rejected the fix as implausible. Zeroing the undulation
+        // makes "mode base <lat> <lon> <h>" take h as ellipsoidal, which is
+        // what the IE always sends.
+        "CONFIG UNDULATION 0.0\r\n",
         "MASK 10.0\r\n",              // 10 deg elevation cutoff
         "rtcm1077,com1,1\r\n",        // GPS    MSM7 @1Hz
         "rtcm1087,com1,1\r\n",        // GLONASS
@@ -446,6 +459,13 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
     snprintf(cmd, sizeof(cmd), "mode base %.9f %.9f %.4f\r\n", lat_deg, lon_deg, height_m);
 
     s_capturing = true;
+    // Zero the undulation IMMEDIATELY before every mode base, not only in
+    // config_gnss_base: this path runs from the IE heartbeat and must be
+    // correct on a receiver that never saw the boot sequence (mid-life OTA, or
+    // a saveconfig that failed). Idempotent, one command, and the idempotence
+    // gate above keeps it off the UART in steady state. Without it the height
+    // is taken as MSL and the base sits N metres too high; see config_gnss_base.
+    (void)send_cmd_acked("CONFIG UNDULATION 0.0\r\n", ACK_RETRIES);
     bool acked = send_cmd_acked(cmd, ACK_RETRIES);
     bool ok = acked;
     if (ok) ok = send_cmd_acked("saveconfig\r\n", ACK_RETRIES);
