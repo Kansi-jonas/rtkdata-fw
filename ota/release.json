@@ -1,7 +1,7 @@
 {
-  "version": "1.1.5",
+  "version": "1.1.6",
   "channel": "stable",
-  "notes": "ROLLED BACK 2026-08-03: v1.1.4 was published from a tag that did NOT contain the bench-tested fix 'a fresh PENDING_VERIFY image is not a crash boot'. Without it, a device updating from 1.0.6 counts its own successful OTA reboot as a crash. The binary below is deliberately LEFT AS IS so a cached manifest can never be paired with a different binary; only the version is reverted, which stops any further install because update.c installs strictly newer versions only. A corrected 1.1.5 follows.",
+  "notes": "Zeroes the receiver undulation so 'mode base' takes the ELLIPSOIDAL height the IE sends. Until now the UM980 read that height as altitude above MSL and added its own geoid undulation, so every base broadcast an ARP that was off by the local undulation (measured: NZ +20.50 m, Saarland +48.32 m). Lighthouse rewrote the served ARP to the catalog value, which hid it from customers. Bench-verified on RTKD48C49591AC4 (UM980 R4.10Build11833), same device before and after with mode base 274.1987 pushed both times: broadcast 322.5232 m -> 274.1986 m, horizontal unchanged. The binary below is byte-identical to the one bench-tested (md5 4e65ff0dc0b9e46b2c37d94b4a35cacf); this is the check v1.1.4 failed. EXPECTED FLEET EFFECT: every base's broadcast ARP moves by its own undulation (Iceland +66.4 m, Thunder Bay -36.2 m) toward the correct value. Watch 1005_drift_hi: it should fall silent per station as devices update, that is the success signal, not an outage. Rollback stops further installs only; devices that already updated keep 1.1.6.",
   "update_files_urls": [
     "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/rtkdata-fw.bin"
   ]
