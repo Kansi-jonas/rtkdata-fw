@@ -996,6 +996,18 @@ const char *wifi_auth_mode_name(wifi_auth_mode_t auth_mode){
 
 // RTKdata: hard restart of the Wi-Fi driver (supervisor link-recovery action,
 // instead of waiting out the stock 60-attempt / ~5 min reconnect backoff).
+void wifi_ap_stop_now(void) {
+
+    if (wifi_event_group == NULL || !ap_active) return;
+
+    // Same signal the 15-minute auto-off timer raises, so the AP always closes
+    // through ONE path. The control task keeps its own guard: while a client is
+    // connected it re-arms instead of stopping, which is what we want (never
+    // pull the AP out from under a customer mid-onboarding).
+    ESP_LOGI(TAG, "AP stop requested early (boot OTA needs the heap)");
+    xEventGroupSetBits(wifi_event_group, WIFI_AP_STOP_DUE_BIT);
+}
+
 void wifi_driver_restart(void) {
     ESP_LOGW(TAG, "wifi driver restart requested");
     uart_nmea("$PESP,RTK,SUPERVISOR,WIFIRESTART");

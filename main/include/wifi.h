@@ -63,6 +63,14 @@ bool wait_for_ip(uint32_t timeout_ms);   // bounded; true if STA got an IP, fals
 
 void wifi_driver_restart(void);
 
+// Ask the Wi-Fi control task to close the config AP NOW instead of waiting out
+// the 15-minute auto-off. Used by the boot OTA check, which runs ~2 min after
+// boot and therefore always meets the AP (plus its DHCP + captive DNS) still
+// holding the heap the TLS download needs. The control task DECLINES while a
+// client is connected (a customer mid-onboarding keeps the AP), so this is a
+// request, not a guarantee; the caller must re-check the heap.
+void wifi_ap_stop_now(void);
+
 const char * wifi_auth_mode_name(wifi_auth_mode_t auth_mode);
 
 #endif //ESP32_XBEE_WIFI_H

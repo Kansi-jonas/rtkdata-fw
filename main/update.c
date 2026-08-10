@@ -23,6 +23,7 @@
 #include "esp_partition.h"
 #include "nvs.h"
 #include "uart.h"
+#include "wifi.h"
 
 static const char *TAG              = "OTA";
 static       bool checkUpdates      = true;
@@ -151,6 +152,26 @@ static bool ota_attempt_allowed(const char *version) {
     nvs_close(h);
     ESP_LOGI(TAG, "OTA attempt %u/%u for version %s", cnt + 1, MAX_OTA_ATTEMPTS, version);
     return true;
+}
+
+// Read-only twin of ota_attempt_allowed(): "would an attempt still be allowed?"
+// WITHOUT booking one. The daily poll needs this: it used to reboot purely on
+// "a newer version is published", never consulting the budget, so a device that
+// had already exhausted its three attempts kept rebooting every single night
+// forever, losing ~70 s of corrections each time and never installing anything
+// (found 2026-08-10). Fail-OPEN like its twin: an NVS hiccup must not block a
+// real update.
+static bool ota_attempts_exhausted(const char *version) {
+    nvs_handle_t h;
+    if (nvs_open(OTA_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    char    stored[24] = {0};
+    size_t  len        = sizeof(stored);
+    uint8_t cnt        = 0;
+    if (nvs_get_str(h, OTA_KEY_FAILVER, stored, &len) == ESP_OK && strcmp(stored, version) == 0) {
+        nvs_get_u8(h, OTA_KEY_FAILCNT, &cnt);
+    }
+    nvs_close(h);
+    return cnt >= MAX_OTA_ATTEMPTS;
 }
 
 esp_err_t ota_update_firmware(const char *url) {
@@ -831,6 +852,58 @@ void ota_boot_check(void) {
 
         if (ota_version_is_newer(new_version, FW_VERSION)) {
 
+            // The config AP (plus its DHCP server and captive DNS) is STILL UP
+            // here: it auto-closes 15 min after boot, this check runs ~2 min in.
+            // On 1.1.5 that left 109 700 bytes free against the 112 640 the TLS
+            // download demands, so the install deferred on EVERY boot of EVERY
+            // device (measured 2026-08-10, with no client on the AP). Ask the
+            // Wi-Fi control task to close the AP now; it declines while a client
+            // is mid-onboarding, which is the correct trade and just means we
+            // defer once more.
+            if (esp_get_free_heap_size() < MIN_OTA_HEAP) {
+                ESP_LOGW(TAG, "free heap %u < %u -> closing the config AP to make room",
+                         (unsigned)esp_get_free_heap_size(), (unsigned)MIN_OTA_HEAP);
+                wifi_ap_stop_now();
+
+                // POLL, do not sleep a fixed span: the teardown is asynchronous
+                // (control task -> esp_wifi_set_mode -> DHCP/DNS teardown) and a
+                // guessed delay is either too short (fix silently useless) or
+                // wasted boot time on every device that is already fine.
+                for (int i = 0; i < 30 && esp_get_free_heap_size() < MIN_OTA_HEAP; i++) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+
+                // Closing the AP changes the Wi-Fi mode on a live driver. If that
+                // disturbed the STA association we must NOT walk into the
+                // download: it would fail and burn a REAL attempt for a problem
+                // we caused ourselves. No IP -> defer, uplink first.
+                if (!wait_for_ip(5000)) {
+                    ESP_LOGW(TAG, "no STA IP after closing the AP -> deferring %s (no attempt booked)",
+                             new_version);
+                    cJSON_Delete(jsonFile);
+                    return;
+                }
+            }
+
+            // Budget check BEFORE booking. ota_attempt_allowed() WRITES the
+            // per-version counter and that counter is only cleared after a
+            // CONFIRMED install, so booking here and then bailing out on the
+            // heap pre-check inside ota_update_firmware() burned all three
+            // attempts without downloading a single byte -- after which the
+            // device refused that version forever (measured 2026-08-10:
+            // "OTA attempt 3/3 for version 1.1.6", no download). A deferral is
+            // not an attempt; retry on the next boot instead.
+            {
+                size_t heap_now = esp_get_free_heap_size();
+                if (heap_now < MIN_OTA_HEAP) {
+                    ESP_LOGW(TAG, "deferring %s: free heap %u < %u, no attempt booked, retry next boot",
+                             new_version, (unsigned)heap_now, (unsigned)MIN_OTA_HEAP);
+                    uart_nmea("$PESP,OTA,DEFER,%s,%u", new_version, (unsigned)heap_now);
+                    cJSON_Delete(jsonFile);
+                    return;
+                }
+            }
+
             if (!ota_attempt_allowed(new_version)) {
                 // exhausted the retry budget for this version -> do NOT attempt
                 // again; boot the current (working) FW instead of crash-looping.
@@ -1266,6 +1339,14 @@ void ota_schedule_check_newupdate(void *pvParameter){
                 if (jsonFile) {
                     cJSON *v = cJSON_GetObjectItem(jsonFile, "version");
                     bool newer = cJSON_IsString(v) && ota_version_is_newer(v->valuestring, FW_VERSION);
+                    // Never reboot for a version this device has already given up
+                    // on: the boot check would refuse to install it anyway, so the
+                    // restart is pure customer downtime, repeated every night.
+                    if (newer && ota_attempts_exhausted(v->valuestring)) {
+                        ESP_LOGW(TAG, "newer version %s available but its attempt budget is spent -> NOT rebooting",
+                                 v->valuestring);
+                        newer = false;
+                    }
                     if (newer) {
                         ESP_LOGI(TAG, "newer version %s available -> restart to install at boot (full heap)", v->valuestring);
                     }
