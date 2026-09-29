@@ -457,8 +457,19 @@ function renderDash(st, rtk){
   const pos = rtk.position || {};
   const phase = pos.phase || "";                 // locked | computing | awaiting_survey
   const blocking = rtk.blocking || "";           // clean_window | precise_position
-  const eta = fmtDur(rtk.matures_in_s);          // honest "until live" = the binding gate
-  if(state === "active"){
+  const sitePhase = rtk.site_phase || "";
+  const siteMessages = {
+    checking: ["Checking location", "The station is checking its antenna position. Keep the antenna stationary with a clear view of the sky."],
+    fencing: ["Preparing new location", "A location change was detected. The previous position is being retired before measurement resumes."],
+    surveying: ["Measuring location", "The station is collecting satellite observations for its precise position. Keep it powered and connected; completion time depends on reception and processing."],
+    positioned: ["Applying precise position", "The precise position is ready. The station is applying it and checking the correction stream."],
+    publishing: ["Final checks", "The new position is being released to the network. The station will show Live when checks complete."]
+  };
+  if(siteMessages[sitePhase]){
+    setState("Setting up","amber");
+    $("#dState").textContent = siteMessages[sitePhase][0];
+    $("#dMsg").textContent = siteMessages[sitePhase][1];
+  } else if(state === "active"){
     setState("Live","green");
     $("#dState").textContent = "Live on RTKdata";
     $("#dMsg").innerHTML = "This station is part of the live network."+(rtk.station_id?" ID <b>"+escapeHtml(rtk.station_id)+"</b>.":"");
@@ -470,16 +481,16 @@ function renderDash(st, rtk){
     // the honest ETA is matures_in_s).
     if(phase === "locked"){
       $("#dState").textContent = "Position fixed";
-      $("#dMsg").textContent = "Position locked (cm-precise). Final stability check before going live · "+(rtk.progress_pct||0)+"% · ~"+eta+" to go.";
+      $("#dMsg").textContent = "Precise position ready. Final stability checks are running before the station goes live.";
     } else {
       $("#dState").textContent = "Computing position";
-      $("#dMsg").textContent = "Survey captured · the exact position is being computed server-side · "+(rtk.progress_pct||0)+"% · goes live in ~"+eta+".";
+      $("#dMsg").textContent = "The exact position is being computed. Keep the station powered and connected; completion time depends on reception and processing.";
     }
   } else {
     setState("Provisioning","amber");
     $("#dState").textContent = "Provisioning";
     if(phase === "computing"){
-      $("#dMsg").textContent = "Survey captured · computing the exact position server-side · goes live in ~"+eta+".";
+      $("#dMsg").textContent = "Survey captured. The exact position is being computed; keep the station powered and connected.";
     } else if(phase === "awaiting_survey"){
       $("#dMsg").textContent = rtk.enrolled ? "Enrolled · waiting for the first survey capture." : "Enrolling with the RTKdata network.";
     } else {

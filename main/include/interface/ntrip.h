@@ -19,6 +19,7 @@
 
 void ntrip_server_init();
 void ntrip_server_reconnect_all(void);
+void ntrip_server_site_flush(void);
 
 // Bring up the RTCM parser + frame ring. Call right after uart_init(), BEFORE
 // the OTA window: GNSS liveness (supervisor_note_gnss_rx) is derived from
@@ -85,6 +86,7 @@ typedef struct {
 } ntrip_msg_freshness_t;
 
 void ntrip_server_msg_freshness(ntrip_msg_freshness_t *out);
+uint32_t ntrip_server_observations_silent_ms(void);
 
 // Drop all freshness evidence: call whenever the receiver is reset, since a
 // new epoch has to re-prove the required set from scratch.

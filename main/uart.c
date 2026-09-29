@@ -152,7 +152,10 @@ void uart_init() {
     
     stream_stats = stream_stats_new("uart");
     gnss_mutex_send = app_mutex_create();
-    xTaskCreate(uart_task, "uart_task", 8192, NULL, TASK_PRIORITY_UART, NULL);
+    // Xtensa own-frame accounting of UART -> BASEPOS parsing is ~5744 bytes
+    // including this task's 4 KiB receive buffer, before newlib/RTOS calls.
+    // Keep another 2 KiB of margin; real stack high-water still needs HIL.
+    xTaskCreate(uart_task, "uart_task", 10240, NULL, TASK_PRIORITY_UART, NULL);
     drv_uart_usbc_init();
     // drv_uart_gnss_init();
     drv_uart_usbc_read_set_cb(handle_usbc_received_data);
@@ -181,8 +184,35 @@ static void uart_task(void *ctx) {
                 ESP_LOGE(TAG, "uart_read_bytes error (%lu total)",
                          (unsigned long)s_read_errors);
             }
+            vTaskDelay(1);   // yield, see the len == 0 note below
             continue;
         } else if (len == 0) {
+            // This yield is load-bearing, do NOT drop it for a "tighter" loop.
+            // uart_read_bytes() holds the driver's rx_mux for the WHOLE call,
+            // and this task runs at TASK_PRIORITY_UART (10) while app_main runs
+            // at 1. Looping straight back into the read re-takes rx_mux before
+            // any lower-priority task can be scheduled, so uart_flush() from
+            // the main task waits on that mutex forever.
+            //
+            // That is not theoretical. gnss_reset_pulse() holds the UM980 in
+            // hardware reset, so the receiver goes SILENT -- which is exactly
+            // the len == 0 path -- and the drv_uart_gnss_flush() right after
+            // the pulse then never returns. gnss_init() never finishes, the
+            // main task dies there, and the device never starts its web server
+            // or NTRIP: no config UI, no corrections, forever, on every boot.
+            // Reproduced on a fresh RTK38182BF84D7C, 2026-08-10, main task
+            // silent for 400+ s after "reset_pulse: delays done".
+            // When bytes DO arrive the processing below blocks often enough to
+            // hand the mutex over by luck, which is why it looked like a broken
+            // single device instead of a fleet-wide race.
+            //
+            // vTaskDelay(1), not pdMS_TO_TICKS(n): CONFIG_FREERTOS_HZ is 100,
+            // so anything under 10 ms truncates to 0 ticks and yields only to
+            // tasks of EQUAL or higher priority, i.e. not to the one that is
+            // actually stuck. One tick costs nothing here (the read above
+            // already waited 50 ms) and the 4 KB RX buffer holds ~0.36 s at
+            // line rate.
+            vTaskDelay(1);
             continue;
         }
 

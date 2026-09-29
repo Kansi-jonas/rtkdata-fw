@@ -11,6 +11,7 @@
 #define RTKDATA_GNSS_H
 
 #include <stdbool.h>
+#include "gnss_site.h"
 
 // Hardware-reset the UM980 and apply the reference-base config. Called at boot.
 void gnss_init(void);
@@ -26,6 +27,8 @@ void gnss_log_version(void);
 // (lat/lon in degrees, height in metres, ITRF2020). Returns true if the UM980
 // acknowledged. Called by the provisioning client once the position converges.
 bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m);
+bool gnss_start_site_survey(void);
+bool gnss_apply_site_revision(const gnss_site_desired_t *desired);
 
 // Synchronous command/response capture, called from uart_task for every UART
 // chunk. Cheap no-op unless a transaction is capturing.

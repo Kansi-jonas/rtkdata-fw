@@ -701,7 +701,36 @@ static void test_progress_timeout_wraparound(void) {
     CHECK(ntrip_tx_stalled(&tx, 0x00001000u, 5000));   /* 8192ms, wrapped */
 }
 
+typedef struct { bool locked, allow, hold_on_lock; unsigned guard_calls; } guarded_ring_test_t;
+static void guarded_lock(void *ctx) {
+    guarded_ring_test_t *g = ctx;
+    g->locked = true;
+    if (g->hold_on_lock) g->allow = false;
+}
+static void guarded_unlock(void *ctx) { ((guarded_ring_test_t *)ctx)->locked = false; }
+static bool guarded_check(void *ctx) {
+    guarded_ring_test_t *g = ctx;
+    CHECK(g->locked); g->guard_calls++;
+    return g->allow;
+}
+static void test_hold_before_enqueue(void) {
+    guarded_ring_test_t gate = {.allow=true,.hold_on_lock=true};
+    ntrip_ring_t ring;
+    uint8_t frame[64];
+    uint16_t len = make_frame(frame, 44, 99);
+    ntrip_ring_init(&ring, guarded_lock, guarded_unlock, &gate);
+    /* The caller saw allow=true, but HOLD/flush acquired the mutex first. */
+    CHECK(!ntrip_ring_push_guarded(&ring, frame, len, 100, guarded_check, &gate));
+    CHECK(ring.next_seq == 0 && ring.cum_bytes == 0 && !gate.locked);
+    gate.hold_on_lock = false; gate.allow = true;
+    CHECK(ntrip_ring_push_guarded(&ring, frame, len, 200, guarded_check, &gate));
+    CHECK(ring.next_seq == 1 && ring.cum_bytes == len && gate.guard_calls == 2);
+    CHECK(!ntrip_ring_push_guarded(&ring, frame, 1, 200, guarded_check, &gate));
+    CHECK(gate.guard_calls == 2 && !gate.locked);
+}
+
 int main(void) {
+    test_hold_before_enqueue();
     test_crc_known_vector();
     test_all_chunk_splits();
     test_embedded_and_false_preambles();

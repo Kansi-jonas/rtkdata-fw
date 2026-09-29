@@ -35,8 +35,20 @@ FW_PARTS = [
     ("0x8000", "partition_table/partition-table.bin"),
     ("0x10000", "rtkdata-fw.bin"),
     ("0x210000", "www.bin"),
+    ("0x410000", "spiffs.bin"),
     ("0x640000", "ota_data_initial.bin"),
 ]
+
+# Parts that may be absent: flashing simply skips them. spiffs.bin is a
+# pre-formatted, empty 2 MB SPIFFS image. Writing it is not cosmetic: erase_flash
+# leaves that partition raw, so on its FIRST boot ota_update_init() mounts it
+# with format_if_mount_failed=true and formats 2 MB inline. That blocks the main
+# task for MINUTES, logs nothing while it runs, and the config UI never comes up
+# -- and any reset during the format restarts it from scratch, so an impatient
+# operator can loop forever. Shipping a formatted image removes the format.
+# Generate with:
+#   python $IDF_PATH/components/spiffs/spiffsgen.py 2097152 <empty-dir> spiffs.bin
+OPTIONAL_PARTS = {"spiffs.bin"}
 
 
 def esptool(port, *args):
@@ -67,6 +79,10 @@ def main():
     for off, rel in FW_PARTS:
         p = os.path.join(build, rel)
         if not os.path.exists(p):
+            if os.path.basename(rel) in OPTIONAL_PARTS:
+                print(f"  note: {rel} not present, skipping "
+                      f"(first boot will format SPIFFS, which takes minutes)")
+                continue
             sys.exit(f"error: missing build artifact {p}\n  build first: idf.py build (or the Docker build)")
         parts += [off, p]
 

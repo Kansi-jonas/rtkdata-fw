@@ -143,6 +143,88 @@ void rtcm_parser_feed(rtcm_parser_t *p, const uint8_t *data, size_t len,
     }
 }
 
+/* --------------------------------------------- Observation progress ----- */
+
+static uint32_t observation_bits(const uint8_t *p, unsigned bit, unsigned width) {
+    uint32_t value = 0;
+    for (unsigned i = 0; i < width; ++i)
+        value = (value << 1) | ((p[(bit+i)/8] >> (7-(bit+i)%8)) & 1U);
+    return value;
+}
+
+void rtcm_observation_init(rtcm_observation_monitor_t *monitor) {
+    memset(monitor, 0, sizeof(*monitor));
+}
+
+bool rtcm_observation_note(rtcm_observation_monitor_t *monitor,
+                           const uint8_t *frame, size_t len, uint32_t now_ms) {
+    if (!monitor || !frame || len < 28 || len > RTCM_MAX_FRAME_B ||
+        frame[0] != 0xd3 || (frame[1] & 0xfc)) return false;
+    unsigned payload_len = ((unsigned)(frame[1] & 3) << 8) | frame[2];
+    if (payload_len + 6U != len ||
+        rtcm_crc24q(frame, len-3) != (((uint32_t)frame[len-3] << 16) |
+          ((uint32_t)frame[len-2] << 8) | frame[len-1])) return false;
+    const uint8_t *p = frame + 3;
+    uint32_t type = observation_bits(p, 0, 12);
+    unsigned family;
+    switch (type) {
+        case 1077: family = 0; break;
+        case 1087: family = 1; break;
+        case 1097: family = 2; break;
+        case 1117: family = 3; break;
+        case 1127: family = 4; break;
+        case 1137: family = 5; break;
+        default: return false;
+    }
+    uint32_t epoch = observation_bits(p, 24, 30);
+    if (family == 1) {
+        uint32_t day = epoch >> 27, tod = epoch & UINT32_C(0x7ffffff);
+        if (day > 6 || tod >= 86400000) return false;
+        epoch = day * 86400000 + tod;
+    } else if (epoch >= 604800000) {
+        return false;
+    }
+    unsigned satellites = 0, signals = 0, cells = 0;
+    for (unsigned i = 0; i < 64; ++i) satellites += observation_bits(p, 73+i, 1);
+    for (unsigned i = 0; i < 32; ++i) signals += observation_bits(p, 137+i, 1);
+    if (!satellites || !signals) return false;
+    unsigned mask_bits = satellites * signals;
+    if (169U + mask_bits > payload_len * 8U) return false;
+    for (unsigned i = 0; i < mask_bits; ++i) cells += observation_bits(p, 169+i, 1);
+    unsigned satellite_start = 169U + mask_bits;
+    unsigned cell_start = satellite_start + 36U * satellites;
+    if (!cells || (cell_start + 80U * cells + 7U) / 8U != payload_len) return false;
+    bool valid_cell = false;
+    unsigned cell = 0;
+    for (unsigned i = 0; i < mask_bits; ++i) {
+        if (!observation_bits(p, 169+i, 1)) continue;
+        unsigned sat = i / signals;
+        /* MSM7 invalid sentinels: rough range255, fine code -2^19,
+         * fine phase -2^23. One usable code+carrier cell is enough; loss
+         * of another satellite/constellation must not cause recovery. */
+        if (observation_bits(p, satellite_start + 8U*sat, 8) != 255 &&
+            observation_bits(p, cell_start + 20U*cell, 20) != UINT32_C(0x80000) &&
+            observation_bits(p, cell_start + 20U*cells + 24U*cell, 24) != UINT32_C(0x800000))
+            valid_cell = true;
+        ++cell;
+    }
+    if (!valid_cell) return false;
+    if (monitor->seen & (1U << family)) {
+        uint32_t advance = (epoch + 604800000U - monitor->epoch[family]) % 604800000U;
+        if (!advance || advance > 302400000U) return false;
+    }
+    monitor->epoch[family] = epoch;
+    monitor->seen |= (uint8_t)(1U << family);
+    monitor->have_progress = true;
+    monitor->last_progress_ms = now_ms;
+    return true;
+}
+
+uint32_t rtcm_observation_silent_ms(const rtcm_observation_monitor_t *monitor,
+                                   uint32_t now_ms) {
+    return monitor->have_progress ? (uint32_t)(now_ms - monitor->last_progress_ms) : UINT32_MAX;
+}
+
 /* ------------------------------------------------------------------ Ring -- */
 
 static void ring_lock(ntrip_ring_t *r)   { if (r->lock)   r->lock(r->lock_ctx); }
@@ -158,9 +240,18 @@ void ntrip_ring_init(ntrip_ring_t *r, ntrip_ring_lock_fn lock,
 
 void ntrip_ring_push(ntrip_ring_t *r, const uint8_t *frame, uint16_t len,
                      uint32_t now_ms) {
-    if (len < 6 || len > RTCM_MAX_FRAME_B) return;
+    (void)ntrip_ring_push_guarded(r, frame, len, now_ms, NULL, NULL);
+}
+
+bool ntrip_ring_push_guarded(ntrip_ring_t *r, const uint8_t *frame, uint16_t len,
+                             uint32_t now_ms, ntrip_ring_guard_fn guard, void *ctx) {
+    if (len < 6 || len > RTCM_MAX_FRAME_B) return false;
 
     ring_lock(r);
+    if (guard && !guard(ctx)) {
+        ring_unlock(r);
+        return false;
+    }
 
     ntrip_ring_slot_t *s = &r->slot[r->next_seq % RTCM_RING_SLOTS];
     s->seq = r->next_seq;
@@ -173,6 +264,7 @@ void ntrip_ring_push(ntrip_ring_t *r, const uint8_t *frame, uint16_t len,
     r->pushed_frames++;
 
     ring_unlock(r);
+    return true;
 }
 
 /* Oldest seq still resident. Caller holds the lock. */

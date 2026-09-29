@@ -30,6 +30,8 @@
 #include <esp_log.h>
 
 #include "supervisor.h"
+#include "gnss_site.h"
+#include "interface/ntrip.h"
 #include "uart.h"
 
 #define TAG "SUPERVISOR"
@@ -70,6 +72,7 @@ static volatile int64_t s_t_ip     = 0;
 /* "has this subsystem ever been healthy" gates */
 static volatile bool s_gnss_seen   = false;
 static volatile bool s_caster_seen = false;
+static volatile bool s_caster_progress = false; // handshake alone proves no RTCM progress
 static volatile bool s_ip_seen     = false;
 static volatile bool s_link_up     = false;
 
@@ -101,6 +104,7 @@ void supervisor_note_caster_tx(int bytes) {
     if (bytes > 0) {
         s_t_caster = now_us();
         s_caster_seen = true;
+        s_caster_progress = true;
     } else if (!s_caster_seen) {
         s_t_caster = now_us();
         s_caster_seen = true;
@@ -122,6 +126,11 @@ void supervisor_set_recovery(supervisor_recovery_fn gnss_reset,
 
 /* ---- health snapshot --------------------------------------------------- */
 
+static bool gnss_observation_fault(void) {
+    return gnss_site_output_expected() &&
+        ntrip_server_observations_silent_ms() >= TH_GNSS_S * 1000U;
+}
+
 void supervisor_health(supervisor_health_t *out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
@@ -129,8 +138,13 @@ void supervisor_health(supervisor_health_t *out) {
     out->gnss_silent_s   = s_gnss_seen   ? age_s(s_t_gnss)   : out->uptime_s;
     out->caster_silent_s = s_caster_seen ? age_s(s_t_caster) : 0; /* 0 = n/a yet */
     out->ip_down_s       = s_link_up ? 0 : (s_ip_seen ? age_s(s_t_ip) : 0);
-    out->gnss_ok         = s_gnss_seen   && out->gnss_silent_s   < TH_GNSS_S;
-    out->caster_ok       = !s_caster_seen || out->caster_silent_s < TH_CASTER_S;
+    uint32_t obs_ms = ntrip_server_observations_silent_ms();
+    out->obs_silent_s = obs_ms == UINT32_MAX ? -1 : (int32_t)(obs_ms / 1000U);
+    out->obs_expected = gnss_site_output_expected();
+    out->gnss_ok         = s_gnss_seen && out->gnss_silent_s < TH_GNSS_S &&
+                          !gnss_site_needs_recovery() && !gnss_observation_fault();
+    out->caster_ok       = gnss_site_upload_allowed() && s_caster_progress &&
+                          out->caster_silent_s < TH_CASTER_S;
     out->link_ok         = s_link_up || !s_ip_seen;
     out->recoveries_gnss   = s_rec_gnss;
     out->recoveries_caster = s_rec_caster;
@@ -170,11 +184,14 @@ static void supervisor_task(void *ctx) {
 
         /* GNSS: silent if never seen after grace, or stale */
         uint32_t gnss_silent = s_gnss_seen ? age_s(s_t_gnss) : uptime;
-        bool gnss_fault = gnss_silent >= TH_GNSS_S;
+        bool basepos_fault = gnss_site_needs_recovery();
+        bool observation_fault = gnss_observation_fault();
+        bool gnss_fault = gnss_silent >= TH_GNSS_S || basepos_fault || observation_fault;
 
         /* Caster: only judged once it has sent at least once */
         uint32_t caster_silent = s_caster_seen ? age_s(s_t_caster) : 0;
-        bool caster_fault = s_caster_seen && caster_silent >= TH_CASTER_S;
+        bool caster_fault = gnss_site_upload_allowed() && s_caster_seen &&
+                            caster_silent >= TH_CASTER_S;
 
         /* Link: only judged once we have ever had an IP (skip pure-AP setup) */
         uint32_t ip_down = (!s_link_up && s_ip_seen) ? age_s(s_t_ip) : 0;
@@ -214,8 +231,13 @@ static void supervisor_task(void *ctx) {
 
         /* Rung 1: no GNSS bytes -> reset + reconfigure the UM980 */
         if (gnss_fault && s_recover_gnss && age_s(last_gnss_act) >= DEB_GNSS_S) {
-            ESP_LOGW(TAG, "no GNSS bytes %us -> UM980 reset+reconfig", (unsigned)gnss_silent);
-            uart_nmea("$PESP,RTK,SUPERVISOR,GNSS,%u", gnss_silent);
+            const char *reason = observation_fault ? "observations" : basepos_fault ? "basepos" : "receiver";
+            uint32_t obs_ms = ntrip_server_observations_silent_ms();
+            int32_t obs_seconds = obs_ms == UINT32_MAX ? -1 : (int32_t)(obs_ms / 1000U);
+            ESP_LOGW(TAG, "GNSS recovery reason=%s receiver_silent=%us observation_silent=%lds (-1=never)",
+                     reason, (unsigned)gnss_silent, (long)obs_seconds);
+            uart_nmea("$PESP,RTK,SUPERVISOR,GNSS,%u,%s,%ld",
+                      gnss_silent, reason, (long)obs_seconds);
             last_gnss_act = now_us();
             s_rec_gnss++;
             s_recover_gnss();

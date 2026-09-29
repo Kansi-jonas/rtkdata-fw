@@ -23,6 +23,7 @@
 #include "util.h"
 #include "uart.h"
 #include "supervisor.h"
+#include "gnss_site.h"
 
 static const char *TAG = "NTRIP_SERVER";
 
@@ -58,6 +59,7 @@ typedef struct {
     // request that arrives during DNS/handshake must survive until the drain
     // loop can honor it (review 2026-08-01).
     volatile uint32_t       reconnect_gen;
+    uint32_t                site_generation;
 
 } ntrip_instance_t;
 
@@ -74,6 +76,15 @@ static SemaphoreHandle_t g_instances_mutex              = NULL;
 static rtcm_parser_t     g_rtcm_parser;
 static ntrip_ring_t      g_frame_ring;
 static SemaphoreHandle_t g_ring_mutex = NULL;
+
+/* A hold invalidates queued frames; generation checks also reject a frame
+ * already copied into a socket task's partial-send buffer. */
+void ntrip_server_site_flush(void) {
+    if (!g_ring_mutex) return;
+    xSemaphoreTake(g_ring_mutex, portMAX_DELAY);
+    for (unsigned i = 0; i < RTCM_RING_SLOTS; i++) g_frame_ring.slot[i].len = 0;
+    xSemaphoreGive(g_ring_mutex);
+}
 
 static void ring_lock_hook(void *ctx)   { xSemaphoreTake((SemaphoreHandle_t)ctx, portMAX_DELAY); }
 static void ring_unlock_hook(void *ctx) { xSemaphoreGive((SemaphoreHandle_t)ctx); }
@@ -464,6 +475,11 @@ static int ntrip_server_sock_send(void *ctx, const uint8_t *buf, size_t len, int
 {
     ntrip_instance_t *inst = (ntrip_instance_t *)ctx;
 
+    if (!gnss_site_upload_allowed() ||
+        inst->site_generation != gnss_site_upload_generation()) {
+        *out_errno = ECANCELED;
+        return -1;
+    }
     int n = send(inst->sock, buf, len, 0);
 
     if (n > 0) {
@@ -614,6 +630,8 @@ static void ntrip_server_task(void *ctx){
         uint16_t port = 2101;
 
         ntrip_server_wait_for_start(inst);
+        while (!gnss_site_upload_allowed()) vTaskDelay(pdMS_TO_TICKS(200));
+        inst->site_generation = gnss_site_upload_generation();
 
         ntrip_server_load_config_from_storage(inst, key, sizeof(key), &host, &port, &pwd, &mp);
 
@@ -718,7 +736,8 @@ static void ntrip_server_task(void *ctx){
         bool made_progress = false;
         uint32_t last_probe_ms = ntrip_now_ms();
 
-        while (inst->reconnect_gen == conn_gen) {
+        while (inst->reconnect_gen == conn_gen && gnss_site_upload_allowed() &&
+               inst->site_generation == gnss_site_upload_generation()) {
 
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(NTRIP_DRAIN_WAIT_MS));
 
@@ -823,6 +842,10 @@ static uint32_t s_msg_last_ms[NTRIP_REQUIRED_MSG_COUNT];
 static uint32_t s_msg_epoch[NTRIP_REQUIRED_MSG_COUNT];   // 0 = never seen
 static volatile uint32_t s_epoch = 1;                    // current receiver epoch
 static volatile uint32_t s_epoch_started_ms = 0;         // when it began
+/* Parser history belongs only to UART; publish its progress timestamp with
+ * the receiver epoch so reset invalidates old observation evidence at once. */
+static rtcm_observation_monitor_t s_observations;
+static uint32_t s_observation_last_ms, s_observation_epoch;
 
 // A receiver reset starts a NEW epoch: whatever it emitted before proves
 // nothing about what it emits now. Without this, 30 s-budget types (1005,
@@ -891,10 +914,36 @@ void ntrip_server_msg_freshness(ntrip_msg_freshness_t *out) {
     if (s_epoch != epoch) out->all_fresh = false;
 }
 
+typedef struct {
+    uint32_t site_generation;
+    uint32_t receiver_epoch;
+} ntrip_ingest_context_t;
+
+static bool ntrip_site_ring_guard(void *ctx) {
+    return gnss_site_upload_allowed() &&
+        ((const ntrip_ingest_context_t *)ctx)->site_generation == gnss_site_upload_generation();
+}
+
+uint32_t ntrip_server_observations_silent_ms(void) {
+    uint32_t epoch = s_epoch;
+    uint32_t tag = __atomic_load_n(&s_observation_epoch, __ATOMIC_ACQUIRE);
+    uint32_t last = __atomic_load_n(&s_observation_last_ms, __ATOMIC_RELAXED);
+    /* Epoch identity is captured before UART parsing. Signed uptime ordering
+     * fails after 24.9 days; unsigned epoch-age comparisons also fail at 49.7. */
+    if (tag != epoch || __atomic_load_n(&s_observation_epoch, __ATOMIC_ACQUIRE) != tag ||
+        s_epoch != epoch)
+        return UINT32_MAX;
+    return (uint32_t)(ntrip_now_ms() - last);
+}
+
 static void ntrip_server_on_frame(void *ctx, const uint8_t *frame, uint16_t len,
     uint32_t now) {
 
-    (void)ctx;
+    uint32_t observation_epoch = ((const ntrip_ingest_context_t *)ctx)->receiver_epoch;
+    if (rtcm_observation_note(&s_observations, frame, len, now)) {
+        __atomic_store_n(&s_observation_last_ms, now, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_observation_epoch, observation_epoch, __ATOMIC_RELEASE);
+    }
 
     // Message-type bookkeeping for the required-set health contract. The type
     // is the first 12 bits of the payload (frame[3..4]).
@@ -918,7 +967,7 @@ static void ntrip_server_on_frame(void *ctx, const uint8_t *frame, uint16_t len,
     // customer's manual power cycle.
     supervisor_note_gnss_rx();
 
-    ntrip_ring_push(&g_frame_ring, frame, len, now);
+    ntrip_ring_push_guarded(&g_frame_ring, frame, len, now, ntrip_site_ring_guard, ctx);
 }
 
 // Called SYNCHRONOUSLY from uart_task for every UART chunk. This is the whole
@@ -931,19 +980,29 @@ static void ntrip_server_on_frame(void *ctx, const uint8_t *frame, uint16_t len,
 void ntrip_server_ingest_uart(const uint8_t *data, size_t len) {
 
     if (!g_ring_mutex || !data || len == 0) return;   // not initialized yet
+    static uint32_t parser_site_generation;
+    static uint32_t parser_receiver_epoch;
+    ntrip_ingest_context_t capture = {gnss_site_upload_generation(), s_epoch};
+    if (parser_site_generation != capture.site_generation) {
+        /* Keep cumulative health counters, discard only a partial old frame. */
+        g_rtcm_parser.have = g_rtcm_parser.need = 0;
+        parser_site_generation = capture.site_generation;
+    }
 
     // A receiver reset happened: drop the half-parsed frame from the old
     // epoch so its tail cannot be spliced onto post-reset bytes. Done HERE
     // because this task owns the parser.
-    if (s_ingest_reset_req) {
+    if (s_ingest_reset_req || parser_receiver_epoch != capture.receiver_epoch) {
         s_ingest_reset_req = false;
         rtcm_parser_init(&g_rtcm_parser);
+        rtcm_observation_init(&s_observations);
+        parser_receiver_epoch = capture.receiver_epoch;
     }
 
     uint32_t frames_before = g_frame_ring.next_seq;   // sole writer: this task
 
     rtcm_parser_feed(&g_rtcm_parser, data, len,
-                     ntrip_now_ms(), ntrip_server_on_frame, NULL);
+                     ntrip_now_ms(), ntrip_server_on_frame, &capture);
 
     // DATA_READY / keep-alive / wake-ups are driven by complete valid frames,
     // not by raw bytes: garbage must neither hold a mountpoint open nor wake

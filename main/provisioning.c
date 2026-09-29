@@ -15,6 +15,7 @@
  * License: GPLv3 (see LICENSE).
  */
 #include <stdbool.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -61,12 +62,13 @@ static char  s_token[96]     = {0};
 static char  s_enroll_key[80] = {0};   // per-device 64-hex enroll key from NVS
 static uint8_t s_key_ver      = 1;     // which master version derived it
 static int   s_poll_s        = DEFAULT_POLL_S;
-static bool  s_fixed_base_set = false; // log-edge only; idempotence lives in gnss_set_fixed_base
 
 /* last status (for /rtk/status), guarded by a mutex */
 static SemaphoreHandle_t s_mtx;
 static struct {
     char     state[16];
+    char     site_phase[20];
+    char     pos_phase[20];
     int      progress_pct;
     int      matures_in_s;
     char     station_id[40];
@@ -295,15 +297,53 @@ static bool enroll(void) {
 
 /* --------------------------------------------------------------- heartbeat */
 
+static bool json_integer(cJSON *object, const char *key, double min, double max,
+                          int64_t *value) {
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble) ||
+        trunc(item->valuedouble) != item->valuedouble ||
+        item->valuedouble < min || item->valuedouble > max) return false;
+    *value = (int64_t)item->valuedouble;
+    return true;
+}
+
+static bool parse_site_control(cJSON *root, gnss_site_control_t *out) {
+    cJSON *object = cJSON_GetObjectItemCaseSensitive(root, "site_control");
+    cJSON *mode = cJSON_GetObjectItemCaseSensitive(object, "mode");
+    cJSON *allow = cJSON_GetObjectItemCaseSensitive(object, "allow_upload");
+    int64_t version, boot, revision, lat = 0, lon = 0, height = 0;
+    if (!cJSON_IsObject(object) || !cJSON_IsString(mode) || !cJSON_IsBool(allow) ||
+        !json_integer(object, "v", 1, 1, &version) ||
+        !json_integer(object, "boot_id", 1, UINT32_MAX, &boot) ||
+        !json_integer(object, "revision", 0, UINT32_MAX, &revision)) return false;
+    gnss_site_mode_t kind = !strcmp(mode->valuestring, "hold") ? GNSS_SITE_HOLD :
+        !strcmp(mode->valuestring, "survey") ? GNSS_SITE_SURVEY :
+        !strcmp(mode->valuestring, "fixed") ? GNSS_SITE_FIXED : GNSS_SITE_UNKNOWN;
+    if (kind == GNSS_SITE_UNKNOWN || (kind == GNSS_SITE_HOLD && cJSON_IsTrue(allow)))
+        return false;
+    if (kind == GNSS_SITE_FIXED &&
+        (!json_integer(object, "lat_e9", -90000000000.0, 90000000000.0, &lat) ||
+         !json_integer(object, "lon_e9", -180000000000.0, 180000000000.0, &lon) ||
+         !json_integer(object, "h_mm", -500000, 9000000, &height))) return false;
+    *out = (gnss_site_control_t){.boot_id = (uint32_t)boot,
+        .revision = (uint32_t)revision, .mode = kind, .allow_upload = cJSON_IsTrue(allow),
+        .lat_e9 = lat, .lon_e9 = lon, .h_mm = (int32_t)height};
+    return true;
+}
+
 static void apply_reply(cJSON *root) {
     xSemaphoreTake(s_mtx, portMAX_DELAY);
 
     cJSON *state = cJSON_GetObjectItem(root, "state");
     if (cJSON_IsString(state)) strlcpy(s_st.state, state->valuestring, sizeof(s_st.state));
+    cJSON *site_phase = cJSON_GetObjectItem(root, "site_phase");
+    if (cJSON_IsString(site_phase))
+        strlcpy(s_st.site_phase, site_phase->valuestring, sizeof(s_st.site_phase));
     cJSON *prog = cJSON_GetObjectItem(root, "progress_pct");
     if (cJSON_IsNumber(prog)) s_st.progress_pct = prog->valueint;
     cJSON *mat = cJSON_GetObjectItem(root, "matures_in_s");
     if (cJSON_IsNumber(mat)) s_st.matures_in_s = mat->valueint;
+    else s_st.matures_in_s = -1;
     cJSON *sid = cJSON_GetObjectItem(root, "station_id");
     if (cJSON_IsString(sid)) strlcpy(s_st.station_id, sid->valuestring, sizeof(s_st.station_id));
 
@@ -316,9 +356,11 @@ static void apply_reply(cJSON *root) {
     }
 
     cJSON *pos = cJSON_GetObjectItem(root, "position");
-    bool want_fix = false;
-    double lat = 0, lon = 0, h = 0;
+    s_st.pos_valid = false;
     if (cJSON_IsObject(pos)) {
+        cJSON *phase = cJSON_GetObjectItem(pos, "phase");
+        if (cJSON_IsString(phase))
+            strlcpy(s_st.pos_phase, phase->valuestring, sizeof(s_st.pos_phase));
         cJSON *v = cJSON_GetObjectItem(pos, "valid");
         cJSON *la = cJSON_GetObjectItem(pos, "lat");
         cJSON *lo = cJSON_GetObjectItem(pos, "lon");
@@ -329,34 +371,20 @@ static void apply_reply(cJSON *root) {
         if (cJSON_IsBool(v) && cJSON_IsTrue(v) && cJSON_IsNumber(la) &&
             cJSON_IsNumber(lo) && cJSON_IsNumber(he)) {
             s_st.pos_valid = true;
-            s_st.pos_lat = lat = la->valuedouble;
-            s_st.pos_lon = lon = lo->valuedouble;
-            s_st.pos_h   = h   = he->valuedouble;
-            want_fix = true;
+            s_st.pos_lat = la->valuedouble;
+            s_st.pos_lon = lo->valuedouble;
+            s_st.pos_h   = he->valuedouble;
         } else if (cJSON_IsBool(v) && cJSON_IsTrue(v)) {
             ESP_LOGW(TAG, "IE position lacks numeric lat/lon/h; not applying");
         }
     }
     xSemaphoreGive(s_mtx);
 
-    /* IE returned a converged position -> hand it to the GNSS module (outside
-     * the lock) on EVERY reply. The module is idempotent (skips an unchanged
-     * coordinate the receiver already ACKed, with a bounded retry cooldown),
-     * so this is cheap in steady state. The old once-per-boot latch here
-     * blocked exactly the two repairs that matter: re-applying after a NACKed
-     * boot restore, and adopting a CORRECTED IE coordinate before the next
-     * reboot (v1.1.2 audit 2026-08-01). s_fixed_base_set is now only the
-     * log-edge detector. */
-    if (want_fix) {
-        if (gnss_set_fixed_base(lat, lon, h)) {
-            if (!s_fixed_base_set) {
-                s_fixed_base_set = true;
-                ESP_LOGI(TAG, "fixed base applied from IE position");
-            }
-        } else {
-            s_fixed_base_set = false;   // re-log when the next apply succeeds
-        }
-    }
+    /* Position is display data. Only the boot-bound versioned command can
+     * change receiver state or authorize any correction upload. */
+    gnss_site_control_t control;
+    if (parse_site_control(root, &control) && !gnss_site_apply_control(&control))
+        ESP_LOGW(TAG, "site command not applied; upload remains governed by local gate");
 
     /* IE re-issued credentials (re-host, go-live mountpoint, ...) */
     cJSON *delta = cJSON_GetObjectItem(root, "config_delta");
@@ -380,16 +408,41 @@ static void apply_reply(cJSON *root) {
     }
 }
 
+static void handle_heartbeat_auth_failure(int status) {
+    if (status != 401 && status != 403 && status != 404) return;
+    gnss_site_status_t site;
+    gnss_site_status(&site);
+    gnss_site_control_t hold = {.boot_id = site.boot_id, .mode = GNSS_SITE_HOLD};
+    gnss_site_apply_control(&hold);
+    if (status == 403) return; /* disabled/quarantined is not an enrollment reset */
+    /* A removed registry record or invalid token can be repaired with the
+     * separately provisioned per-device enrollment key. Keep site intent,
+     * revision and physical anchor; enrollment cannot authorize uploading. */
+    s_token[0] = '\0';
+    config_set_str(KEY_RTK_STATION_TOK, "");
+    config_set_u8(KEY_RTK_STATE, RTK_UNCLAIMED);
+    config_commit();
+    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    s_st.enrolled = false;
+    s_st.pos_valid = false;
+    strlcpy(s_st.state, "provisioning", sizeof(s_st.state));
+    strlcpy(s_st.site_phase, "checking", sizeof(s_st.site_phase));
+    xSemaphoreGive(s_mtx);
+}
+
 static void heartbeat(void) {
     supervisor_health_t h;
     supervisor_health(&h);
 
     uint32_t nonce = esp_random();
-    char canon[160];
-    // The HMAC canon stays device_id|uptime|nonce ON PURPOSE: extending the
-    // health payload must never invalidate old-IE/new-FW or new-IE/old-FW
-    // pairings mid-rollout.
-    snprintf(canon, sizeof(canon), "%s|%u|%u", s_device_id, (unsigned)h.uptime_s, (unsigned)nonce);
+    gnss_site_status_t site;
+    gnss_site_status(&site);
+    static char site_json[768], site_canon[512], canon[640];
+    if (gnss_site_json(site_json, sizeof(site_json), &site) < 0 ||
+        gnss_site_canonical(site_canon, sizeof(site_canon), &site) < 0) return;
+    int canon_len = snprintf(canon, sizeof(canon), "%s|%u|%u|site-v1|%s",
+        s_device_id, (unsigned)h.uptime_s, (unsigned)nonce, site_canon);
+    if (canon_len <= 0 || (size_t)canon_len >= sizeof(canon)) return;
     char hmac[65];
     // Heartbeat is keyed with the per-station token issued at enroll; it only
     // runs once state >= PROVISIONING, so s_token is always set here.
@@ -412,21 +465,23 @@ static void heartbeat(void) {
     }
 
     // Single writer (this task); static keeps ~1.4 KB off the task stack.
-    static char body[1536];
+    static char body[2560];
     int n = snprintf(body, sizeof(body),
         "{\"device_id\":\"%s\",\"station_token\":\"%s\",\"uptime\":%u,"
         "\"health\":{\"fw\":\"%s\","
         "\"gnss_silent_s\":%u,\"caster_silent_s\":%u,\"ip_down_s\":%u,"
         "\"gnss_ok\":%s,\"caster_ok\":%s,\"link_ok\":%s,"
+        "\"obs_expected\":%s,\"obs_silent_s\":%ld,"
         "\"rec_gnss\":%u,\"rec_caster\":%u,\"rec_wifi\":%u,\"reboots\":%u%s%s},"
-        "\"nonce\":%u,\"hmac\":\"%s\"}",
+        "\"site\":%s,\"nonce\":%u,\"hmac\":\"%s\"}",
         s_device_id, s_token, (unsigned)h.uptime_s,
         FW_VERSION,
         (unsigned)h.gnss_silent_s, (unsigned)h.caster_silent_s, (unsigned)h.ip_down_s,
         h.gnss_ok ? "true" : "false", h.caster_ok ? "true" : "false", h.link_ok ? "true" : "false",
+        h.obs_expected ? "true" : "false", (long)h.obs_silent_s,
         (unsigned)h.recoveries_gnss, (unsigned)h.recoveries_caster, (unsigned)h.recoveries_wifi,
         (unsigned)h.reboots_supervised, tx_sep, tx_json,
-        (unsigned)nonce, hmac);
+        site_json, (unsigned)nonce, hmac);
 
     if (n <= 0 || (size_t)n >= sizeof(body)) {
         // A truncated body would fail the IE's JSON parse at best and poison
@@ -446,6 +501,7 @@ static void heartbeat(void) {
         if (root) { apply_reply(root); cJSON_Delete(root); }
     } else {
         ESP_LOGW(TAG, "heartbeat failed (status=%d)", status);
+        handle_heartbeat_auth_failure(status);
     }
     free(resp);
 }
@@ -458,6 +514,7 @@ static void provisioning_task(void *ctx) {
     load_identity();
 
     uint8_t state = config_get_u8(CONF_ITEM(KEY_RTK_STATE));
+    unsigned enroll_retry_s = 15;
 
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     strlcpy(s_st.state, state >= RTK_MATURING ? "maturing" : "provisioning", sizeof(s_st.state));
@@ -467,12 +524,15 @@ static void provisioning_task(void *ctx) {
     for (;;) {
         if (state < RTK_PROVISIONING) {
             if (enroll()) {
+                enroll_retry_s = 15;
                 state = RTK_PROVISIONING;
                 xSemaphoreTake(s_mtx, portMAX_DELAY);
                 s_st.enrolled = true;
                 xSemaphoreGive(s_mtx);
             } else {
-                vTaskDelay(pdMS_TO_TICKS(15000));   // retry enroll
+                vTaskDelay(pdMS_TO_TICKS(enroll_retry_s * 1000));
+                if (enroll_retry_s < 300) enroll_retry_s *= 2;
+                if (enroll_retry_s > 300) enroll_retry_s = 300;
                 continue;
             }
         } else {
@@ -498,7 +558,9 @@ void provisioning_fill_status(cJSON *root) {
     xSemaphoreTake(s_mtx, portMAX_DELAY);
     cJSON_AddStringToObject(root, "state", s_st.state[0] ? s_st.state : "provisioning");
     cJSON_AddNumberToObject(root, "progress_pct", s_st.progress_pct);
-    cJSON_AddNumberToObject(root, "matures_in_s", s_st.matures_in_s);
+    if (s_st.matures_in_s >= 0) cJSON_AddNumberToObject(root, "matures_in_s", s_st.matures_in_s);
+    else cJSON_AddNullToObject(root, "matures_in_s");
+    cJSON_AddStringToObject(root, "site_phase", s_st.site_phase);
     if (s_st.station_id[0]) cJSON_AddStringToObject(root, "station_id", s_st.station_id);
     cJSON_AddBoolToObject(root, "enrolled", s_st.enrolled);
 
@@ -506,14 +568,21 @@ void provisioning_fill_status(cJSON *root) {
     cJSON_AddNumberToObject(q, "sats", s_st.q_sats);
     cJSON_AddNumberToObject(q, "fix", s_st.q_fix);
 
+    cJSON *p = cJSON_AddObjectToObject(root, "position");
+    cJSON_AddBoolToObject(p, "valid", s_st.pos_valid);
+    cJSON_AddStringToObject(p, "phase", s_st.pos_phase);
     if (s_st.pos_valid) {
-        cJSON *p = cJSON_AddObjectToObject(root, "position");
-        cJSON_AddBoolToObject(p, "valid", true);
         cJSON_AddNumberToObject(p, "lat", s_st.pos_lat);
         cJSON_AddNumberToObject(p, "lon", s_st.pos_lon);
         cJSON_AddNumberToObject(p, "h", s_st.pos_h);
     }
     xSemaphoreGive(s_mtx);
+    gnss_site_status_t site;
+    gnss_site_status(&site);
+    cJSON *shown_phase = cJSON_GetObjectItem(root, "site_phase");
+    if (!site.upload_allowed && cJSON_IsString(shown_phase) &&
+        (!shown_phase->valuestring[0] || !strcmp(shown_phase->valuestring, "active")))
+        cJSON_SetValuestring(cJSON_GetObjectItem(root, "site_phase"), "checking");
 
     /* local liveness the device is sure of */
     cJSON_AddBoolToObject(root, "data_ok", h.caster_ok);
@@ -525,6 +594,8 @@ void provisioning_fill_status(cJSON *root) {
     cJSON_AddBoolToObject(sh, "gnss_ok", h.gnss_ok);
     cJSON_AddBoolToObject(sh, "caster_ok", h.caster_ok);
     cJSON_AddBoolToObject(sh, "link_ok", h.link_ok);
+    cJSON_AddBoolToObject(sh, "obs_expected", h.obs_expected);
+    cJSON_AddNumberToObject(sh, "obs_silent_s", h.obs_silent_s);
     cJSON_AddNumberToObject(sh, "rec_gnss", h.recoveries_gnss);
     cJSON_AddNumberToObject(sh, "rec_caster", h.recoveries_caster);
     cJSON_AddNumberToObject(sh, "rec_wifi", h.recoveries_wifi);

@@ -19,6 +19,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_timer.h"
 #include "supervisor.h"
+#include "gnss_site.h"
 #include "interface/ntrip.h"
 #include "esp_partition.h"
 #include "nvs.h"
@@ -1149,7 +1150,15 @@ void ota_mark_valid_task(void *pvParameter) {
             // confirmation impossible forever.
             ntrip_msg_freshness_t fresh_final;
             ntrip_server_msg_freshness(&fresh_final);
-            bool local_fault = !fresh_final.all_fresh;
+            gnss_site_status_t site;
+            gnss_site_status(&site);
+            /* A verified antenna far from the restored fixed coordinate can
+             * intentionally suppress UM980 RTCM until IE has fenced the old
+             * site. Do not downgrade to firmware without relocation fencing
+             * because that deliberate hold looks like missing RTCM. This is
+             * only a wait exception, never an OTA confirmation. */
+            bool verified_site_hold = !site.upload_allowed && site.valid;
+            bool local_fault = !fresh_final.all_fresh && !verified_site_hold;
 
             if (!local_fault) {
                 if (!outage_logged) {

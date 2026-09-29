@@ -23,6 +23,8 @@ typedef struct {
     uint32_t gnss_silent_s;    // seconds since last GNSS byte (0 = fresh)
     uint32_t caster_silent_s;  // seconds since last successful caster send
     uint32_t ip_down_s;        // seconds STA has had no IP (0 = up)
+    int32_t  obs_silent_s;     // seconds since usable advancing MSM7; -1 = never
+    bool     obs_expected;    // actual MODE warmup complete and upload permitted
     bool     gnss_ok;
     bool     caster_ok;
     bool     link_ok;

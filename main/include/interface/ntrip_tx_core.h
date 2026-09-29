@@ -66,6 +66,20 @@ void rtcm_parser_init(rtcm_parser_t *p);
 void rtcm_parser_feed(rtcm_parser_t *p, const uint8_t *data, size_t len,
                       uint32_t now_ms, rtcm_frame_cb cb, void *cb_ctx);
 
+/* Observation progress is separate from receiver/logging liveness. Metadata,
+ * empty MSM announcements and repeated observation epochs cannot refresh it. */
+typedef struct {
+    uint32_t epoch[6];
+    uint8_t seen;
+    bool have_progress;
+    uint32_t last_progress_ms;
+} rtcm_observation_monitor_t;
+void rtcm_observation_init(rtcm_observation_monitor_t *monitor);
+bool rtcm_observation_note(rtcm_observation_monitor_t *monitor,
+                           const uint8_t *frame, size_t len, uint32_t now_ms);
+uint32_t rtcm_observation_silent_ms(const rtcm_observation_monitor_t *monitor,
+                                   uint32_t now_ms);
+
 /* ------------------------------------------------------------------ Ring -- */
 
 typedef struct {
@@ -97,6 +111,11 @@ void ntrip_ring_init(ntrip_ring_t *r, ntrip_ring_lock_fn lock,
  * ring is full, lagging readers detect the loss via seq. */
 void ntrip_ring_push(ntrip_ring_t *r, const uint8_t *frame, uint16_t len,
                      uint32_t now_ms);
+/* Guard runs under the ring lock, atomically with enqueue. A site generation
+ * change/hold cannot race a completed flush and enqueue an older frame. */
+typedef bool (*ntrip_ring_guard_fn)(void *ctx);
+bool ntrip_ring_push_guarded(ntrip_ring_t *r, const uint8_t *frame, uint16_t len,
+                             uint32_t now_ms, ntrip_ring_guard_fn guard, void *ctx);
 
 /* -------------------------------------------------------------- Sender ---- */
 

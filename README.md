@@ -37,9 +37,14 @@ The web UI ships in the `www` SPIFFS partition (see `partitions.csv`). Build the
 
 1. Power the station. It opens a Wi-Fi AP named `RTKdata_XXXXXX`.
 2. Connect and open `http://192.168.4.1` -> the onboarding UI.
-3. Pick your Wi-Fi, enter the password. The station joins your network and enrolls with RTKdata.
-4. Watch the 48 h maturing ring. The station goes live automatically once its position is locked and
-   its data is clean.
+3. Pick your 2.4 GHz Wi-Fi and enter its password. The station joins your network and enrolls with RTKdata.
+4. Keep the antenna stationary with a clear view of the sky, and leave power and internet connected.
+   The station checks its location, measures its precise position and goes live after network checks
+   pass. Completion time depends on reception and processing.
+
+The local 1.1.10 candidate adds independent location checks and automatic relocation control.
+It requires coordinated IE/Lighthouse support and hardware acceptance before customer rollout.
+See [implementation and validation](docs/AUTOMATIC_SITE_LIFECYCLE_2026-09-19.md).
 
 ## OTA (independent channel)
 
