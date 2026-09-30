@@ -10,6 +10,8 @@
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+#include "esp_app_format.h"
 #include "esp_system.h"
 #include "esp_spiffs.h"
 #include "config.h"
@@ -259,6 +261,7 @@ esp_err_t ota_update_firmware(const char *url) {
                         int     data_read;
                         char    buffer[1024];
                         bool    downloadBreak = false;
+                        bool    identity_checked = false;
 
                         //download the firmware
                         while ((data_read = esp_http_client_read(http_client, buffer, sizeof(buffer))) > 0) {
@@ -280,6 +283,36 @@ esp_err_t ota_update_firmware(const char *url) {
                             }
 
                             total_file_write += data_read;
+
+                            // Identity gate, once the app descriptor is on
+                            // flash: an image built for the other board (other
+                            // project name) must never become bootable. The
+                            // Wi-Fi fleet and the Ethernet board share this
+                            // code but not pins; the channels are separate
+                            // paths, this catches a manifest pointing at the
+                            // wrong .bin (2026-09-29).
+                            if (!identity_checked &&
+                                total_file_write >= (int)(sizeof(esp_image_header_t) +
+                                                          sizeof(esp_image_segment_header_t) +
+                                                          sizeof(esp_app_desc_t))) {
+
+                                identity_checked = true;
+
+                                esp_app_desc_t incoming;
+                                const esp_app_desc_t *running = esp_app_get_description();
+
+                                if (esp_ota_get_partition_description(update_partition, &incoming) != ESP_OK ||
+                                    strncmp(incoming.project_name, running->project_name,
+                                            sizeof(incoming.project_name)) != 0) {
+
+                                    incoming.project_name[sizeof(incoming.project_name) - 1] = '\0';
+                                    ESP_LOGE(TAG, "OTA image is for project '%s', this is '%s' -> refused",
+                                             incoming.project_name, running->project_name);
+                                    uart_nmea("$PESP,OTA,WRONGIMAGE,%s", incoming.project_name);
+                                    downloadBreak = true;
+                                    break;
+                                }
+                            }
 
                             int progress = 0;
 

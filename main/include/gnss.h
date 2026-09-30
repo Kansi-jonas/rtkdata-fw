@@ -38,4 +38,8 @@ void gnss_ingest_uart(const uint8_t *data, size_t len);
 // recovery action (fires when no GNSS bytes have arrived for a while).
 void gnss_recover(void);
 
+// Reconfigure after the receiver was reset from OUTSIDE the firmware (the
+// K_EVK_V4 button resets the UM980 in hardware on every press).
+void gnss_after_external_reset(void);
+
 #endif // RTKDATA_GNSS_H

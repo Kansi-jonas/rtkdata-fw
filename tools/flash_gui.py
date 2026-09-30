@@ -18,6 +18,7 @@ Prereqs: pip install esptool esp-idf-nvs-partition-gen ; a dist-ship-*/ folder
 (the released binaries) next to the repo root, or build/ from idf.py build.
 """
 import os
+import re
 import sys
 import glob
 import queue
@@ -37,10 +38,17 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Flat ship-binary layout (dist-ship-*/). Offsets match partitions.csv /
 # flash_device.py. A nested build/ dir is also supported (see resolve_parts).
+#
+# Two boards, two images: the OnoLink Wi-Fi fleet (1.x, app rtkdata-fw.bin) and
+# the K_EVK_V4 Ethernet board (2.x, app rtkdata-fw-eth.bin, folders
+# dist-ship-eth-*/ or build_eth/). The app name in the folder decides which
+# board an image is for; same partition table, same offsets.
+APP_WIFI = "rtkdata-fw.bin"
+APP_ETH = "rtkdata-fw-eth.bin"
 SHIP_PARTS = [
     ("0x1000", "bootloader.bin"),
     ("0x8000", "partition-table.bin"),
-    ("0x10000", "rtkdata-fw.bin"),
+    ("0x10000", "{app}"),
     ("0x210000", "www.bin"),
     ("0x410000", "spiffs.bin"),
     ("0x640000", "ota_data_initial.bin"),
@@ -48,7 +56,7 @@ SHIP_PARTS = [
 BUILD_PARTS = [
     ("0x1000", "bootloader/bootloader.bin"),
     ("0x8000", "partition_table/partition-table.bin"),
-    ("0x10000", "rtkdata-fw.bin"),
+    ("0x10000", "{app}"),
     ("0x210000", "www.bin"),
     ("0x410000", "spiffs.bin"),
     ("0x640000", "ota_data_initial.bin"),
@@ -73,20 +81,45 @@ def list_ports():
         return []
 
 
+def _version_key(path):
+    """Sort key by semantic version: dist-ship-1.1.10 after dist-ship-1.1.9.
+
+    A plain string sort put 1.1.9 above 1.1.10 and preselected the wrong
+    (older, never published) image."""
+    m = re.search(r"(\d+(?:\.\d+)*)$", os.path.basename(path))
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
 def find_build_dirs():
-    """Newest-first list of flashable source dirs (dist-ship-* then build/)."""
-    dirs = sorted(glob.glob(os.path.join(REPO, "dist-ship-*")), reverse=True)
-    b = os.path.join(REPO, "build")
-    if os.path.isdir(b):
-        dirs.append(b)
+    """Flashable source dirs: Ethernet ship builds, then Wi-Fi ship builds,
+    each newest first, then the local build dirs."""
+    eth = sorted(glob.glob(os.path.join(REPO, "dist-ship-eth-*")), key=_version_key, reverse=True)
+    wifi = sorted((d for d in glob.glob(os.path.join(REPO, "dist-ship-*"))
+                   if not os.path.basename(d).startswith("dist-ship-eth-")),
+                  key=_version_key, reverse=True)
+    dirs = eth + wifi
+    for name in ("build_eth", "build"):
+        b = os.path.join(REPO, name)
+        if os.path.isdir(b):
+            dirs.append(b)
     return dirs
+
+
+def image_board(src_dir):
+    """'eth' or 'wifi', from the app binary the folder carries."""
+    if os.path.exists(os.path.join(src_dir, APP_ETH)):
+        return "eth"
+    return "wifi"
 
 
 def resolve_parts(src_dir):
     """Return [(offset, abspath), ...] for the chosen source dir, or raise."""
-    layout = BUILD_PARTS if os.path.basename(src_dir) == "build" else SHIP_PARTS
+    nested = os.path.basename(src_dir) in ("build", "build_eth")
+    layout = BUILD_PARTS if nested else SHIP_PARTS
+    app = APP_ETH if image_board(src_dir) == "eth" else APP_WIFI
     parts = []
     for off, rel in layout:
+        rel = rel.format(app=app)
         p = os.path.join(src_dir, rel)
         if not os.path.exists(p):
             if os.path.basename(rel) in OPTIONAL_PARTS:
@@ -191,11 +224,40 @@ class FlasherGUI:
         if proc.returncode != 0:
             raise RuntimeError(f"esptool exited {proc.returncode}")
 
+    def _check_board(self, port, board):
+        """Refuse to put one board's image on the other board.
+
+        The K_EVK_V4 module (ESP32-WROOM-32UE-N16R2) has PSRAM inside the chip
+        package (ESP32-D0WDR2-V3); esptool reports it as "Embedded PSRAM". The
+        Wi-Fi image would drive RMII lines as LEDs there, and the Ethernet image
+        would drive the OnoLink LED and reset pins as RMII."""
+        out = subprocess.run([sys.executable, "-m", "esptool", "--port", port, "chip-id"],
+                             capture_output=True, text=True).stdout
+        # esptool 4.x prints "Chip is ESP32-D0WDR2-V3 (...)", 5.x "Chip type:  ESP32-D0WDR2-V3 (...)"
+        chip = re.search(r"(?:Chip is|Chip type:)\s*(.+)", out)
+        self.emit(f"      chip: {chip.group(1).strip() if chip else 'unknown'}")
+        if not chip:
+            self.emit("      WARNING: could not read the chip type, board check skipped")
+            return
+        psram = ("Embedded PSRAM" in out) or ("D0WDR2" in chip.group(1))
+        if board == "eth" and not psram:
+            raise RuntimeError("this is an ETHERNET image (K_EVK_V4) but the chip has no "
+                               "embedded PSRAM: looks like an OnoLink Wi-Fi board. Pick a "
+                               "dist-ship-1.x folder.")
+        if board == "wifi" and psram:
+            raise RuntimeError("this is a Wi-Fi image (OnoLink, 1.x) but the chip has embedded "
+                               "PSRAM: looks like a K_EVK_V4 Ethernet board. Pick a "
+                               "dist-ship-eth-* or build_eth folder.")
+
     def _flash_worker(self, port, build_name, baud):
         try:
             src = os.path.join(REPO, build_name)
             parts = resolve_parts(src)
+            board = image_board(src)
             master = os.environ.get("RTK_ENROLL_MASTER")
+
+            self.emit(f"[0/4] image is for the {'K_EVK_V4 Ethernet' if board == 'eth' else 'OnoLink Wi-Fi'} board; checking the chip ...")
+            self._check_board(port, board)
 
             self.emit(f"[1/4] reading device MAC on {port} ...")
             mac = read_mac(port)
@@ -228,7 +290,11 @@ class FlasherGUI:
 
             self.emit("")
             self.emit("DONE. Power-cycle the device:")
-            self.emit(f"  - comes up as WiFi AP '{ap_ssid}' -> connect -> set site WiFi")
+            if board == "eth":
+                self.emit(f"  - plug the LAN cable: DHCP, hostname rtkdata-{chip[6:12].lower()} (no WiFi needed)")
+                self.emit(f"  - without cable: WiFi AP '{ap_ssid}' -> connect -> set site WiFi")
+            else:
+                self.emit(f"  - comes up as WiFi AP '{ap_ssid}' -> connect -> set site WiFi")
             self.emit("  - then enrolls automatically and appears on /dashboard/edge")
             self.emit(f"  - once active + matured, the einmessung autopilot surveys it (CSRS-PPP)")
             self.emit(f"  inventory: device_id=rtk-{chip}  mountpoint=RTK_{bareid}")

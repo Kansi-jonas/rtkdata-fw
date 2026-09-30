@@ -35,6 +35,9 @@
 #include <lwip/sockets.h>
 #include "web_server.h"
 #include "esp_timer.h" //makeItCompileable
+#include "board.h"
+#include "eth.h"
+#include "esp_mac.h"
 #include "update.h"
 #include "state.h"
 #include "provisioning.h"
@@ -965,6 +968,33 @@ static esp_err_t status_get_handler(httpd_req_t *req) {
             cJSON_AddStringToObject(sta, "ip6", ip);
         }
     }
+
+#if BOARD_HAS_ETH
+    {
+        eth_status_t es;
+        eth_status(&es);
+
+        cJSON *eth = cJSON_AddObjectToObject(root, "eth");
+        cJSON_AddBoolToObject(eth, "present", es.present);
+        cJSON_AddBoolToObject(eth, "link", es.link);
+        cJSON_AddBoolToObject(eth, "connected", es.has_ip);
+        cJSON_AddNumberToObject(eth, "speed", es.speed_mbps);
+        cJSON_AddBoolToObject(eth, "full_duplex", es.full_duplex);
+        cJSON_AddNumberToObject(eth, "link_ups", es.link_ups);
+        cJSON_AddNumberToObject(eth, "symbol_errors", es.symbol_errors);
+
+        char buf[40];
+        snprintf(buf, sizeof(buf), MACSTR, MAC2STR(es.mac));
+        cJSON_AddStringToObject(eth, "mac", buf);
+        if (es.has_ip) {
+            snprintf(buf, sizeof(buf), IPSTR, IP2STR(&es.ip4_addr));
+            cJSON_AddStringToObject(eth, "ip4", buf);
+            snprintf(buf, sizeof(buf), IPSTR, IP2STR(&es.gw4_addr));
+            cJSON_AddStringToObject(eth, "gw4", buf);
+        }
+        cJSON_AddBoolToObject(sta, "parked", sta_status.suspended);
+    }
+#endif
 
     // Which interface did THIS request arrive on: the captive SoftAP (setup)
     // or the LAN/STA side (dashboard)? The UI serves the onboarding wizard on

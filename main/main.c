@@ -43,10 +43,21 @@
 #include "provisioning.h"
 #include "update.h"
 #include "iot_button.h"
+#include "board.h"
+#include "eth.h"
+#include "esp_chip_info.h"
+#if CONFIG_SPIRAM
+#include "esp_psram.h"
+#endif
 
 
-#define BUTTON_GPIO GPIO_NUM_13
-#define BUTTON_DOWN 1
+#define BUTTON_GPIO BOARD_BUTTON_GPIO
+#define BUTTON_DOWN BOARD_BUTTON_PRESSED_LEVEL
+
+// Ethernet board: how long boot waits for a cable link before deciding the
+// unit is "unprovisioned" (no STA SSID, no cable) and opening the web server in
+// AP mode first. LAN8720 autonegotiation takes ~2-3 s after the PHY reset.
+#define ETH_BOOT_LINK_TIMEOUT_MS 5000
 
 // Bounded boot wait for the STA IP. If WiFi is wrong/down/out-of-range we stop
 // waiting after this and bring up the AP config server so the user can re-onboard.
@@ -55,6 +66,61 @@
 static const char *TAG = "MAIN";
 
 static char *reset_reason_name(esp_reset_reason_t reason);
+
+#if CONFIG_RTK_BOARD_K_EVK_V4
+
+// K_EVK_V4: GPIO34 is input-only with an external pull-up (R77), so it is a
+// plain input; iot_button would try to enable an internal pull it does not have.
+// Every press also resets the UM980 in hardware, so a short press means
+// "reconfigure the receiver" and a long hold (6 s) means factory reset.
+static void reset_button_task() {
+
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    if (gpio_config(&io) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize button");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "button was init.");
+
+    const int poll_ms = 100;
+    const int factory_reset_ms = 6000;
+    int held_ms = 0;
+
+    while (true) {
+
+        if (BUTTON_DOWN == gpio_get_level(BUTTON_GPIO)) {
+
+            held_ms += poll_ms;
+
+            if (held_ms >= factory_reset_ms) {
+                config_reset();
+                ota_note_planned_reboot();   // user action, not a crash
+                esp_restart();
+            }
+
+        } else {
+
+            if (held_ms > 0) {
+                ESP_LOGI(TAG, "button released after %d ms", held_ms);
+                gnss_after_external_reset();
+            }
+            held_ms = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(poll_ms));
+    }
+}
+
+#else
 
 static void reset_button_task() {
 
@@ -104,6 +170,8 @@ static void reset_button_task() {
     }
 
 }
+
+#endif
 
 static void sntp_time_set_handler(struct timeval *tv) {
     ESP_LOGI(TAG, "Synced time from SNTP");
@@ -167,6 +235,7 @@ void app_main()
     ESP_LOGI(TAG, "║ Compiled: %8s %-25s "                       "║", app_desc->time, app_desc->date);
     ESP_LOGI(TAG, "║ ELF SHA256: %-32s "                         "║", elf_buffer);
     ESP_LOGI(TAG, "║ ESP-IDF: %-35s "                            "║", app_desc->idf_ver);
+    ESP_LOGI(TAG, "║ Board: %-37s "                              "║", BOARD_NAME);
     ESP_LOGI(TAG, "╟──────────────────────────────────────────────╢");
     ESP_LOGI(TAG, "║ Reset reason: %-30s "                       "║", reset_reason_name(reset_reason));
     ESP_LOGI(TAG, "╟──────────────────────────────────────────────╢");
@@ -192,9 +261,27 @@ void app_main()
     }*/
 
 
+    {
+        esp_chip_info_t chip;
+        esp_chip_info(&chip);
+#if CONFIG_SPIRAM
+        size_t psram = esp_psram_is_initialized() ? esp_psram_get_size() : 0;
+#else
+        size_t psram = 0;
+#endif
+        ESP_LOGI(TAG, "chip rev v%d.%d, %d cores, PSRAM %u KB, free heap %u",
+                 chip.revision / 100, chip.revision % 100, chip.cores,
+                 (unsigned)(psram / 1024), (unsigned)esp_get_free_heap_size());
+        uart_nmea("$PESP,INIT,BOARD,%s,%u", BOARD_NAME, (unsigned)(psram / 1024));
+    }
+
     net_init();
 
     wifi_init();
+
+    // Ethernet board: the cable is the primary uplink. Failure (no RMII clock,
+    // no PHY) is logged and the unit carries on over Wi-Fi.
+    bool eth_ok = (eth_init() == ESP_OK);
 
     ota_update_init();          // SPIFFS mount (web server serves from it)
 
@@ -213,6 +300,12 @@ void app_main()
         config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_WIFI_STA_SSID), (void **)&ssid);
         sta_provisioned = (ssid && ssid[0]);
         free(ssid);
+    }
+    // A plugged cable is an uplink too: such a unit is on the provisioned path
+    // (OTA window first, web server after) even with no Wi-Fi configured.
+    if (!sta_provisioned && eth_ok && eth_wait_link(ETH_BOOT_LINK_TIMEOUT_MS)) {
+        ESP_LOGI(TAG, "no STA WiFi configured, but an Ethernet link is up");
+        sta_provisioned = true;
     }
     bool web_started = false;
     if (!sta_provisioned) {
@@ -259,9 +352,12 @@ void app_main()
     socket_client_init();
 
     // RTKdata: data-path health supervisor + zero-touch provisioning
-    supervisor_set_recovery(gnss_recover, ntrip_server_reconnect_all, wifi_driver_restart);
+    // Link rung: eth_link_recover() is wifi_driver_restart() on the Wi-Fi
+    // board, and DHCP-restart-or-Wi-Fi-fallback on the Ethernet board.
+    supervisor_set_recovery(gnss_recover, ntrip_server_reconnect_all, eth_link_recover);
     supervisor_init();
     provisioning_init();
+    status_led_board_start();
 
     check_count_webhandler();
 

@@ -32,6 +32,10 @@ status_led_handle_t status_led_add(uint32_t rgba, status_led_flashing_mode_t fla
 void status_led_remove(status_led_handle_t color);
 void status_led_init();
 
+// Ethernet board: start the task that derives the two LEDs from supervisor and
+// uplink state. Call once the supervisor runs. No-op on the RGB (OnoLink) board.
+void status_led_board_start(void);
+
 // wifi leds
 void rssi_led_set(uint8_t value);
 void rssi_led_fade(uint8_t value, int max_fade_time_ms);

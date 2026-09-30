@@ -46,6 +46,16 @@ jobs:
           target: esp32
           path: '.'
 
+      # The K_EVK_V4 Ethernet board (2.x) is a second image from the same tree:
+      # own project name, own OTA channel, own sdkconfig in build_eth/.
+      - name: ESP-IDF build, Ethernet board (K_EVK_V4, v5.3.1)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.1
+          target: esp32
+          path: '.'
+          command: idf.py -B build_eth -DRTK_BOARD=k_evk_v4 build
+
       # Boot gate. The compiler and the host tests both pass on an image that
       # panics in app_main: on 2026-08-01 a reordered init took a semaphore that
       # did not exist yet and every device would have asserted at boot, before
@@ -69,6 +79,7 @@ jobs:
           mkdir -p out
           cp build/rtkdata-fw.bin out/
           cp build/www.bin out/
+          cp build_eth/rtkdata-fw-eth.bin out/
           ls -la out
 
       - uses: actions/upload-artifact@v4

@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "esp_err.h"
+#include "sdkconfig.h"
 
 typedef enum {
     CONFIG_ITEM_TYPE_BOOL = 0,
@@ -252,7 +253,22 @@ typedef struct config_item {
 // so keep this in lockstep with the tag you push.
 #define FW_VERSION "1.1.10"
 
+// The Ethernet board (K_EVK_V4, -DRTK_BOARD=k_evk_v4) is its own release line
+// with its own OTA channel: the major version is the hardware generation
+// (1.x = OnoLink Wi-Fi fleet, 2.x = Ethernet). Same exact-strcmp rule as above
+// against ota/eth/release.json. Kept as a separate define so release.yml's
+// FW_VERSION grep and the CMake version read stay unambiguous.
+#define FW_VERSION_ETH "2.0.0"
+
+#if CONFIG_RTK_BOARD_K_EVK_V4
+#undef FW_VERSION
+#define FW_VERSION FW_VERSION_ETH
+// NEVER the fleet's main/ota/: the 1.x Wi-Fi units have that path baked in and
+// must not see an Ethernet image (update.c also refuses a foreign project name).
+#define UPDATE_SERVER_URL "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/eth/"
+#else
 #define UPDATE_SERVER_URL "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/"
+#endif
 #define VERSION_FILE "release.json"
 
 #define WWW_PARTITION_PATH      "/www"

@@ -34,6 +34,7 @@ const int WIFI_STA_GOT_IPV4_BIT         = BIT0;
 const int WIFI_STA_GOT_IPV6_BIT         = BIT1;
 const int WIFI_AP_STA_CONNECTED_BIT     = BIT2;
 const int WIFI_AP_STOP_DUE_BIT          = BIT3;
+const int WIFI_ETH_GOT_IPV4_BIT         = BIT4;   // set by eth.c via wifi_note_eth_ip()
 
 static TaskHandle_t sta_status_task     = NULL;
 static TaskHandle_t sta_reconnect_task  = NULL;
@@ -56,6 +57,12 @@ static bool ap_active  = false;
 static bool sta_active = false;
 
 static bool sta_connected = false;
+
+// Ethernet board: while the cable has an IP the STA stays idle (no connect, no
+// reconnect loop, no AP re-open on its disconnects). Mode is left alone on
+// purpose: parking the STA is cheaper and safer than WIFI_MODE_NULL juggling
+// against the AP time-box, and wifi_driver_restart() keeps working.
+static volatile bool sta_suspended = false;
 
 static wifi_ap_record_t sta_ap_info;
 static wifi_sta_list_t  ap_sta_list;
@@ -91,6 +98,31 @@ static void rssi_led_safe_off(void){
     }
 
     rssi_led_set(0);
+}
+
+/*============================= Uplink IP ===================================*/
+
+// The supervisor and every wait_for_ip() caller care about "the device has an
+// uplink", not which one. Recompute from both bits so a STA drop while the
+// Ethernet holds an IP does not read as a link fault (and vice versa).
+static void uplink_note_supervisor(void) {
+
+    EventBits_t bits = xEventGroupGetBits(wifi_event_group);
+
+    supervisor_note_sta_ip((bits & (WIFI_STA_GOT_IPV4_BIT | WIFI_ETH_GOT_IPV4_BIT)) != 0);
+}
+
+void wifi_note_eth_ip(bool up) {
+
+    if (wifi_event_group == NULL) return;
+
+    if (up) {
+        xEventGroupSetBits(wifi_event_group, WIFI_ETH_GOT_IPV4_BIT);
+    } else {
+        xEventGroupClearBits(wifi_event_group, WIFI_ETH_GOT_IPV4_BIT);
+    }
+
+    uplink_note_supervisor();
 }
 
 /*============================= AP/STA Mode Helpers =========================*/
@@ -208,8 +240,8 @@ static void wifi_sta_reconnect_task(void *ctx){
 
     for (;;) {
 
-        // STA is not active, do nothing
-        if (!sta_active) {
+        // STA is not active, or parked behind the Ethernet uplink: do nothing
+        if (!sta_active || sta_suspended) {
 
             vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -277,7 +309,12 @@ static void handle_sta_start(void *arg, esp_event_base_t base, int32_t id, void 
     ESP_LOGI(TAG, "WIFI_EVENT_STA_START");
 
     sta_active = true;
-    
+
+    if (sta_suspended) {
+        ESP_LOGI(TAG, "STA parked (Ethernet uplink), not connecting");
+        return;
+    }
+
     esp_wifi_connect();
 
 }
@@ -337,7 +374,7 @@ static void handle_sta_disconnected(void *arg, esp_event_base_t base, int32_t id
     sta_connected = false;
 
     xEventGroupClearBits(wifi_event_group, WIFI_STA_GOT_IPV4_BIT);
-    supervisor_note_sta_ip(false);
+    uplink_note_supervisor();
     xEventGroupClearBits(wifi_event_group, WIFI_STA_GOT_IPV6_BIT);
 
     if (status_led_sta != NULL)
@@ -355,7 +392,9 @@ static void handle_sta_disconnected(void *arg, esp_event_base_t base, int32_t id
     config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_WIFI_STA_SSID), (void **)&sta_ssid);
     bool provisioned = (sta_ssid && sta_ssid[0]);
     free(sta_ssid);
-    if (!provisioned) {
+    // A parked STA (Ethernet has the uplink) is not an onboarding case: its
+    // disconnects must not keep re-opening and re-arming the open AP.
+    if (!provisioned && !sta_suspended) {
         wifi_ap_start_only();
         wifi_ap_start_timer();   // time-box even this AP-up to 15 min
     }
@@ -478,7 +517,7 @@ static void handle_sta_got_ip(void *arg, esp_event_base_t base, int32_t id, void
 
     xEventGroupSetBits(wifi_event_group, WIFI_STA_GOT_IPV4_BIT);
 
-    supervisor_note_sta_ip(true);
+    uplink_note_supervisor();
 }
 
 static void handle_sta_lost_ip(void *arg, esp_event_base_t base, int32_t id, void *event_data){
@@ -488,7 +527,7 @@ static void handle_sta_lost_ip(void *arg, esp_event_base_t base, int32_t id, voi
     uart_nmea("$PESP,WIFI,STA,IP_LOST");
 
     xEventGroupClearBits(wifi_event_group, WIFI_STA_GOT_IPV4_BIT);
-    supervisor_note_sta_ip(false);
+    uplink_note_supervisor();
 
     // force a disconnect to trigger reconnect flow
     esp_wifi_disconnect();
@@ -505,15 +544,17 @@ static void handle_ap_sta_ip_assigned(void *arg, esp_event_base_t base, int32_t 
 
 /*============================= Public helpers ==============================*/
 
-// Wait up to timeout_ms for the STA to get an IPv4 (0 = wait forever). Returns
-// true if connected, false on timeout. Bounded so a device whose configured WiFi
-// is wrong/down/out-of-range does NOT block boot forever -- the caller then brings
-// up the AP config server so the user can re-onboard without the reset button.
+// Wait up to timeout_ms for an uplink IPv4, STA or Ethernet (0 = wait forever).
+// Returns true if connected, false on timeout. Bounded so a device whose
+// configured WiFi is wrong/down/out-of-range does NOT block boot forever -- the
+// caller then brings up the AP config server so the user can re-onboard without
+// the reset button.
 bool wait_for_ip(uint32_t timeout_ms){
 
+    const EventBits_t any_ip = WIFI_STA_GOT_IPV4_BIT | WIFI_ETH_GOT_IPV4_BIT;
     TickType_t ticks = (timeout_ms == 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
-    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_STA_GOT_IPV4_BIT, false, false, ticks);
-    return (bits & WIFI_STA_GOT_IPV4_BIT) != 0;
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, any_ip, false, false, ticks);
+    return (bits & any_ip) != 0;
 }
 
 /*============================= Net init ====================================*/
@@ -887,6 +928,7 @@ void wifi_sta_status(wifi_sta_status_t *status){
 
     status->active    = sta_active;
     status->connected = sta_connected;
+    status->suspended = sta_suspended;
 
     if (!sta_connected) {
 
@@ -1006,6 +1048,32 @@ void wifi_ap_stop_now(void) {
     // pull the AP out from under a customer mid-onboarding).
     ESP_LOGI(TAG, "AP stop requested early (boot OTA needs the heap)");
     xEventGroupSetBits(wifi_event_group, WIFI_AP_STOP_DUE_BIT);
+}
+
+void wifi_sta_set_suspended(bool suspended) {
+
+    if (sta_suspended == suspended) return;
+
+    sta_suspended = suspended;
+
+    if (suspended) {
+
+        ESP_LOGI(TAG, "Ethernet has the uplink -> parking the STA");
+        uart_nmea("$PESP,WIFI,STA,PARKED");
+
+        // The disconnect event that follows sees sta_suspended and neither
+        // reconnects nor re-opens the AP.
+        if (sta_connected) esp_wifi_disconnect();
+
+    } else {
+
+        ESP_LOGI(TAG, "Ethernet uplink gone -> STA resumes");
+        uart_nmea("$PESP,WIFI,STA,RESUMED");
+
+        retry_reset(delay_handle);
+
+        if (sta_active) esp_wifi_connect();
+    }
 }
 
 void wifi_driver_restart(void) {

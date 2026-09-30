@@ -28,6 +28,8 @@
 #include <esp_system.h>
 #include <esp_attr.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include "sdkconfig.h"
 
 #include "supervisor.h"
 #include "gnss_site.h"
@@ -60,6 +62,17 @@
  * steady-state idle heap, so it only fires on genuine exhaustion. */
 #define HEAP_FLOOR_B           (12 * 1024)
 #define HEAP_LOW_S             15
+
+/* With PSRAM (Ethernet board) the total free heap includes megabytes of
+ * PSRAM and would never trip the floor while the INTERNAL RAM that DMA, the
+ * EMAC, Wi-Fi and the task stacks need runs dry. Guard the internal part. */
+static inline size_t guarded_free_heap(void) {
+#if CONFIG_SPIRAM
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+    return esp_get_free_heap_size();
+#endif
+}
 
 /* survives a soft reboot (not power loss) so flapping is visible to the IE */
 static RTC_DATA_ATTR uint32_t s_supervised_reboots;
@@ -168,13 +181,13 @@ static void supervisor_task(void *ctx) {
         /* Rung 5: heap-exhaustion guard (self-healing against a slow leak or
          * fragmentation that would otherwise hard-fault). Sustained low heap
          * -> clean reboot, counted so flapping is visible to the IE. */
-        if (esp_get_free_heap_size() < HEAP_FLOOR_B) {
+        if (guarded_free_heap() < HEAP_FLOOR_B) {
             if (++heap_low_streak >= HEAP_LOW_S) {
                 s_supervised_reboots++;
                 ESP_LOGE(TAG, "heap exhausted (free=%u < %u for %ds) -> reboot #%u",
-                         (unsigned)esp_get_free_heap_size(), (unsigned)HEAP_FLOOR_B,
+                         (unsigned)guarded_free_heap(), (unsigned)HEAP_FLOOR_B,
                          HEAP_LOW_S, (unsigned)s_supervised_reboots);
-                uart_nmea("$PESP,RTK,SUPERVISOR,HEAP,%u", (unsigned)esp_get_free_heap_size());
+                uart_nmea("$PESP,RTK,SUPERVISOR,HEAP,%u", (unsigned)guarded_free_heap());
                 vTaskDelay(pdMS_TO_TICKS(150));
                 esp_restart();
             }

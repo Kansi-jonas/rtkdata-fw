@@ -38,6 +38,8 @@
 #include "gnss.h"
 #include "supervisor.h"
 #include "telemetry_json.h"
+#include "board.h"
+#include "eth.h"
 #include "interface/ntrip.h"
 
 #define TAG "PROVISION"
@@ -464,6 +466,23 @@ static void heartbeat(void) {
         ESP_LOGW(TAG, "tx telemetry omitted from heartbeat (did not fit)");
     }
 
+    // Ethernet board: which uplink carries the beat, plus the cable's flap and
+    // PHY symbol-error counters (the bench/field signal for marginal RMII
+    // timing). Health is stored as-is by the IE and is outside the HMAC
+    // canon. The Wi-Fi 1.x beat stays byte-identical.
+    char net_json[160] = "";
+#if BOARD_HAS_ETH
+    {
+        eth_status_t es;
+        eth_status(&es);
+        snprintf(net_json, sizeof(net_json),
+                 ",\"board\":\"%s\",\"uplink\":\"%s\",\"eth_link\":%s,"
+                 "\"eth_speed\":%u,\"eth_link_ups\":%u,\"eth_sym_err\":%u",
+                 BOARD_NAME, es.has_ip ? "eth" : "wifi", es.link ? "true" : "false",
+                 (unsigned)es.speed_mbps, (unsigned)es.link_ups, (unsigned)es.symbol_errors);
+    }
+#endif
+
     // Single writer (this task); static keeps ~1.4 KB off the task stack.
     static char body[2560];
     int n = snprintf(body, sizeof(body),
@@ -472,7 +491,7 @@ static void heartbeat(void) {
         "\"gnss_silent_s\":%u,\"caster_silent_s\":%u,\"ip_down_s\":%u,"
         "\"gnss_ok\":%s,\"caster_ok\":%s,\"link_ok\":%s,"
         "\"obs_expected\":%s,\"obs_silent_s\":%ld,"
-        "\"rec_gnss\":%u,\"rec_caster\":%u,\"rec_wifi\":%u,\"reboots\":%u%s%s},"
+        "\"rec_gnss\":%u,\"rec_caster\":%u,\"rec_wifi\":%u,\"reboots\":%u%s%s%s},"
         "\"site\":%s,\"nonce\":%u,\"hmac\":\"%s\"}",
         s_device_id, s_token, (unsigned)h.uptime_s,
         FW_VERSION,
@@ -480,7 +499,7 @@ static void heartbeat(void) {
         h.gnss_ok ? "true" : "false", h.caster_ok ? "true" : "false", h.link_ok ? "true" : "false",
         h.obs_expected ? "true" : "false", (long)h.obs_silent_s,
         (unsigned)h.recoveries_gnss, (unsigned)h.recoveries_caster, (unsigned)h.recoveries_wifi,
-        (unsigned)h.reboots_supervised, tx_sep, tx_json,
+        (unsigned)h.reboots_supervised, net_json, tx_sep, tx_json,
         site_json, (unsigned)nonce, hmac);
 
     if (n <= 0 || (size_t)n >= sizeof(body)) {
@@ -600,6 +619,11 @@ void provisioning_fill_status(cJSON *root) {
     cJSON_AddNumberToObject(sh, "rec_caster", h.recoveries_caster);
     cJSON_AddNumberToObject(sh, "rec_wifi", h.recoveries_wifi);
     cJSON_AddNumberToObject(sh, "reboots", h.reboots_supervised);
+
+#if BOARD_HAS_ETH
+    cJSON_AddStringToObject(root, "board", BOARD_NAME);
+    cJSON_AddStringToObject(root, "uplink", eth_has_ip() ? "eth" : "wifi");
+#endif
 }
 
 void provisioning_init(void) {

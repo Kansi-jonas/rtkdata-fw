@@ -35,6 +35,7 @@ typedef struct wifi_sta_status {
 
     bool active;                          
     bool connected;                       
+    bool suspended;                       // parked behind the Ethernet uplink
 
     char ssid[WIFI_SSID_STRLEN_BUF];      
 
@@ -59,7 +60,16 @@ void wifi_ap_status(wifi_ap_status_t *status);
 
 void wifi_sta_status(wifi_sta_status_t *status);
 
-bool wait_for_ip(uint32_t timeout_ms);   // bounded; true if STA got an IP, false on timeout (0 = forever)
+bool wait_for_ip(uint32_t timeout_ms);   // bounded; true if STA or Ethernet has an IP, false on timeout (0 = forever)
+
+// Ethernet board (eth.c): report the Ethernet IPv4 up/down so wait_for_ip()
+// and the supervisor see one uplink, whichever interface carries it.
+void wifi_note_eth_ip(bool up);
+
+// Park (true) or resume (false) the STA. While parked it neither connects nor
+// reconnects and its disconnects never re-open the config AP. Driven by eth.c:
+// parked while the Ethernet has an IP, resumed when it loses it.
+void wifi_sta_set_suspended(bool suspended);
 
 void wifi_driver_restart(void);
 

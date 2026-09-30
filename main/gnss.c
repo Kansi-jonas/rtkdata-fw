@@ -30,6 +30,7 @@
 #include <driver/gpio.h>
 #include "nvs.h"
 
+#include "board.h"
 #include "gnss.h"
 #include "gnss_ack.h"
 #include "uart.h"
@@ -38,7 +39,7 @@
 
 #define TAG "GNSS"
 
-#define GPIO_GNSS_RESET    GPIO_NUM_22
+#define GPIO_GNSS_RESET    BOARD_GNSS_RESET_GPIO
 #define GNSS_RESET_MS      500
 #define ACK_TIMEOUT_MS     900   // UM980 usually replies within ~100-300 ms
 #define ACK_POLL_MS        20
@@ -579,6 +580,22 @@ void gnss_recover(void) {
     ESP_LOGW(TAG, "GNSS recover: hardware reset + reconfigure");
     uart_nmea("$PESP,RTK,GNSS,RECOVER");
     gnss_reset_pulse();
+    config_gnss_base();
+    txn_give();
+}
+
+void gnss_after_external_reset(void) {
+    txn_take();
+    ESP_LOGW(TAG, "GNSS reset by the button: reconfigure");
+    uart_nmea("$PESP,RTK,GNSS,BUTTONRESET");
+    /* The button pulled RESET_N low in hardware (K_EVK_V4 D22) and C58 lets it
+     * go a moment after release. Give the UM980 the same settle time our own
+     * pulse gives it, then treat it exactly like our reset: old evidence dies,
+     * config goes back on. No health gate here, unlike gnss_recover(): the
+     * receiver HAS lost its config even though bytes may still look fresh. */
+    vTaskDelay(pdMS_TO_TICKS(2 * GNSS_RESET_MS));
+    drv_uart_gnss_flush();
+    gnss_receiver_epoch_invalidate();
     config_gnss_base();
     txn_give();
 }

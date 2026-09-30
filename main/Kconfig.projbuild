@@ -1,1 +1,21 @@
-# put here your custom config value
+menu "RTKdata board"
+
+    choice RTK_BOARD
+        prompt "Target board"
+        default RTK_BOARD_ONOLINK
+        help
+            Selects the pin map and the uplink hardware. The two boards need
+            DIFFERENT images: the OnoLink pins collide with the RMII, PSRAM and
+            LED pins of the Ethernet board. Do not set this by hand; build the
+            Ethernet image with `idf.py -B build_eth -DRTK_BOARD=k_evk_v4 build`,
+            which also selects the matching project name and OTA channel.
+
+        config RTK_BOARD_ONOLINK
+            bool "OnoLink (Wi-Fi only, fleet 1.x)"
+
+        config RTK_BOARD_K_EVK_V4
+            bool "K_EVK_V4.0 (Ethernet LAN8720 + optional PoE, 2.x)"
+            select ETH_USE_ESP32_EMAC
+    endchoice
+
+endmenu
