@@ -71,7 +71,15 @@ Uplink:
   Wi-Fi configured takes the provisioned boot path: OTA check first, then
   the web server, reachable on the LAN IP.
 - A missing RMII clock or PHY is logged (`$PESP,ETH,INIT,FAIL,...`) and the
-  unit carries on over Wi-Fi. It never aborts.
+  unit carries on over Wi-Fi. It never aborts. The failure path then logs a
+  one-line diagnosis (`$PESP,ETH,DIAG,...`): PHY ID over a bit-banged MDIO
+  scan or "no PHY", REF_CLK toggling or absent, RMII outputs driven or
+  floating.
+- If no link has come up 15 s after start, one line reports whether the PHY
+  sees energy on the wire (`$PESP,ETH,NOLINK,<energy>,<bmsr>`). No energy with
+  a known-good cable points at the board's analog path.
+- `esp_eth_start()` does not wait for autonegotiation; the link poll reports
+  the link when it comes up.
 
 Supervisor link rung: link up but no lease restarts the DHCP client, no link
 restarts the Wi-Fi driver (the STA is the fallback). With PSRAM the heap

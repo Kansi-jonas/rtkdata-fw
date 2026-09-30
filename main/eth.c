@@ -35,6 +35,9 @@ static const char *TAG = "ETH";
 // LAN8720 vendor register: Symbol Error Counter (16 bit, rolls over).
 #define LAN8720_REG_SECR        26
 
+// Report the PHY's view of the wire once if the link has not come up by then.
+#define ETH_NOLINK_REPORT_MS    15000
+
 static esp_eth_handle_t   s_eth      = NULL;
 static esp_netif_t       *s_netif    = NULL;
 static EventGroupHandle_t s_events   = NULL;
@@ -50,88 +53,23 @@ static uint16_t           s_secr_last = 0;
 static uint32_t           s_secr_sum  = 0;
 static bool               s_secr_init = false;
 
-/* ---- RMII reference clock bring-up --------------------------------------
- *
- * The LAN8720 latches its nINTSEL strap on the rising edge of nRST, from the
- * same pin that later outputs REFCLKO (nINT/REFCLKO). Only nINTSEL = LOW
- * selects "REF_CLK Out", i.e. the 50 MHz we need on GPIO0. On K_EVK_V4 that
- * pin is tied through R102 (0R) to GPIO0, which carries R71 10k to 3V3 (boot
- * strap) against R100 10k to GND, plus the ESP32 and LAN8720 internal
- * pull-ups: the strap floats near 2 V and reads HIGH, the PHY comes up in
- * nINT mode and never clocks the EMAC ("emac reset timeout", measured on the
- * first sample 2026-09-29).
- *
- * Fix without touching the board: hold GPIO0 actively LOW while nRST rises,
- * then hand GPIO0 straight back as an input for the clock. The PHY is in
- * reset (outputs tri-stated) while we drive, so there is no contention before
- * the edge; after it we release within about a microsecond. ESP-IDF must NOT
- * pulse nRST again afterwards (reset_gpio_num = -1): a second rising edge with
- * GPIO0 as an input would latch nINT mode again. */
-
-static void rmii_outputs_probe(const char *when);
+/* ---- Diagnostics for a failed bring-up ----------------------------------
+ * Run only when the EMAC driver does not install, after it released its
+ * pins. They separate "no PHY at all" (not populated, unpowered, held in
+ * reset) from "PHY alive but no RMII clock", which is what a support case
+ * needs from a unit in the field. Measured on the 2026-09 samples: the
+ * non-PoE sample showed no PHY on MDIO and undriven RMII outputs. */
 
 #define RMII_CLK_GPIO           0
 #define REFCLK_SAMPLES          2000
 
-// A running 50 MHz clock read back through the GPIO matrix gives a mix of
-// levels; a dead line gives a constant one.
+// Toggling reads mean transitions on GPIO0 (not a frequency measurement);
+// a constant level means no clock.
 static int refclk_sample_ones(void) {
     int ones = 0;
     for (int i = 0; i < REFCLK_SAMPLES; i++) ones += gpio_get_level(RMII_CLK_GPIO);
     return ones;
 }
-
-static bool refclk_running(int ones) {
-    return ones > REFCLK_SAMPLES / 20 && ones < REFCLK_SAMPLES - REFCLK_SAMPLES / 20;
-}
-
-static bool phy_release_with_refclk_strap(void) {
-
-    gpio_config_t rst = {
-        .pin_bit_mask = 1ULL << BOARD_ETH_PHY_RST_GPIO,
-        .mode = GPIO_MODE_INPUT_OUTPUT,   // input too: read back the actual pin level
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&rst);
-    gpio_set_level(BOARD_ETH_PHY_RST_GPIO, 0);          // PHY in reset
-
-    gpio_config_t clk = {
-        .pin_bit_mask = 1ULL << RMII_CLK_GPIO,
-        .mode = GPIO_MODE_INPUT_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&clk);
-    gpio_set_level(RMII_CLK_GPIO, 0);                   // nINTSEL = 0 -> REF_CLK Out
-
-    esp_rom_delay_us(1000);                             // reset asserted >> 100 us
-    rmii_outputs_probe("in_reset");
-
-    // No preemption between the edge and the release: every microsecond after
-    // the edge is the PHY's REFCLKO driving against our low.
-    static portMUX_TYPE edge_mux = portMUX_INITIALIZER_UNLOCKED;
-    portENTER_CRITICAL(&edge_mux);
-    gpio_set_level(BOARD_ETH_PHY_RST_GPIO, 1);          // strap latched on this edge
-    gpio_set_direction(RMII_CLK_GPIO, GPIO_MODE_INPUT); // hand the line to REFCLKO
-    portEXIT_CRITICAL(&edge_mux);
-
-    vTaskDelay(pdMS_TO_TICKS(20));                      // oscillator + PLL settle
-
-    int ones = refclk_sample_ones();
-    bool running = refclk_running(ones);
-    ESP_LOGI(TAG, "RMII REF_CLK on GPIO%d after strap-forced release: %s (%d/%d high)",
-             RMII_CLK_GPIO, running ? "running" : "NOT running", ones, REFCLK_SAMPLES);
-    uart_nmea("$PESP,ETH,REFCLK,%s,%d", running ? "OK" : "NONE", ones);
-    return running;
-}
-
-/* ---- MDIO bit-bang probe (bring-up diagnostics) -------------------------
- * Clause-22 reads on MDC/MDIO without the EMAC, so a dead RMII clock does
- * not hide whether the PHY itself is alive (powered, out of reset, strapped
- * address). Runs before the EMAC claims the pins. */
 
 static inline void mdio_half(void) { esp_rom_delay_us(2); }
 
@@ -152,7 +90,8 @@ static int mdio_read_bit(void) {
     return b;
 }
 
-// Returns the register value, or -1 when no PHY drove the turnaround low.
+// Clause-22 read without the EMAC. Returns -1 when no PHY drove the
+// turnaround low.
 static int mdio_read(int phy, int reg) {
     for (int i = 0; i < 32; i++) mdio_write_bit(1);          // preamble
     int hdr[] = {0, 1, 1, 0};                                 // start 01, read 10
@@ -168,70 +107,65 @@ static int mdio_read(int phy, int reg) {
     return ta == 0 ? v : -1;
 }
 
-/* Is anybody driving the PHY's RMII outputs? A live LAN8720 out of reset
- * drives RXD0/RXD1/CRS_DV low while idle. Read each line once with the ESP32
- * pull-up and once with the pull-down: a line that follows our pull is
- * floating (PHY not driving = dead/unpowered/unclocked); a line that stays low
- * against the pull-up is driven. */
-static const int s_rmii_outs[] = {25, 26, 27};   // RXD0, RXD1, CRS_DV
-
-static void rmii_outputs_probe(const char *when) {
-    char res[3][8];
-    for (int i = 0; i < 3; i++) {
-        int pin = s_rmii_outs[i];
-        gpio_config_t io = {
-            .pin_bit_mask = 1ULL << pin,
-            .mode = GPIO_MODE_INPUT,
-            .pull_up_en = GPIO_PULLUP_ENABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        };
-        gpio_config(&io);
-        esp_rom_delay_us(200);
-        int with_up = gpio_get_level(pin);
-        gpio_set_pull_mode(pin, GPIO_PULLDOWN_ONLY);
-        esp_rom_delay_us(200);
-        int with_down = gpio_get_level(pin);
-        gpio_set_pull_mode(pin, GPIO_FLOATING);
-        snprintf(res[i], sizeof(res[i]), "%s",
-                 (with_up && !with_down) ? "float" : (with_up ? "high" : "low"));
-    }
-    ESP_LOGI(TAG, "RMII outputs %s: RXD0=%s RXD1=%s CRS_DV=%s", when, res[0], res[1], res[2]);
-    uart_nmea("$PESP,ETH,RMIIOUT,%s,%s,%s,%s", when, res[0], res[1], res[2]);
+// A live LAN8720 out of reset drives RXD0/RXD1/CRS_DV low while idle. A line
+// that follows our pull-up and pull-down is not driven by anybody.
+static const char *rmii_output_state(int pin) {
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    };
+    gpio_config(&io);
+    esp_rom_delay_us(200);
+    int with_up = gpio_get_level(pin);
+    gpio_set_pull_mode(pin, GPIO_PULLDOWN_ONLY);
+    esp_rom_delay_us(200);
+    int with_down = gpio_get_level(pin);
+    gpio_set_pull_mode(pin, GPIO_FLOATING);
+    return (with_up && !with_down) ? "float" : (with_up ? "high" : "low");
 }
 
-static void phy_mdio_probe(void) {
-    gpio_config_t mdc = {
-        .pin_bit_mask = 1ULL << BOARD_ETH_MDC_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-    };
+static void eth_diagnose_bringup(void) {
+
+    int ones = refclk_sample_ones();
+    bool clock = ones > REFCLK_SAMPLES / 20 && ones < REFCLK_SAMPLES - REFCLK_SAMPLES / 20;
+
+    const char *rxd0 = rmii_output_state(25);
+    const char *rxd1 = rmii_output_state(26);
+    const char *crs  = rmii_output_state(27);
+
+    gpio_config_t mdc = { .pin_bit_mask = 1ULL << BOARD_ETH_MDC_GPIO, .mode = GPIO_MODE_OUTPUT };
     gpio_config(&mdc);
     gpio_config_t mdio = {
         .pin_bit_mask = 1ULL << BOARD_ETH_MDIO_GPIO,
         .mode = GPIO_MODE_INPUT_OUTPUT_OD,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE,       // the board has no external MDIO pull-up
     };
     gpio_config(&mdio);
     gpio_set_level(BOARD_ETH_MDC_GPIO, 0);
     gpio_set_level(BOARD_ETH_MDIO_GPIO, 1);
 
-    int found = 0;
-    for (int a = 0; a < 32; a++) {
-        int id1 = mdio_read(a, 2);
-        if (id1 < 0 || id1 == 0xFFFF) continue;
-        int id2 = mdio_read(a, 3), bmcr = mdio_read(a, 0), bmsr = mdio_read(a, 1);
-        int smr = mdio_read(a, 18), mcsr = mdio_read(a, 17), scsr = mdio_read(a, 31);
-        found++;
-        ESP_LOGI(TAG, "MDIO: PHY at addr %d id %04x:%04x bmcr %04x bmsr %04x (link %s) "
-                      "modes(18) %04x mcsr(17) %04x scsr(31) %04x",
-                 a, id1, id2, bmcr, bmsr, (bmsr >= 0 && (bmsr & 0x4)) ? "up" : "down",
-                 smr, mcsr, scsr);
-        uart_nmea("$PESP,ETH,MDIO,%d,%04x,%04x,%04x,%04x", a, id1, id2, bmsr, smr);
+    int addr = -1, id1 = -1, id2 = -1;
+    for (int a = 0; a < 32 && addr < 0; a++) {
+        int v = mdio_read(a, 2);
+        if (v >= 0 && v != 0xFFFF) { addr = a; id1 = v; id2 = mdio_read(a, 3); }
     }
-    if (!found) {
-        ESP_LOGE(TAG, "MDIO: no PHY answers on any address (unpowered, held in reset, or MDC/MDIO open)");
-        uart_nmea("$PESP,ETH,MDIO,NONE");
+
+    if (addr >= 0) {
+        ESP_LOGE(TAG, "diagnosis: PHY %04x:%04x at addr %d, REF_CLK %s (%d/%d high), "
+                      "RMII outputs %s/%s/%s", id1, id2, addr, clock ? "toggling" : "ABSENT",
+                 ones, REFCLK_SAMPLES, rxd0, rxd1, crs);
+    } else {
+        ESP_LOGE(TAG, "diagnosis: NO PHY on MDIO (not populated, unpowered or held in reset), "
+                      "REF_CLK %s (%d/%d high), RMII outputs %s/%s/%s",
+                 clock ? "toggling" : "absent", ones, REFCLK_SAMPLES, rxd0, rxd1, crs);
     }
+    uart_nmea("$PESP,ETH,DIAG,%d,%04x,%s,%s,%s,%s", addr, id1 < 0 ? 0 : id1,
+              clock ? "CLK" : "NOCLK", rxd0, rxd1, crs);
 }
+
+/* ---- Link events -------------------------------------------------------- */
 
 static void uplink_lost(const char *why) {
 
@@ -314,135 +248,49 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
     }
 }
 
-/* Bring-up diagnostics: while there is no link, dump the PHY's view of the
- * wire every 3 s for the first minute. ENERGYON (reg 17 bit 1) = the PHY
- * hears the partner; reg 5 = the partner's advertised abilities it decoded;
- * reg 1 bit 5 = autonegotiation complete (needs the partner to hear US). */
+/* ---- One-shot "no link" report ------------------------------------------
+ * If no link has come up ETH_NOLINK_REPORT_MS after start, log what the PHY
+ * sees once. ENERGYON (reg 17 bit 1) = signal from a partner on the wire;
+ * zero with a known-good cable means the analog path is broken (the 2026-09
+ * samples: MDI bias network missing). A plain unplugged cable looks the same,
+ * so this is a hint for support, not a verdict. */
+
 static int phy_reg(uint32_t reg) {
     uint32_t v = 0;
     esp_eth_phy_reg_rw_data_t d = { .reg_addr = reg, .reg_value_p = &v };
     return esp_eth_ioctl(s_eth, ETH_CMD_READ_PHY_REG, &d) == ESP_OK ? (int)v : -1;
 }
 
-static void phy_diag_task(void *arg) {
-    for (int i = 0; i < 20 && !s_link; i++) {
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        int bmsr = phy_reg(1), anlpar = phy_reg(5), aner = phy_reg(6), mcsr = phy_reg(17);
-        int scsr = phy_reg(31), isr = phy_reg(29), secr = phy_reg(26);
-        ESP_LOGI(TAG, "PHY diag: bmsr %04x (link %d, an_done %d) anlpar(5) %04x aner(6) %04x "
-                      "mcsr(17) %04x (energyon %d) scsr(31) %04x isr(29) %04x secr(26) %u",
-                 bmsr, (bmsr >> 2) & 1, (bmsr >> 5) & 1, anlpar, aner,
-                 mcsr, (mcsr >> 1) & 1, scsr, isr, (unsigned)secr);
-        uart_nmea("$PESP,ETH,PHYDIAG,%04x,%04x,%04x,%04x,%04x", bmsr, anlpar, aner, mcsr, scsr);
-    }
-    vTaskDelete(NULL);
-}
+static void nolink_report_task(void *arg) {
 
-/* ---- Bench test matrix (TEMPORARY, bring-up only) ------------------------
- * Tries every documented speed / negotiation / MDI-MDIX combination on the
- * LAN8720A and records what the PHY sees on the wire. Answers "can ANY
- * firmware setting get a link on this board". Remove after bring-up. */
-#define ETH_BENCH_MATRIX 1
+    vTaskDelay(pdMS_TO_TICKS(ETH_NOLINK_REPORT_MS));
 
-static int phy_wr(uint32_t reg, uint32_t val) {
-    esp_eth_phy_reg_rw_data_t d = { .reg_addr = reg, .reg_value_p = &val };
-    return esp_eth_ioctl(s_eth, ETH_CMD_WRITE_PHY_REG, &d) == ESP_OK ? 0 : -1;
-}
+    if (!s_link) {
+        phy_reg(1);                                  // BMSR link bit is latch-low:
+        int bmsr = phy_reg(1);                       // the second read is current
+        int mcsr = phy_reg(17), anlpar = phy_reg(5), r27 = phy_reg(27);
 
-typedef struct {
-    const char *name;
-    bool        autoneg;
-    uint16_t    anar;        // advertisement (autoneg only)
-    uint16_t    bmcr_forced; // speed/duplex bits (forced only)
-    int         mdix;        // -1 auto, 0 forced MDI, 1 forced MDIX
-} phy_trial_t;
-
-static const phy_trial_t s_trials[] = {
-    { "AN full, auto-MDIX",     true,  0x01E1, 0,      -1 },
-    { "AN 10-only, auto-MDIX",  true,  0x0061, 0,      -1 },
-    { "AN full, forced MDI",    true,  0x01E1, 0,       0 },
-    { "AN full, forced MDIX",   true,  0x01E1, 0,       1 },
-    { "forced 10 half, MDI",    false, 0,      0x0000,  0 },
-    { "forced 10 half, MDIX",   false, 0,      0x0000,  1 },
-    { "forced 100 half, MDI",   false, 0,      0x2000,  0 },
-    { "forced 100 half, MDIX",  false, 0,      0x2000,  1 },
-};
-
-static void phy_matrix_task(void *arg) {
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    ESP_LOGI(TAG, "MATRIX start: %d trials", (int)(sizeof(s_trials) / sizeof(s_trials[0])));
-
-    for (size_t t = 0; t < sizeof(s_trials) / sizeof(s_trials[0]); t++) {
-        const phy_trial_t *tr = &s_trials[t];
-
-        // Normal operation: no power-down, isolate or loopback; no EDPD / far loopback.
-        int mcsr = phy_reg(17);
-        if (mcsr >= 0) phy_wr(17, (uint32_t)mcsr & ~((1u << 13) | (1u << 9)));
-
-        int sc = phy_reg(27);
-        if (sc >= 0) {
-            uint32_t v = (uint32_t)sc;
-            if (tr->mdix < 0) {
-                v &= ~(1u << 15);                          // AMDIXCTRL=0: Auto-MDIX
-            } else {
-                v |= (1u << 15);                           // manual
-                v = tr->mdix ? (v | (1u << 13)) : (v & ~(1u << 13));  // CH_SELECT
-            }
-            phy_wr(27, v);
-        }
-
-        if (tr->autoneg) {
-            phy_wr(4, tr->anar);
-            phy_wr(0, (1u << 12) | (1u << 9));              // AN enable + restart
+        if (bmsr < 0 || mcsr < 0) {
+            ESP_LOGW(TAG, "no link after %d s, PHY registers unreadable", ETH_NOLINK_REPORT_MS / 1000);
+            uart_nmea("$PESP,ETH,NOLINK,READFAIL");
         } else {
-            phy_wr(0, tr->bmcr_forced);                    // AN off, speed, half duplex
+            int energy = (mcsr >> 1) & 1;
+            ESP_LOGW(TAG, "no link after %d s: energy on the wire %s, bmsr %04x anlpar %04x r27 %04x%s",
+                     ETH_NOLINK_REPORT_MS / 1000, energy ? "yes" : "NO", bmsr,
+                     anlpar < 0 ? 0 : anlpar, r27 < 0 ? 0 : r27,
+                     energy ? "" : " (cable unplugged, dead port, or board analog path)");
+            uart_nmea("$PESP,ETH,NOLINK,%d,%04x", energy, bmsr);
         }
-
-        int energy_max = 0, link_any = 0, an_any = 0, anlpar_seen = 0x0001, aner_seen = 0;
-        for (int s = 0; s < 9; s++) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            phy_reg(1);                                    // BMSR link is latch-low:
-            int bmsr = phy_reg(1);                         // second read = current state
-            int m = phy_reg(17), lp = phy_reg(5), ae = phy_reg(6);
-            if (bmsr < 0 || m < 0) continue;
-            energy_max |= (m >> 1) & 1;
-            link_any   |= (bmsr >> 2) & 1;
-            an_any     |= (bmsr >> 5) & 1;
-            if (lp > 0 && lp != 0x0001) anlpar_seen = lp;
-            if (ae > 0) aner_seen |= ae;
-        }
-        int bmcr = phy_reg(0), r27 = phy_reg(27);
-        ESP_LOGI(TAG, "MATRIX %d/%d %-22s energyon %d link %d an_done %d anlpar %04x aner %04x "
-                      "(bmcr %04x r27 %04x)",
-                 (int)t + 1, (int)(sizeof(s_trials) / sizeof(s_trials[0])), tr->name,
-                 energy_max, link_any, an_any, anlpar_seen, aner_seen, bmcr, r27);
-        uart_nmea("$PESP,ETH,MATRIX,%d,%d,%d,%d,%04x", (int)t + 1, energy_max, link_any,
-                  an_any, anlpar_seen);
     }
-
-    // Back to the default: autonegotiation, full advertisement, Auto-MDIX.
-    int sc = phy_reg(27);
-    if (sc >= 0) phy_wr(27, (uint32_t)sc & ~(1u << 15));
-    phy_wr(4, 0x01E1);
-    phy_wr(0, (1u << 12) | (1u << 9));
-    ESP_LOGI(TAG, "MATRIX done, PHY back to autonegotiation");
     vTaskDelete(NULL);
 }
+
+/* ---- Bring-up ----------------------------------------------------------- */
 
 esp_err_t eth_init(void) {
 
     s_events = xEventGroupCreate();
     if (s_events == NULL) return ESP_ERR_NO_MEM;
-
-    // Before the EMAC exists: its init needs the PHY clock already running.
-    phy_release_with_refclk_strap();
-    rmii_outputs_probe("released");
-    phy_mdio_probe();
-    {
-        int ones = refclk_sample_ones();
-        ESP_LOGI(TAG, "REF_CLK after MDIO probe (+~%d ms): %d/%d high, LAN_RST reads %d",
-                 40, ones, REFCLK_SAMPLES, gpio_get_level(BOARD_ETH_PHY_RST_GPIO));
-    }
 
     esp_netif_inherent_config_t inherent = ESP_NETIF_INHERENT_DEFAULT_ETH();
     inherent.route_prio = ETH_ROUTE_PRIO;
@@ -477,9 +325,13 @@ esp_err_t eth_init(void) {
 
     eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
     phy_cfg.phy_addr       = BOARD_ETH_PHY_ADDR;
-    // -1: we released nRST ourselves with the strap forced. A driver pulse
-    // would re-latch nINTSEL from the pulled-up GPIO0 and kill the clock.
-    phy_cfg.reset_gpio_num = -1;
+    // esp_eth_driver_install() pulses nRST and releases it BEFORE the EMAC
+    // init, so REFCLKO is running when the EMAC reset needs a clock.
+    phy_cfg.reset_gpio_num = BOARD_ETH_PHY_RST_GPIO;
+    // 0: esp_eth_start() must not block boot waiting for autonegotiation
+    // (4 s by default with no cable). The driver's link poll reports the
+    // link whenever it comes up.
+    phy_cfg.autonego_timeout_ms = 0;
 
     esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&emac_cfg, &mac_cfg);
     esp_eth_phy_t *phy = esp_eth_phy_new_lan87xx(&phy_cfg);
@@ -494,22 +346,14 @@ esp_err_t eth_init(void) {
     esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
     esp_err_t err = esp_eth_driver_install(&eth_cfg, &s_eth);
     if (err != ESP_OK) {
-        // Typical: "emac reset timeout" = no 50 MHz on GPIO0 (PHY held in
-        // reset, missing crystal, R102 open). Wi-Fi keeps the unit usable.
-        ESP_LOGE(TAG, "driver install failed: %s (no RMII clock on GPIO0?)", esp_err_to_name(err));
+        // Typical: "emac reset timeout" = no 50 MHz on GPIO0. Wi-Fi keeps
+        // the unit usable; the diagnosis says whether a PHY is there at all.
+        ESP_LOGE(TAG, "driver install failed: %s", esp_err_to_name(err));
         uart_nmea("$PESP,ETH,INIT,FAIL,%s", esp_err_to_name(err));
-        // Bring-up diagnostics: rule out a slow PHY start (seconds, not ms).
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        {
-            int ones = refclk_sample_ones();
-            ESP_LOGI(TAG, "3 s later: REF_CLK %d/%d high, LAN_RST %d", ones, REFCLK_SAMPLES,
-                     gpio_get_level(BOARD_ETH_PHY_RST_GPIO));
-        }
-        rmii_outputs_probe("after_3s");
-        phy_mdio_probe();
         mac->del(mac);
         phy->del(phy);
         s_eth = NULL;
+        eth_diagnose_bringup();
         return err;
     }
 
@@ -534,12 +378,8 @@ esp_err_t eth_init(void) {
 
     ESP_LOGI(TAG, "up: LAN8720 addr %d, mac " MACSTR ", hostname %s",
              BOARD_ETH_PHY_ADDR, MAC2STR(eth_mac), hostname);
-#if ETH_BENCH_MATRIX
-    xTaskCreate(phy_matrix_task, "eth_matrix", 4096, NULL, 3, NULL);
-#else
-    xTaskCreate(phy_diag_task, "eth_diag", 3072, NULL, 3, NULL);
-#endif
     uart_nmea("$PESP,ETH,INIT,OK," MACSTR, MAC2STR(eth_mac));
+    xTaskCreate(nolink_report_task, "eth_nolink", 3072, NULL, 3, NULL);
     return ESP_OK;
 }
 
