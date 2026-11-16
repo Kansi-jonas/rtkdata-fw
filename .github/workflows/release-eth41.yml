@@ -1,0 +1,101 @@
+name: release-eth41
+
+# Stage a release for the K_EVK_V4.1 Ethernet/PoE station (eth41 line).
+# NOTHING reaches a device here.
+#
+#   1. bump FW_VERSION_ETH41 in main/include/config.h, commit
+#   2. git tag eth41-v2.1.5 && git push origin eth41-v2.1.5
+#   3. this builds the k_evk_v41 customer image from the tagged commit, checks
+#      that it is a customer image for the eth41 channel with this version,
+#      and creates a DRAFT release with rtkdata-fw-eth41.bin + www.bin
+#   4. review the draft, then "Publish release": promote-eth41 writes it to
+#      main/ota/eth41/ and nowhere else
+#
+# The 1.x Wi-Fi fleet channel (main/ota/) is out of reach of this line:
+# release.yml only fires on v* tags, promote-ota.yml only promotes v* tags,
+# the image carries the ota/eth41/ URL, and update.c refuses an image whose
+# project name differs from the running one (rtkdata-fw vs rtkdata-fw-eth41).
+
+on:
+  push:
+    tags: ['eth41-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Built from the EXACT tagged commit (checkout defaults to the tag).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Host tests gate the release
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28 || true
+          bash tools/host-tests.sh
+
+      - name: Verify FW_VERSION_ETH41 matches the tag
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#eth41-v}"
+          FW=$(grep -oP '#define\s+FW_VERSION_ETH41\s+"\K[^"]+' main/include/config.h)
+          echo "tag=${VER}  FW_VERSION_ETH41=${FW}"
+          if [ "${VER}" != "${FW}" ]; then
+            echo "::error::tag ${VER} != FW_VERSION_ETH41 ${FW} (bump config.h first; a mismatch causes an OTA re-flash loop)"
+            exit 1
+          fi
+          echo "VER=${VER}" >> "$GITHUB_ENV"
+
+      - name: ESP-IDF build (v5.3.1, k_evk_v41 customer image)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.1
+          target: esp32
+          path: '.'
+          command: idf.py -B build_eth41 -DRTK_BOARD=k_evk_v41 build
+
+      # A release image must be the customer image of this line: the V4.1
+      # board, never the vendor test page (it would ship /test/do to every
+      # customer), the legacy IE heartbeat the production IE verifies today,
+      # the eth41 channel URL and this version string.
+      - name: Verify the image is the eth41 customer image
+        run: |
+          set -euo pipefail
+          H=build_eth41/config/sdkconfig.h
+          BIN=build_eth41/rtkdata-fw-eth41.bin
+          test -f "$BIN"
+          grep -q '^#define CONFIG_RTK_BOARD_K_EVK_V41 1' "$H" || { echo "::error::not a k_evk_v41 build"; exit 1; }
+          if grep -q '^#define CONFIG_RTK_TEST_PAGE ' "$H"; then echo "::error::test page in a release image"; exit 1; fi
+          grep -q '^#define CONFIG_RTK_SITE_LEGACY 1' "$H" || { echo "::error::site-v1 heartbeat: the production IE answers 401"; exit 1; }
+          # Materialise first, then match (strings | grep -q under pipefail
+          # fails on SIGPIPE, see promote-ota.yml).
+          strings "$BIN" > /tmp/fwstrings.txt
+          grep -qxF "$VER" /tmp/fwstrings.txt || { echo "::error::version string $VER not in the image"; exit 1; }
+          grep -qF 'Kansi-jonas/rtkdata-fw/main/ota/eth41/' /tmp/fwstrings.txt || { echo "::error::image does not poll ota/eth41/"; exit 1; }
+
+      - name: QEMU boot smoke test on the release image
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.1
+          target: esp32
+          path: '.'
+          command: bash tools/qemu-smoke.sh build_eth41
+
+      - name: Draft GitHub Release (review, then Publish to go live)
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: ${{ github.ref_name }}
+          body: |
+            Firmware ${{ github.ref_name }} for the K_EVK_V4.1 Ethernet/PoE station.
+
+            This is a DRAFT. Review the attached binaries, then click "Publish release"
+            to write it to the eth41 OTA channel (main/ota/eth41/). Only eth41 units
+            poll that channel; the 1.x Wi-Fi fleet channel main/ota/ is not touched.
+            Units install within ~24h (boot check + daily poll).
+          files: |
+            build_eth41/rtkdata-fw-eth41.bin
+            build_eth41/www.bin

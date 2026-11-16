@@ -18,6 +18,9 @@ permissions:
 
 jobs:
   promote:
+    # The fleet line only. eth41-v* releases go to main/ota/eth41/ through
+    # promote-eth41.yml and must never reach the 1.x channel.
+    if: startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

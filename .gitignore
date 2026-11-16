@@ -5,6 +5,8 @@ managed_components/*
 
 build/
 build_eth/
+build_*/
+__pycache__/
 cmake-build-debug/
 cmake-build-cmakestd/
 sdkconfig

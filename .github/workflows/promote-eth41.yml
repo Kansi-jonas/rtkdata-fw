@@ -1,0 +1,98 @@
+name: promote-eth41
+
+# The Freigabe for the eth41 line. Fires when you PUBLISH a draft release whose
+# tag starts with eth41-v (see release-eth41.yml). It writes main/ota/eth41/
+# and nothing else; the commit is refused if any other path is staged.
+#
+# Channel URL is hardcoded in the eth41 image (config.h UPDATE_SERVER_URL ->
+# raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/eth41/).
+
+on:
+  release:
+    types: [released]
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    if: startsWith(github.event.release.tag_name, 'eth41-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download the published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.release.tag_name }}"
+          VER="${TAG#eth41-v}"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p 'rtkdata-fw-eth41.bin' -p 'www.bin' -D dl --clobber
+          test -f dl/rtkdata-fw-eth41.bin
+          test -f dl/www.bin
+          echo "VER=$VER" >> "$GITHUB_ENV"
+
+      - name: Verify the binary is this eth41 version
+        run: |
+          set -euo pipefail
+          strings dl/rtkdata-fw-eth41.bin > /tmp/fwstrings.txt
+          grep -qxF "$VER" /tmp/fwstrings.txt || { echo "::error::version string '$VER' not in the image"; exit 1; }
+          grep -qxF 'rtkdata-fw-eth41' /tmp/fwstrings.txt || { echo "::error::not an rtkdata-fw-eth41 image"; exit 1; }
+          grep -qF 'Kansi-jonas/rtkdata-fw/main/ota/eth41/' /tmp/fwstrings.txt || { echo "::error::image does not poll ota/eth41/"; exit 1; }
+
+      - name: Write the eth41 OTA channel (main/ota/eth41/)
+        run: |
+          set -euo pipefail
+          mkdir -p ota/eth41
+          # www.bin ships only when it changed. App and www are not one
+          # transaction, so an unchanged web UI is never put at risk. The
+          # first release stores www.bin as the baseline and ships app only:
+          # every unit got its www partition from the factory image.
+          if [ ! -f ota/eth41/www.bin ]; then
+            echo "first eth41 release: www.bin stored as baseline, app-only update"
+            cp dl/www.bin ota/eth41/www.bin
+            WWW_CHANGED=0
+          elif cmp -s dl/www.bin ota/eth41/www.bin; then
+            echo "www.bin unchanged -> app-only update"
+            WWW_CHANGED=0
+          else
+            echo "www.bin changed -> shipping it too"
+            cp dl/www.bin ota/eth41/www.bin
+            WWW_CHANGED=1
+          fi
+          cp dl/rtkdata-fw-eth41.bin ota/eth41/rtkdata-fw-eth41.bin
+
+          python3 - "$VER" "$WWW_CHANGED" <<'PY'
+          import json, sys
+          ver, www = sys.argv[1], sys.argv[2] == "1"
+          base = "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/eth41/"
+          d = {
+              "version": ver,
+              "channel": "eth41",
+              "notes": "K_EVK_V4.1 Ethernet/PoE station",
+              "update_files_urls": [base + "rtkdata-fw-eth41.bin"] + ([base + "www.bin"] if www else []),
+          }
+          with open("ota/eth41/release.json", "w") as f:
+              json.dump(d, f, indent=2)
+              f.write("\n")
+          PY
+
+          git config user.name  "rtkdata-ci"
+          git config user.email "ci@rtkdata.com"
+          git add ota/eth41/rtkdata-fw-eth41.bin ota/eth41/www.bin ota/eth41/release.json
+          # Belt and braces: this job may only ever change ota/eth41/.
+          OUTSIDE=$(git diff --cached --name-only | grep -v '^ota/eth41/' || true)
+          if [ -n "$OUTSIDE" ]; then
+            echo "::error::refusing to commit paths outside ota/eth41/: $OUTSIDE"
+            exit 1
+          fi
+          if git diff --cached --quiet; then
+            echo "eth41 channel already matches ${{ github.event.release.tag_name }}; nothing to publish"
+          else
+            git commit -m "release: ${{ github.event.release.tag_name }} -> eth41 OTA channel (published)"
+            git push origin HEAD:main
+          fi
