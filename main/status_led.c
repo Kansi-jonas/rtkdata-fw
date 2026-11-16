@@ -60,6 +60,9 @@ status_led_handle_t status_led_add(uint32_t rgba, status_led_flashing_mode_t fla
     uint8_t alpha = rgba & 0xFFu;
 
     status_led_handle_t color = calloc(1, sizeof(struct status_led_color_t));
+    // Callers check for NULL (an LED is optional); dereferencing it here
+    // panicked a low-memory boot before the heap guard could act (U6).
+    if (color == NULL) return NULL;
     color->red = (red * alpha) / 0xFF;
     color->green = (green * alpha) / 0xFF;
     color->blue = (blue * alpha) / 0xFF;
@@ -245,22 +248,38 @@ void status_led_board_start(void) {
     // The OnoLink RGB LED is driven by status_led_add() colors, nothing to start.
 }
 
-#else /* !BOARD_HAS_RGB_STATUS_LED: K_EVK_V4.0, two discrete LEDs */
+void status_led_test_set(int led, int mode) { (void)led; (void)mode; }
+int  status_led_test_get(int led) { (void)led; return -1; }
+
+#else /* !BOARD_HAS_RGB_STATUS_LED: K_EVK_V4.0 / V4.1, two discrete LEDs */
 
 /*
- * The Ethernet board has no RGB LED and no RSSI/assoc LEDs: every OnoLink LED
+ * The Ethernet boards have no RGB LED and no RSSI/assoc LEDs: every OnoLink LED
  * pin is an RMII, PSRAM or UART line here, so none of them may be touched.
  * The color API stays (ntrip/socket/wifi hold handles and flip their mode),
  * but a color is never shown. Instead one task derives two LEDs from state:
  *
  *   green (NTRIP, GPIO12): on = caster streaming, 1 Hz blink = uplink up but
  *                          not streaming yet, off = no uplink
- *   blue  (GPIO13):        on = Ethernet uplink, 1 Hz blink = Wi-Fi uplink,
+ *
+ * V4.0, blue status LED (GPIO13):
+ *                          on = Ethernet uplink, 1 Hz blink = Wi-Fi uplink,
  *                          4 Hz blink = no uplink but setup AP open,
  *                          off = no uplink at all
+ *                          (blue is on during boot, before the task starts)
  *
- * During boot (before status_led_board_start) blue is on and green off.
+ * V4.1, Wi-Fi LED (GPIO32; LAN shows on the RJ45 jack LEDs, PoE in hardware):
+ *                          on = Wi-Fi is the uplink, 4 Hz blink = setup AP
+ *                          open, off = Wi-Fi not in use (parked behind
+ *                          Ethernet or not configured)
  */
+#ifdef BOARD_LED_WIFI_GPIO
+#define BOARD_LED_SECOND_GPIO BOARD_LED_WIFI_GPIO
+#define BOARD_LED_SECOND_BOOT 0
+#else
+#define BOARD_LED_SECOND_GPIO BOARD_LED_STATUS_GPIO
+#define BOARD_LED_SECOND_BOOT 1
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <driver/gpio.h>
@@ -291,7 +310,7 @@ void status_led_remove(status_led_handle_t color) {
 
 void status_led_init() {
     gpio_config_t io = {
-        .pin_bit_mask = (1ULL << BOARD_LED_NTRIP_GPIO) | (1ULL << BOARD_LED_STATUS_GPIO),
+        .pin_bit_mask = (1ULL << BOARD_LED_NTRIP_GPIO) | (1ULL << BOARD_LED_SECOND_GPIO),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -299,10 +318,22 @@ void status_led_init() {
     };
     gpio_config(&io);
     gpio_set_level(BOARD_LED_NTRIP_GPIO, 0);
-    gpio_set_level(BOARD_LED_STATUS_GPIO, 1);   // booting
+    gpio_set_level(BOARD_LED_SECOND_GPIO, BOARD_LED_SECOND_BOOT);   // V4.0: blue on while booting
 }
 
 typedef enum { LED_OFF = 0, LED_ON, LED_BLINK_SLOW, LED_BLINK_FAST } led_pattern_t;
+
+// Board test page overrides, -1 = follow the state (see status_led.h).
+static volatile int s_led_override[2] = { -1, -1 };
+
+void status_led_test_set(int led, int mode) {
+    if (led < 0 || led > 1) return;
+    s_led_override[led] = (mode >= LED_OFF && mode <= LED_BLINK_FAST) ? mode : -1;
+}
+
+int status_led_test_get(int led) {
+    return (led < 0 || led > 1) ? -1 : s_led_override[led];
+}
 
 static int pattern_level(led_pattern_t p, uint32_t tick) {
     switch (p) {
@@ -315,7 +346,7 @@ static int pattern_level(led_pattern_t p, uint32_t tick) {
 
 static void board_led_task(void *ctx) {
     (void)ctx;
-    led_pattern_t green = LED_OFF, blue = LED_ON;
+    led_pattern_t green = LED_OFF, second = BOARD_LED_SECOND_BOOT ? LED_ON : LED_OFF;
 
     for (uint32_t tick = 0;; tick++) {
         if (tick % 8 == 0) {   // re-derive the state once a second
@@ -329,17 +360,27 @@ static void board_led_task(void *ctx) {
             wifi_ap_status(&ap);
 
             bool eth_up  = eth_has_ip();
-            bool sta_up  = sta.connected && !sta.suspended;
+            // Association alone is not an uplink: the LED claimed one while
+            // DHCP had not answered (review 2026-11-06, U5).
+            bool sta_up  = sta.connected && !sta.suspended && sta.ip4_addr.addr != 0;
             bool uplink  = eth_up || sta_up;
 
             green = !uplink ? LED_OFF : (h.caster_ok ? LED_ON : LED_BLINK_SLOW);
-            blue  = eth_up ? LED_ON
-                  : sta_up ? LED_BLINK_SLOW
-                  : ap.active ? LED_BLINK_FAST
-                  : LED_OFF;
+#ifdef BOARD_LED_WIFI_GPIO
+            second = sta_up ? LED_ON
+                   : ap.active ? LED_BLINK_FAST
+                   : LED_OFF;
+#else
+            second = eth_up ? LED_ON
+                   : sta_up ? LED_BLINK_SLOW
+                   : ap.active ? LED_BLINK_FAST
+                   : LED_OFF;
+#endif
         }
-        gpio_set_level(BOARD_LED_NTRIP_GPIO, pattern_level(green, tick));
-        gpio_set_level(BOARD_LED_STATUS_GPIO, pattern_level(blue, tick));
+        led_pattern_t g = s_led_override[0] >= 0 ? (led_pattern_t)s_led_override[0] : green;
+        led_pattern_t s = s_led_override[1] >= 0 ? (led_pattern_t)s_led_override[1] : second;
+        gpio_set_level(BOARD_LED_NTRIP_GPIO, pattern_level(g, tick));
+        gpio_set_level(BOARD_LED_SECOND_GPIO, pattern_level(s, tick));
         vTaskDelay(pdMS_TO_TICKS(BOARD_LED_TICK_MS));
     }
 }

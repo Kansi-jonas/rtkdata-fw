@@ -234,8 +234,9 @@ static void socket_clients_receive(fd_set *socket_set) {
             uart_write(buffer, len);
         }
 
-        // Remove on error
-        if (len < 0 && errno != EWOULDBLOCK) {
+        // Remove on error, and on the peer's FIN (len 0): an EOF socket stays
+        // readable for select() and was polled at full speed (review B4).
+        if (len == 0 || (len < 0 && errno != EWOULDBLOCK && errno != EAGAIN)) {
             socket_client_remove(client);
         }
     }

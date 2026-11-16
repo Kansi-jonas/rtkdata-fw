@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RTKdata Board Test</title>
+<style>
+  /* Board test page, only in images built with -DRTK_TEST_PAGE=1.
+     Self-contained: the device has no internet on its own AP. */
+  :root{
+    --bg:#1a1a1a; --card:#262626; --raise:#2e2e2e; --line:rgba(255,255,255,.10);
+    --txt:#fafafa; --muted:#a3a3a3; --primary:#ededed; --primary-fg:#1c1c1c;
+    --good:#34d399; --good2:rgba(16,185,129,.14); --warn:#fbbf24; --warn2:rgba(245,158,11,.14);
+    --bad:#f87171; --bad2:rgba(239,68,68,.14);
+    --font:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    --mono:ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 var(--font);padding:16px 16px 40px}
+  .wrap{max-width:640px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 2px}
+  .sub{color:var(--muted);margin:0 0 16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:0 0 12px}
+  .card h2{font-size:15px;margin:0 0 8px;display:flex;align-items:center;gap:8px}
+  .hint{color:var(--muted);font-size:13px;margin:6px 0 0}
+  .warn-text{color:var(--warn)}
+  table{width:100%;border-collapse:collapse}
+  td{padding:3px 0;vertical-align:top}
+  td:first-child{color:var(--muted);width:42%;padding-right:8px}
+  td:last-child{font-family:var(--mono);font-size:13px;word-break:break-word}
+  .pill{font-size:12px;font-weight:600;padding:1px 8px;border-radius:999px;margin-left:auto}
+  .pass{color:var(--good);background:var(--good2)}
+  .fail{color:var(--bad);background:var(--bad2)}
+  .info{color:var(--warn);background:var(--warn2)}
+  .btns{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+  button{font:inherit;font-size:13px;background:var(--raise);color:var(--txt);border:1px solid var(--line);
+    border-radius:8px;padding:6px 12px;cursor:pointer}
+  button.primary{background:var(--primary);color:var(--primary-fg);border-color:transparent;font-weight:600}
+  button.on{outline:2px solid var(--good)}
+  button:disabled{opacity:.5;cursor:default}
+  .ledrow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px}
+  .ledrow span{min-width:110px;color:var(--muted)}
+  #conn{font-family:var(--mono);font-size:12px}
+  ul.scan{margin:8px 0 0;padding-left:18px;font-family:var(--mono);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>RTKdata Board Test</h1>
+  <p class="sub">Firmware test build for hardware bring-up. Status refreshes every second. <span id="conn">connecting...</span></p>
+
+  <div class="card">
+    <h2>Board <span class="pill info" id="p-board">...</span></h2>
+    <table id="t-board"></table>
+    <div class="btns">
+      <button onclick="act('clear_boots')">Clear counters</button>
+      <button onclick="if(confirm('Restart the ESP32 now?'))act('restart')">Restart ESP32</button>
+    </div>
+    <p class="hint">Boot counters survive restarts. "power-on / EN" counts power cycles and EN resets. "software" counts firmware restarts: this page, a factory reset, or the supervisor (for example low memory).</p>
+  </div>
+
+  <div class="card">
+    <h2>Report <span class="pill info" id="p-rep">...</span></h2>
+    <table id="t-rep"></table>
+    <table id="t-boots"></table>
+    <table id="t-results"></table>
+    <div class="btns">
+      <button class="primary" onclick="report()">Download report</button>
+    </div>
+    <p class="hint">The page keeps writing one report across restarts, power cycles and reloads of this page: every boot and every test result it sees, listed above. It is stored in this browser for this board, so keep using the same browser and the same address (hotspot or Ethernet IP) for the whole test. Before the next restart, wait until the new boot and the test results show up here.</p>
+  </div>
+
+  <div class="card">
+    <h2>Power and revision <span class="pill" id="p-power">...</span></h2>
+    <table id="t-power"></table>
+    <p class="hint">PoE voltage reads GPIO36 (low = PoE module delivers 5 V). Check it once on PoE only and once on USB only. Revision ID reads the GPIO35 divider once at boot: about 1650 mV on K_EVK_V4.1.</p>
+  </div>
+
+  <div class="card">
+    <h2>Ethernet <span class="pill" id="p-eth">...</span></h2>
+    <table id="t-eth"></table>
+    <p class="hint">Needs a router or switch with DHCP for an IP address. PASS = link at 100 Mbit full duplex and 0 symbol errors. Unplug and replug the cable: "link ups" counts up by one.</p>
+  </div>
+
+  <div class="card">
+    <h2>Wi-Fi <span class="pill" id="p-wifi">...</span></h2>
+    <table id="t-wifi"></table>
+    <div class="btns"><button id="b-scan" onclick="scan()">Scan networks</button></div>
+    <ul class="scan" id="scan"></ul>
+  </div>
+
+  <div class="card">
+    <h2>GNSS (UM980) <span class="pill" id="p-gnss">...</span></h2>
+    <table id="t-gnss"></table>
+    <div class="btns">
+      <button onclick="act('gnss_version')">Read version</button>
+      <button onclick="act('gnss_reset')">Reset GNSS</button>
+    </div>
+    <p class="hint">"Reset GNSS" pulses the UM980 reset line, then sends the full configuration again (takes several seconds). A real reset stops the PPS: "longest PPS pause" then shows several seconds. PPS needs an antenna with sky view.</p>
+  </div>
+
+  <div class="card">
+    <h2>Button SW1 <span class="pill" id="p-btn">...</span></h2>
+    <table id="t-btn"></table>
+    <p class="hint warn-text">Short presses only. Holding the button for 6 seconds erases the configuration (factory reset). Every press also resets the UM980 in hardware.</p>
+  </div>
+
+  <div class="card">
+    <h2>LEDs</h2>
+    <div class="ledrow" id="led0"><span>NTRIP (GPIO12)</span></div>
+    <div class="ledrow" id="led1"><span>Wi-Fi (GPIO32)</span></div>
+    <p class="hint">"Auto" gives the LED back to the firmware. Power, PoE, PPS and the RJ45 LEDs are hardware only.</p>
+  </div>
+
+  <div class="card">
+    <h2>Crypto chip ATECC608B <span class="pill" id="p-atecc">...</span></h2>
+    <table id="t-atecc"></table>
+    <div class="btns"><button onclick="atecc()">Check ATECC608B</button></div>
+    <p class="hint">I2C at address 0x60, SDA GPIO15, SCL GPIO4. Only for K_EVK_V4.1: on a reworked V4.0 GPIO15 is still the GNSS reset, so the page asks first, and the firmware also checks the revision ID.</p>
+  </div>
+
+  <div class="card">
+    <h2>Memory <span class="pill" id="p-heap">...</span></h2>
+    <table id="t-heap"></table>
+    <p class="hint">PASS = internal RAM never fell below 16 KB since boot (the supervisor restarts the unit at 12 KB).</p>
+  </div>
+</div>
+
+<script>
+const LED_MODES = [[-1,'Auto'],[0,'Off'],[1,'On'],[2,'Slow blink'],[3,'Fast blink']];
+const REP_KEY = 'rtk-board-test-report-';
+const REP_MAX = {boots: 300, results: 1000, actions: 500, scans: 5};
+const LISTS = ['boots', 'results', 'actions', 'scans'];
+const RESULT_KEYS = [['gnss version', s => s.gnss.version], ['gnss reset', s => s.gnss.reset_test],
+                     ['atecc', s => s.io.atecc]];
+let last = null, lastScan = null, polling = false;
+let rep = null, pending = [];   // pending: actions before the first status names the board
+let storeWarn = '';
+
+/* Running report. The firmware forgets its test results on every restart, so
+   the page collects them: one entry per boot, told apart by the firmware's
+   boot_id, and every result the moment it appears. Stored in localStorage
+   per board MAC.
+   localStorage has no lock on a plain-http page, so two tabs on the same
+   board can interleave their writes. Every write therefore MERGES this tab's
+   copy with the stored one instead of replacing it: whatever one write loses
+   comes back with that tab's next write, a second later. Reports are only
+   ever merged, never replaced (there is deliberately no "new report" button:
+   discarding history across tabs is where merging goes wrong). A failed save
+   keeps everything in this tab and the Report box says so until a save works. */
+function nowIso(){ return new Date().toISOString(); }
+function fin(v){ return typeof v === 'number' && isFinite(v); }
+function lo(a, b){ return fin(b) ? (fin(a) ? Math.min(a, b) : b) : (fin(a) ? a : null); }
+function hi(a, b){ return fin(b) ? (fin(a) ? Math.max(a, b) : b) : (fin(a) ? a : null); }
+function kbv(v){ return fin(v) ? kb(v) : '-'; }
+function minIso(a, b){ return !a ? b : !b ? a : (a < b ? a : b); }
+function maxIso(a, b){ return !a ? b : !b ? a : (a > b ? a : b); }
+function uniq(list){ return Array.from(new Set(list.filter(Boolean))); }
+function itemTime(k, x){ return (k === 'boots' ? x.first_seen : x.t) || ''; }
+const ITEM_KEY = {boots: x => x.boot_id, results: x => x.boot_id + '|' + x.test + '|' + x.result,
+                  actions: x => x.t + '|' + x.action + '|' + x.result, scans: x => x.t};
+
+function repNew(mac){
+  const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  return normalize({format: 'rtkdata-board-test-report/5', mac, report_id: id, started: nowIso(),
+                    last_status: null, last_status_t: null});
+}
+// Cap bookkeeping per list: how many entries were dropped (a lower bound once
+// tabs merge), and the floor: the time of the newest dropped entry plus the
+// keys of the dropped entries that share exactly that time.
+function normalize(r){
+  LISTS.forEach(k => { if (!Array.isArray(r[k])) r[k] = []; });
+  r.dropped = Object.assign({boots: 0, results: 0, actions: 0, scans: 0}, r.dropped || {});
+  r.floor = r.floor || {};
+  LISTS.forEach(k => { const f = r.floor[k]; r.floor[k] = f && typeof f === 'object' ? {t: f.t || '', keys: f.keys || []} : {t: '', keys: []}; });
+  return r;
+}
+function mergeFloor(fa, fb){
+  if (fa.t === fb.t) return {t: fa.t, keys: uniq(fa.keys.concat(fb.keys))};
+  return fa.t > fb.t ? fa : fb;
+}
+function belowFloor(k, f, x){
+  if (!f.t) return false;
+  const t = itemTime(k, x);
+  return t < f.t || (t === f.t && f.keys.includes(ITEM_KEY[k](x)));
+}
+
+function mergeBoot(a, b){
+  const m = Object.assign({}, a, b);
+  m.first_seen = minIso(a.first_seen, b.first_seen);
+  m.last_seen = maxIso(a.last_seen, b.last_seen);
+  ['uptime_s', 'pps_count', 'pps_max_gap_ms', 'button_presses'].forEach(k => m[k] = hi(a[k], b[k]));
+  m.heap_min = lo(a.heap_min, b.heap_min);
+  const ea = a.eth || {}, eb = b.eth || {};
+  m.eth = {link_seen: !!(ea.link_seen || eb.link_seen),
+           best: (a.last_seen || '') >= (b.last_seen || '') ? (ea.best || eb.best || '') : (eb.best || ea.best || ''),
+           had_ip: !!(ea.had_ip || eb.had_ip),
+           link_ups: hi(ea.link_ups, eb.link_ups), symbol_errors: hi(ea.symbol_errors, eb.symbol_errors)};
+  ['poe_yes_seen', 'poe_no_seen', 'gnss_data_seen'].forEach(k => m[k] = !!(a[k] || b[k]));
+  return m;
+}
+
+function unionBy(a, b, key, merge){
+  const map = new Map();
+  a.concat(b).forEach(x => { const k = key(x); map.set(k, map.has(k) && merge ? merge(map.get(k), x) : (map.get(k) || x)); });
+  return Array.from(map.values());
+}
+
+function mergeReports(a, b){
+  if (!b || !a || b.mac !== a.mac || !Array.isArray(b.boots)) return a || b;
+  normalize(a); normalize(b);
+  // Same report, or two started independently (e.g. two tabs on an empty
+  // store): merge everything. The older id names the result, so every tab
+  // converges on the same id.
+  const older = ((a.started || '') + a.report_id) <= ((b.started || '') + b.report_id) ? a : b;
+  const m = {format: a.format, mac: a.mac, report_id: older.report_id, started: older.started,
+             dropped: {}, floor: {}};
+  LISTS.forEach(k => {
+    m.floor[k] = mergeFloor(a.floor[k], b.floor[k]);
+    m.dropped[k] = Math.max(a.dropped[k] || 0, b.dropped[k] || 0);
+  });
+  m.boots = unionBy(a.boots, b.boots, ITEM_KEY.boots, mergeBoot);
+  ['results', 'actions', 'scans'].forEach(k => m[k] = unionBy(a[k], b[k], ITEM_KEY[k]));
+  // Entries the cap dropped already must not come back from a stale copy and
+  // be dropped (and counted) again.
+  LISTS.forEach(k => { m[k] = m[k].filter(x => !belowFloor(k, m.floor[k], x)); });
+  const newer = (b.last_status_t || '') > (a.last_status_t || '') ? b : a;
+  m.last_status = newer.last_status; m.last_status_t = newer.last_status_t;
+  return m;
+}
+
+function capAll(){
+  LISTS.forEach(k => {
+    const list = rep[k], max = REP_MAX[k];
+    if (list.length <= max) return;
+    list.sort((x, y) => itemTime(k, x) < itemTime(k, y) ? -1 : itemTime(k, x) > itemTime(k, y) ? 1 : 0);
+    const gone = list.splice(0, list.length - max);
+    rep.dropped[k] += gone.length;
+    const t = itemTime(k, gone[gone.length - 1]);
+    const f = {t, keys: gone.filter(x => itemTime(k, x) === t).map(ITEM_KEY[k])};
+    rep.floor[k] = mergeFloor(rep.floor[k], f);
+  });
+}
+
+// Read the stored copy and merge it into this tab's copy.
+function repSync(mac){
+  let stored = null;
+  try {
+    const t = localStorage.getItem(REP_KEY + mac);
+    stored = t ? JSON.parse(t) : null;
+  } catch(e) {
+    storeWarn = 'browser storage not readable (' + e.name + '): the report lives only in this tab, download it before closing';
+  }
+  const ok = stored && stored.mac === mac && Array.isArray(stored.boots);
+  if (!rep || rep.mac !== mac) rep = ok ? stored : repNew(mac);
+  else if (ok) rep = mergeReports(rep, stored);
+  normalize(rep);
+  return rep;
+}
+
+function repSave(){
+  if (!rep) return;
+  capAll();
+  try {
+    localStorage.setItem(REP_KEY + rep.mac, JSON.stringify(rep));
+    storeWarn = '';
+  } catch(e) {
+    storeWarn = 'NOT SAVED in this browser (' + e.name + '): download the report before closing or reloading this page';
+  }
+  renderReport();
+}
+
+function logAction(entry){
+  if (!rep) { pending.push(entry); return; }
+  repSync(rep.mac);
+  rep.actions.push(entry);
+  repSave();
+}
+
+function record(s){
+  const mac = s.board && s.board.mac_wifi;
+  if (!mac) return;
+  repSync(mac);
+  if (pending.length) { rep.actions.push(...pending); pending = []; }
+  const r = s.reset || {}, e = s.eth || {}, g = s.gnss || {}, io = s.io || {}, h = s.heap || {};
+  const id = r.boot_id || 'unknown';
+  let boot = rep.boots.find(b => b.boot_id === id);
+  if (!boot) {
+    boot = {boot_id: id, boot_epoch: r.boot_epoch || 'none', boot_seq: r.boot_seq, first_seen: nowIso(),
+            reset_reason: r.last, boots_counter: r.boots,
+            counters_at_boot: {r_pwr: r.r_pwr, r_sw: r.r_sw, r_panic: r.r_panic,
+                               r_wdt: r.r_wdt, r_brown: r.r_brown, r_other: r.r_other},
+            firmware: s.board.version, rev_id_mv: io.rev_id_mv,
+            uptime_s: null, heap_min: null, pps_count: null, pps_max_gap_ms: null, button_presses: null,
+            eth: {link_seen: false, best: '', had_ip: false, link_ups: null, symbol_errors: null},
+            poe_yes_seen: false, poe_no_seen: false, gnss_data_seen: false};
+    rep.boots.push(boot);
+  }
+  boot.last_seen = nowIso();
+  boot.boots_counter = r.boots;
+  boot.uptime_s = hi(boot.uptime_s, r.uptime_s);
+  boot.heap_min = lo(boot.heap_min, h.internal_min);
+  boot.pps_count = hi(boot.pps_count, g.pps_count);
+  boot.pps_max_gap_ms = hi(boot.pps_max_gap_ms, g.pps_max_gap_ms);
+  boot.button_presses = hi(boot.button_presses, io.button_presses);
+  if (e.link) { boot.eth.link_seen = true; boot.eth.best = e.speed + (e.full_duplex ? ' full' : ' half'); }
+  boot.eth.had_ip = !!(boot.eth.had_ip || e.has_ip);
+  boot.eth.link_ups = hi(boot.eth.link_ups, e.link_ups);
+  boot.eth.symbol_errors = hi(boot.eth.symbol_errors, e.symbol_errors);
+  if (io.poe_voltage === true) boot.poe_yes_seen = true;
+  if (io.poe_voltage === false) boot.poe_no_seen = true;
+  boot.gnss_data_seen = !!(boot.gnss_data_seen || g.data_ok);
+
+  RESULT_KEYS.forEach(([test, get]) => {
+    let v;
+    try { v = get(s); } catch(err) { return; }
+    if (typeof v !== 'string' || !v || v === 'not run') return;
+    if (!rep.results.some(x => x.boot_id === id && x.test === test && x.result === v))
+      rep.results.push({t: nowIso(), boot_id: id, test, result: v});
+  });
+  rep.last_status = s;
+  rep.last_status_t = nowIso();
+  repSave();
+}
+
+/* Boot order comes from the firmware, not from arrival order or the PC
+   clock: epochs (a new one after every NVS erase) in the order they were
+   first seen, inside an epoch by boot_seq. boot n is the n-th in that order,
+   and "not seen" is a jump of boot_seq inside one epoch. */
+function bootView(){
+  const epochFirst = new Map();
+  rep.boots.forEach(b => { const ep = b.boot_epoch || 'none';
+    epochFirst.set(ep, minIso(epochFirst.get(ep), b.first_seen) || ''); });
+  const key = b => epochFirst.get(b.boot_epoch || 'none') + '|' + (b.boot_epoch || 'none');
+  const view = rep.boots.slice().sort((x, y) => {
+    const kx = key(x), ky = key(y);
+    if (kx !== ky) return kx < ky ? -1 : 1;
+    const fx = fin(x.boot_seq), fy = fin(y.boot_seq);
+    if (fx && fy && x.boot_seq !== y.boot_seq) return x.boot_seq - y.boot_seq;
+    if (fx !== fy) return fx ? -1 : 1;
+    return (x.first_seen || '') < (y.first_seen || '') ? -1 : (x.first_seen || '') > (y.first_seen || '') ? 1 : 0;
+  }).map((b, i) => Object.assign({}, b, {n: i + 1, boots_not_seen: 0}));
+  for (let i = 1; i < view.length; i++) {
+    const p = view[i - 1], b = view[i];
+    if ((p.boot_epoch || 'none') !== (b.boot_epoch || 'none') || !fin(p.boot_seq) || !fin(b.boot_seq)) continue;
+    const gap = b.boot_seq - p.boot_seq - 1;
+    if (gap > 0) b.boots_not_seen = gap;
+  }
+  return view;
+}
+
+function renderReport(){
+  if (!rep) return;
+  const view = bootView(), num = new Map(view.map(b => [b.boot_id, b.n]));
+  pill('p-rep', storeWarn ? 'fail' : 'info',
+       storeWarn ? 'NOT SAVED' : rep.boots.length + ' boots, ' + rep.results.length + ' results');
+  const info = [['recording since', new Date(rep.started).toLocaleString()],
+                ['boots seen', rep.boots.length], ['actions logged', rep.actions.length]];
+  if (storeWarn) info.unshift(['warning', storeWarn]);
+  const d = rep.dropped;
+  const dropped = d.boots + d.results + d.actions + d.scans;
+  if (dropped) info.push(['oldest entries dropped (at least)', dropped]);
+  rows('t-rep', info);
+  rows('t-boots', view.map(b => ['boot ' + b.n + ' (' + b.reset_reason + ')',
+    'up ' + (fin(b.uptime_s) ? b.uptime_s : '-') + ' s, heap min ' + kbv(b.heap_min) +
+    ', ETH ' + (b.eth && b.eth.link_seen ? b.eth.best + ', ' + (fin(b.eth.symbol_errors) ? b.eth.symbol_errors : '-') + ' err' : 'no link') +
+    ', PPS ' + (fin(b.pps_count) ? b.pps_count : '-') + ', button ' + (fin(b.button_presses) ? b.button_presses : '-') +
+    (b.boots_not_seen ? ', ' + b.boots_not_seen + ' boots before this one not seen' : '')]));
+  const byBoot = rep.results.slice().sort((x, y) => (num.get(x.boot_id) || 1e9) - (num.get(y.boot_id) || 1e9));
+  rows('t-results', byBoot.map(x => ['boot ' + (num.get(x.boot_id) || '?') + ' ' + x.test, x.result]));
+}
+
+function esc(v){ return String(v).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function rows(id, list){ document.getElementById(id).innerHTML = list.map(([k,v]) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join(''); }
+function pill(id, cls, text){ const e = document.getElementById(id); e.className = 'pill ' + cls; e.textContent = text; }
+function kb(b){ return typeof b === 'number' && isFinite(b) ? (b/1024).toFixed(1) + ' KB' : '-'; }
+function verdict(s){ return /^PASS/.test(s) ? 'pass' : /^FAIL/.test(s) ? 'fail' : 'info'; }
+
+function buildLeds(){
+  [0,1].forEach(i => {
+    const row = document.getElementById('led' + i);
+    LED_MODES.forEach(([m,label]) => {
+      const b = document.createElement('button');
+      b.textContent = label; b.dataset.m = m;
+      b.onclick = () => act('led', '&led=' + i + '&m=' + m);
+      row.appendChild(b);
+    });
+  });
+}
+
+async function act(a, extra){
+  try {
+    const r = await fetch('/test/do?a=' + a + (extra || ''), {cache:'no-store'});
+    const j = await r.json();
+    logAction({t: nowIso(), action: a + (extra || ''), result: j.result});
+    if (j.result && j.result !== 'ok' && j.result !== 'started') alert(a + ': ' + j.result);
+  } catch(e) {
+    // A restart can drop the connection before the answer arrives.
+    logAction({t: nowIso(), action: a + (extra || ''), result: a === 'restart' ? 'restarting' : 'failed: ' + e});
+    if (a !== 'restart') alert(a + ' failed: ' + e);
+  }
+  poll();
+}
+
+function atecc(){
+  if (confirm('Is this a K_EVK_V4.1 board (new PCB with U6 fitted)?\n\nOn a reworked V4.0 board press Cancel: there GPIO15 is the GNSS reset and this test would reset the UM980.'))
+    act('atecc', '&v41=1');
+}
+
+async function scan(){
+  const b = document.getElementById('b-scan'); b.disabled = true; b.textContent = 'Scanning...';
+  try {
+    const r = await fetch('/wifi/scan', {cache:'no-store'});
+    lastScan = await r.json();
+    document.getElementById('scan').innerHTML = lastScan.length
+      ? lastScan.map(ap => `<li>${esc(ap.ssid || '(hidden)')}  ${ap.rssi} dBm  ${esc(ap.authmode)}</li>`).join('')
+      : '<li>no networks found</li>';
+    logAction({t: nowIso(), action: 'wifi_scan', result: lastScan.length + ' networks'});
+    if (rep) {
+      repSync(rep.mac);
+      const cur = last && last.reset ? last.reset.boot_id : null;
+      rep.scans.push({t: nowIso(), boot_id: cur, networks: lastScan});
+      repSave();
+    }
+  } catch(e) {
+    document.getElementById('scan').innerHTML = '<li>Scan failed: ' + esc(e) + '</li>';
+    logAction({t: nowIso(), action: 'wifi_scan', result: 'failed'});
+  }
+  b.disabled = false; b.textContent = 'Scan networks';
+}
+
+function render(s){
+  const b = s.board, r = s.reset;
+  pill('p-board', 'info', s.job === 'idle' ? 'idle' : 'running: ' + s.job);
+  rows('t-board', [
+    ['board', b.name], ['firmware', b.project + ' ' + b.version], ['ESP-IDF', b.idf],
+    ['chip revision', 'v' + Math.floor(b.chip_rev/100) + '.' + (b.chip_rev%100)],
+    ['flash / PSRAM', b.flash_mb + ' MB / ' + b.psram_kb + ' KB'], ['Wi-Fi MAC', b.mac_wifi],
+    ['uptime', r.uptime_s + ' s'], ['last reset', r.last],
+    ['boots since clear', r.boots],
+    ['power-on / EN', r.r_pwr], ['software', r.r_sw], ['panic', r.r_panic],
+    ['watchdog', r.r_wdt], ['brownout', r.r_brown], ['other', r.r_other],
+  ]);
+
+  const io = s.io;
+  const revOk = /V4\.1/.test(io.rev_id || '');
+  pill('p-power', revOk ? 'pass' : 'info', revOk ? 'V4.1' : 'check');
+  rows('t-power', [
+    ['PoE voltage', io.poe_voltage === undefined ? 'n/a' : (io.poe_voltage ? 'yes' : 'no')],
+    ['revision ID', io.rev_id_mv === undefined ? 'n/a' : io.rev_id_mv + ' mV, ' + io.rev_id],
+  ]);
+
+  const e = s.eth;
+  const ethPass = e.present && e.link && e.speed === 100 && e.full_duplex && e.symbol_errors === 0;
+  pill('p-eth', !e.present ? 'fail' : ethPass ? 'pass' : e.link ? 'info' : 'fail',
+       !e.present ? 'no PHY' : ethPass ? (e.has_ip ? 'PASS' : 'PASS, no IP') : e.link ? 'check' : 'no link');
+  rows('t-eth', [
+    ['PHY found', e.present ? 'yes' : 'no'], ['link', e.link ? 'up' : 'down'],
+    ['speed / duplex', e.link ? e.speed + ' Mbit ' + (e.full_duplex ? 'full' : 'half') : '-'],
+    ['IP / gateway', e.has_ip ? e.ip + ' / ' + e.gw : 'no DHCP lease'],
+    ['MAC', e.mac], ['link ups since boot', e.link_ups], ['symbol errors', e.symbol_errors],
+  ]);
+
+  const w = s.wifi;
+  pill('p-wifi', w.ap_active || w.sta_connected ? 'pass' : 'fail', w.ap_active || w.sta_connected ? 'radio up' : 'off');
+  rows('t-wifi', [
+    ['access point', w.ap_active ? w.ap_ssid + ' (' + w.ap_clients + ' clients)' : 'off'],
+    ['station', w.sta_connected ? w.sta_ssid + ', ' + w.sta_rssi + ' dBm, ' + w.sta_ip
+                : w.sta_parked ? 'parked (Ethernet is the uplink)' : 'not connected'],
+  ]);
+
+  const g = s.gnss;
+  const ppsOk = g.pps_age_ms >= 0 && g.pps_age_ms < 1500;
+  pill('p-gnss', g.data_ok ? (ppsOk ? 'pass' : 'info') : 'fail', g.data_ok ? (ppsOk ? 'data + PPS' : 'data, no PPS') : 'no data');
+  rows('t-gnss', [
+    ['data from UM980', g.data_ok ? 'yes' : 'no (silent ' + g.silent_s + ' s)'],
+    ['PPS pulses', g.pps_count], ['last PPS', g.pps_age_ms < 0 ? 'never' : g.pps_age_ms + ' ms ago'],
+    ['longest PPS pause', g.pps_max_gap_ms + ' ms'],
+    ['version', g.version], ['reset test', g.reset_test],
+  ]);
+
+  pill('p-btn', io.button_presses > 0 ? 'pass' : 'info', io.button_presses > 0 ? 'PASS' : 'press SW1');
+  rows('t-btn', [['pressed now', io.button_pressed ? 'yes' : 'no'], ['presses counted', io.button_presses]]);
+
+  [0,1].forEach(i => {
+    const cur = i === 0 ? io.led_ntrip : io.led_second;
+    document.querySelectorAll('#led' + i + ' button').forEach(btn => btn.classList.toggle('on', +btn.dataset.m === cur));
+  });
+
+  pill('p-atecc', verdict(io.atecc), io.atecc.split(':')[0]);
+  rows('t-atecc', [['result', io.atecc]]);
+
+  const h = s.heap;
+  if (!fin(h.internal_min)) pill('p-heap', 'info', '-');
+  else pill('p-heap', h.internal_min >= 16384 ? 'pass' : 'fail', h.internal_min >= 16384 ? 'PASS' : 'LOW');
+  rows('t-heap', [
+    ['internal free', kb(h.internal_free)], ['internal minimum', kb(h.internal_min)],
+    ['largest internal block', kb(h.internal_largest)], ['PSRAM free', kb(h.psram_free)],
+  ]);
+}
+
+async function poll(){
+  if (polling) return;          // one request at a time: no answer overtakes a newer one
+  polling = true;
+  const conn = document.getElementById('conn');
+  try {
+    const r = await fetch('/test/status', {cache:'no-store'});
+    last = await r.json();
+  } catch(e) {
+    conn.textContent = 'no connection (restarting?)';
+    return;
+  } finally {
+    polling = false;
+  }
+  // Display and report apart: a display error must not stop the recording.
+  let err = '';
+  try { render(last); } catch(e) { err += ' display error: ' + e.message; }
+  try { record(last); } catch(e) { err += ' report error: ' + e.message; }
+  conn.textContent = 'connected ' + new Date().toLocaleTimeString() + err;
+}
+
+function report(){
+  if (!rep) { alert('No data from the board yet.'); return; }
+  repSync(rep.mac);
+  const view = bootView(), num = new Map(view.map(b => [b.boot_id, b.n]));
+  const data = Object.assign({created: nowIso()}, rep, {boots: view,
+    results: rep.results.map(x => Object.assign({boot: num.get(x.boot_id)}, x))});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], {type:'application/json'}));
+  a.download = 'board-test-' + rep.mac.replace(/:/g, '') + '-' + new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '') + '.json';
+  a.click();
+}
+
+buildLeds();
+poll();
+setInterval(poll, 1000);
+</script>
+</body>
+</html>

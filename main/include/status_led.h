@@ -36,6 +36,13 @@ void status_led_init();
 // uplink state. Call once the supervisor runs. No-op on the RGB (OnoLink) board.
 void status_led_board_start(void);
 
+// Board test page (Ethernet boards): force a firmware LED to a pattern.
+// led: 0 = NTRIP, 1 = second LED (Wi-Fi on V4.1, status on V4.0).
+// mode: -1 = back to the state-derived pattern, 0 off, 1 on, 2 slow, 3 fast.
+// No-op on the RGB (OnoLink) board.
+void status_led_test_set(int led, int mode);
+int  status_led_test_get(int led);
+
 // wifi leds
 void rssi_led_set(uint8_t value);
 void rssi_led_fade(uint8_t value, int max_fade_time_ms);

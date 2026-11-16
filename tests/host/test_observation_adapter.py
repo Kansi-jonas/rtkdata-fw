@@ -46,6 +46,12 @@ static uint32_t ntrip_now_ms(void) { return clock_ms; }
 static bool gnss_site_upload_allowed(void) { return upload_allowed; }
 static uint32_t gnss_site_upload_generation(void) { return site_generation; }
 static void supervisor_note_gnss_rx(void) { ++liveness_notes; }
+/* 1005/1006 go to the relocation guard; covered by test_gnss_site_runtime.py */
+static int arp_notes;
+__attribute__((unused))
+static void gnss_site_runtime_note_frame(const uint8_t *frame, size_t len) {
+    (void)frame; (void)len; ++arp_notes;
+}
 #define portMAX_DELAY 0
 static void xSemaphoreTake(int mutex, int delay) { (void)mutex; (void)delay; }
 static void xSemaphoreGive(int mutex) { (void)mutex; }
@@ -135,15 +141,18 @@ int main(void) {
     ntrip_server_ingest_uart(frame + len / 2, len - len / 2);
     CHECK(g_frame_ring.next_seq == before);
     CHECK(ntrip_server_observations_silent_ms() == UINT32_MAX);
+    CHECK(arp_notes == 0);                 /* MSM frames are not reference points */
     len = observation_frame(frame, 1005, 2000, OBS_VALID);
     clock_ms = 100;
     ntrip_server_ingest_uart(frame, len);
     CHECK(g_frame_ring.next_seq == before + 1);
     CHECK(ntrip_server_observations_silent_ms() == UINT32_MAX);
+    CHECK(arp_notes == 1);                 /* the 1005 reaches the relocation guard */
     len = observation_frame(frame, 1077, 2000, OBS_VALID);
     clock_ms = 110;
     ntrip_server_ingest_uart(frame, len);
     CHECK(ntrip_server_observations_silent_ms() == 0);
+    CHECK(arp_notes == 1);
 
     // Model the reset writer after incrementing its epoch but before setting
     // the reset-request flag. Epoch identity alone must drop the old partial.

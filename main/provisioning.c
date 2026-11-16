@@ -299,6 +299,7 @@ static bool enroll(void) {
 
 /* --------------------------------------------------------------- heartbeat */
 
+#ifndef CONFIG_RTK_SITE_LEGACY   /* site-v1 reply parsing, unused by the legacy IE */
 static bool json_integer(cJSON *object, const char *key, double min, double max,
                           int64_t *value) {
     cJSON *item = cJSON_GetObjectItemCaseSensitive(object, key);
@@ -332,6 +333,7 @@ static bool parse_site_control(cJSON *root, gnss_site_control_t *out) {
         .lat_e9 = lat, .lon_e9 = lon, .h_mm = (int32_t)height};
     return true;
 }
+#endif
 
 static void apply_reply(cJSON *root) {
     xSemaphoreTake(s_mtx, portMAX_DELAY);
@@ -380,13 +382,35 @@ static void apply_reply(cJSON *root) {
             ESP_LOGW(TAG, "IE position lacks numeric lat/lon/h; not applying");
         }
     }
+#ifdef CONFIG_RTK_SITE_LEGACY
+    bool want_fix = s_st.pos_valid;
+    double fix_lat = s_st.pos_lat, fix_lon = s_st.pos_lon, fix_h = s_st.pos_h;
+#endif
     xSemaphoreGive(s_mtx);
 
+#ifdef CONFIG_RTK_SITE_LEGACY
+    /* Legacy IE (1.1.9 contract): a converged IE position IS the fixed-base
+     * command, handed over on every reply outside the lock. gnss_set_fixed_base
+     * is idempotent on the receiver-acked coordinate and retries a failed one
+     * with a cooldown, so this costs nothing in steady state. */
+    static bool s_fixed_base_set = false;   // log edge only
+    if (want_fix) {
+        if (gnss_set_fixed_base(fix_lat, fix_lon, fix_h)) {
+            if (!s_fixed_base_set) {
+                s_fixed_base_set = true;
+                ESP_LOGI(TAG, "fixed base applied from IE position");
+            }
+        } else {
+            s_fixed_base_set = false;
+        }
+    }
+#else
     /* Position is display data. Only the boot-bound versioned command can
      * change receiver state or authorize any correction upload. */
     gnss_site_control_t control;
     if (parse_site_control(root, &control) && !gnss_site_apply_control(&control))
         ESP_LOGW(TAG, "site command not applied; upload remains governed by local gate");
+#endif
 
     /* IE re-issued credentials (re-host, go-live mountpoint, ...) */
     cJSON *delta = cJSON_GetObjectItem(root, "config_delta");
@@ -412,10 +436,14 @@ static void apply_reply(cJSON *root) {
 
 static void handle_heartbeat_auth_failure(int status) {
     if (status != 401 && status != 403 && status != 404) return;
+#ifndef CONFIG_RTK_SITE_LEGACY
     gnss_site_status_t site;
     gnss_site_status(&site);
     gnss_site_control_t hold = {.boot_id = site.boot_id, .mode = GNSS_SITE_HOLD};
     gnss_site_apply_control(&hold);
+#endif
+    /* Legacy IE: no site gate to hold, upload keeps running like on 1.1.9;
+     * an invalid token is still repaired by re-enrolling below. */
     if (status == 403) return; /* disabled/quarantined is not an enrollment reset */
     /* A removed registry record or invalid token can be repaired with the
      * separately provisioned per-device enrollment key. Keep site intent,
@@ -428,7 +456,13 @@ static void handle_heartbeat_auth_failure(int status) {
     s_st.enrolled = false;
     s_st.pos_valid = false;
     strlcpy(s_st.state, "provisioning", sizeof(s_st.state));
+#ifdef CONFIG_RTK_SITE_LEGACY
+    /* The legacy IE never sends site_phase, so "checking" would stick on the
+     * UI after the re-enroll repaired everything (review 13.11. R3, P3). */
+    s_st.site_phase[0] = '\0';
+#else
     strlcpy(s_st.site_phase, "checking", sizeof(s_st.site_phase));
+#endif
     xSemaphoreGive(s_mtx);
 }
 
@@ -437,13 +471,25 @@ static void heartbeat(void) {
     supervisor_health(&h);
 
     uint32_t nonce = esp_random();
+    static char site_json[768], canon[640];
+#ifdef CONFIG_RTK_SITE_LEGACY
+    /* Legacy IE canon, byte-identical to the 1.1.9 fleet. The body carries no
+     * "site" either: an IE that later learns site-v1 may treat a site object
+     * as the opt-in and then reject this legacy signature (Kconfig help). */
+    const char *site_pre = "", *site_post = "";
+    site_json[0] = '\0';
+    int canon_len = snprintf(canon, sizeof(canon), "%s|%u|%u",
+        s_device_id, (unsigned)h.uptime_s, (unsigned)nonce);
+#else
     gnss_site_status_t site;
     gnss_site_status(&site);
-    static char site_json[768], site_canon[512], canon[640];
+    static char site_canon[512];
+    const char *site_pre = "\"site\":", *site_post = ",";
     if (gnss_site_json(site_json, sizeof(site_json), &site) < 0 ||
         gnss_site_canonical(site_canon, sizeof(site_canon), &site) < 0) return;
     int canon_len = snprintf(canon, sizeof(canon), "%s|%u|%u|site-v1|%s",
         s_device_id, (unsigned)h.uptime_s, (unsigned)nonce, site_canon);
+#endif
     if (canon_len <= 0 || (size_t)canon_len >= sizeof(canon)) return;
     char hmac[65];
     // Heartbeat is keyed with the per-station token issued at enroll; it only
@@ -470,7 +516,7 @@ static void heartbeat(void) {
     // PHY symbol-error counters (the bench/field signal for marginal RMII
     // timing). Health is stored as-is by the IE and is outside the HMAC
     // canon. The Wi-Fi 1.x beat stays byte-identical.
-    char net_json[160] = "";
+    char net_json[192] = "";
 #if BOARD_HAS_ETH
     {
         eth_status_t es;
@@ -480,6 +526,16 @@ static void heartbeat(void) {
                  "\"eth_speed\":%u,\"eth_link_ups\":%u,\"eth_sym_err\":%u",
                  BOARD_NAME, es.has_ip ? "eth" : "wifi", es.link ? "true" : "false",
                  (unsigned)es.speed_mbps, (unsigned)es.link_ups, (unsigned)es.symbol_errors);
+    }
+#endif
+#ifdef CONFIG_RTK_SITE_LEGACY
+    {
+        // Relocation guard: > 0 while the unit refuses or has dropped the IE
+        // coordinate because it is that many metres away from it. The legacy
+        // IE stores health as-is, so a moved station is visible in its DB.
+        size_t used = strlen(net_json);
+        snprintf(net_json + used, sizeof(net_json) - used, ",\"moved_m\":%u",
+                 (unsigned)gnss_legacy_moved_m());
     }
 #endif
 
@@ -492,7 +548,7 @@ static void heartbeat(void) {
         "\"gnss_ok\":%s,\"caster_ok\":%s,\"link_ok\":%s,"
         "\"obs_expected\":%s,\"obs_silent_s\":%ld,"
         "\"rec_gnss\":%u,\"rec_caster\":%u,\"rec_wifi\":%u,\"reboots\":%u%s%s%s},"
-        "\"site\":%s,\"nonce\":%u,\"hmac\":\"%s\"}",
+        "%s%s%s\"nonce\":%u,\"hmac\":\"%s\"}",
         s_device_id, s_token, (unsigned)h.uptime_s,
         FW_VERSION,
         (unsigned)h.gnss_silent_s, (unsigned)h.caster_silent_s, (unsigned)h.ip_down_s,
@@ -500,7 +556,7 @@ static void heartbeat(void) {
         h.obs_expected ? "true" : "false", (long)h.obs_silent_s,
         (unsigned)h.recoveries_gnss, (unsigned)h.recoveries_caster, (unsigned)h.recoveries_wifi,
         (unsigned)h.reboots_supervised, net_json, tx_sep, tx_json,
-        site_json, (unsigned)nonce, hmac);
+        site_pre, site_json, site_post, (unsigned)nonce, hmac);
 
     if (n <= 0 || (size_t)n >= sizeof(body)) {
         // A truncated body would fail the IE's JSON parse at best and poison
@@ -541,6 +597,11 @@ static void provisioning_task(void *ctx) {
     xSemaphoreGive(s_mtx);
 
     for (;;) {
+#ifdef CONFIG_RTK_SITE_LEGACY
+        // Relocation and unknown-mode checks need no IE: also while an
+        // enrollment is failing (a moved unit whose IE record was deleted).
+        gnss_legacy_tick();
+#endif
         if (state < RTK_PROVISIONING) {
             if (enroll()) {
                 enroll_retry_s = 15;
@@ -596,12 +657,14 @@ void provisioning_fill_status(cJSON *root) {
         cJSON_AddNumberToObject(p, "h", s_st.pos_h);
     }
     xSemaphoreGive(s_mtx);
+#ifndef CONFIG_RTK_SITE_LEGACY   /* legacy: no grant, the IE state is shown as is */
     gnss_site_status_t site;
     gnss_site_status(&site);
     cJSON *shown_phase = cJSON_GetObjectItem(root, "site_phase");
     if (!site.upload_allowed && cJSON_IsString(shown_phase) &&
         (!shown_phase->valuestring[0] || !strcmp(shown_phase->valuestring, "active")))
         cJSON_SetValuestring(cJSON_GetObjectItem(root, "site_phase"), "checking");
+#endif
 
     /* local liveness the device is sure of */
     cJSON_AddBoolToObject(root, "data_ok", h.caster_ok);

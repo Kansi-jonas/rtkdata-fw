@@ -18,6 +18,12 @@ uint32_t uart_event_post_drops(void);
 // corrupting memory.
 uint32_t uart_read_errors(void);
 
+// GNSS UART receive faults from the driver event queue: overflows (hardware
+// FIFO or ring buffer full, bytes were lost) and line errors (framing,
+// parity, break; a UM980 held in reset drives a break).
+uint32_t uart_rx_overflows(void);
+uint32_t uart_rx_line_errors(void);
+
 int uart_log(char *buffer, size_t len);
 int uart_nmea(const char *fmt, ...);
 int uart_write(char *buffer, size_t len);

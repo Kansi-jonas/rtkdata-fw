@@ -27,6 +27,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "board_test.h"
 #include "esp_log.h"
 #include "driver/uart.h"
 #include "driver/ledc.h"
@@ -67,9 +69,18 @@ static const char *TAG = "MAIN";
 
 static char *reset_reason_name(esp_reset_reason_t reason);
 
-#if CONFIG_RTK_BOARD_K_EVK_V4
+/* Boot-phase memory trace (Ethernet board, 15.10.: the internal heap ran out
+ * before the supervisor's own telemetry starts). One line per milestone. */
+static void log_heap(const char *where) {
+    ESP_LOGI(TAG, "heap @%s: internal free %u largest %u, psram free %u", where,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
 
-// K_EVK_V4: GPIO34 is input-only with an external pull-up (R77), so it is a
+#if CONFIG_RTK_BOARD_K_EVK
+
+// K_EVK_V4 and V4.1: GPIO34 is input-only with an external pull-up (R77), so it is a
 // plain input; iot_button would try to enable an internal pull it does not have.
 // Every press also resets the UM980 in hardware, so a short press means
 // "reconfigure the receiver" and a long hold (6 s) means factory reset.
@@ -198,6 +209,7 @@ void app_main()
     stream_stats_init();
 
     config_init();
+    board_test_count_boot();    // empty unless built with -DRTK_TEST_PAGE=1
     init_state();
 
     // RTCM ingest (parser + frame ring) comes up BEFORE the UART task exists:
@@ -278,14 +290,22 @@ void app_main()
     net_init();
 
     wifi_init();
+    log_heap("wifi");
 
     // Ethernet board: the cable is the primary uplink. Failure (no RMII clock,
     // no PHY) is logged and the unit carries on over Wi-Fi.
     bool eth_ok = (eth_init() == ESP_OK);
+    log_heap("eth");
+
+    // Ethernet boards: the LED task only reads uplink and supervisor state, so
+    // it can run now. Started after the OTA window (as before), both LEDs
+    // stayed dark for up to a minute after power-on. No-op on the OnoLink.
+    status_led_board_start();
 
     ota_update_init();          // SPIFFS mount (web server serves from it)
 
     gnss_init();                // UM980 UART config (no heap/TLS) - configure receiver early
+    log_heap("gnss");
 
     // Fresh-device provisioning fix: wait_for_ip() below blocks until the STA
     // gets an IP, which a device with NO STA WiFi configured never does -- so the
@@ -338,10 +358,19 @@ void app_main()
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
+#if CONFIG_RTK_TEST_PAGE
+    // The vendor's test build must stay the test build: its LAN may reach the
+    // internet, and a boot check would replace it with the newer customer
+    // release of the eth41 channel in the middle of the factory test (14.11.).
+    ESP_LOGW(TAG, "board test build: no OTA (boot check and daily poll off)");
+    uart_nmea("$PESP,OTA,OFF,TESTBUILD");
+#else
     ota_boot_check_blocking();  // installs + reboots if newer; runs on a 16K-stack task (anti stack-smash)
+#endif
 
     // ---- data plane (brought up only after the OTA window) ----
     ntrip_server_init();
+    log_heap("ntrip");
 
     if (!web_started) {
         web_server_init();   // provisioned + connected: web server after the OTA window (full heap)
@@ -354,10 +383,15 @@ void app_main()
     // RTKdata: data-path health supervisor + zero-touch provisioning
     // Link rung: eth_link_recover() is wifi_driver_restart() on the Wi-Fi
     // board, and DHCP-restart-or-Wi-Fi-fallback on the Ethernet board.
-    supervisor_set_recovery(gnss_recover, ntrip_server_reconnect_all, eth_link_recover);
+    // Caster rung: kick_stalled, not reconnect_all. reconnect_all also cancels
+    // connects in progress (right for new credentials), and every 15 s that
+    // kept a slow but working caster unreachable (review 2026-11-06, N2).
+    supervisor_set_recovery(gnss_recover, ntrip_server_kick_stalled, eth_link_recover);
+    supervisor_set_log_repair(gnss_repair_required_logs);
     supervisor_init();
     provisioning_init();
-    status_led_board_start();
+    log_heap("services");
+    board_test_init();          // empty unless built with -DRTK_TEST_PAGE=1
 
     check_count_webhandler();
 
@@ -389,7 +423,9 @@ void app_main()
     // version is published (then ota_boot_check_blocking installs it at full
     // heap). No new version -> no restart. 8 KB stack: the manifest GET still
     // does a TLS handshake (cert-bundle verify), too tight at 4 KB.
+#if !CONFIG_RTK_TEST_PAGE
     xTaskCreate(&ota_schedule_check_newupdate, "OTA_Sched_Task", 8192, NULL, 5, NULL);
+#endif
 
 #ifdef DEBUG_HEAP
     while (true) {

@@ -56,6 +56,61 @@ Every OnoLink LED pin (21, 22, 19, 32, 27, 16), its GNSS reset (22) and its
 button (13) collide with RMII, PSRAM or the LEDs here. That is why the two
 boards can never share an image.
 
+## K_EVK_V4.1 (schematic SCH_1013)
+
+The revision after `K_EVK_V4.0_SCH_1013` (2026-10-13), with the fixes asked for
+on 13.10. (FB5 fitted, 1k pull-up on GPIO13, U6 fitted), is its own build
+target, because its pin map differs:
+
+| | K_EVK_V4.1 |
+|---|---|
+| Build | `idf.py -B build_eth41 -DRTK_BOARD=k_evk_v41 build` |
+| Project name / app | `rtkdata-fw-eth41` / `rtkdata-fw-eth41.bin` |
+| Version | `FW_VERSION_ETH41` (2.1.x) |
+| OTA channel | `main/ota/eth41/` |
+| sdkconfig | `build_eth41/sdkconfig`, from `sdkconfig.defaults` + `sdkconfig.defaults.k_evk_v41` |
+
+Pin changes against V4.0:
+
+| Function | GPIO | Notes |
+|---|---|---|
+| RMII REF_CLK in | 0 | from oscillator Y7 (YSO110TR) via R160 33R; LAN8720 in REF_CLK In mode |
+| Oscillator enable | 2 | Y7 tri-state pin, R107 4.7k pull-down: off at every chip reset; firmware drives it high before the Ethernet driver starts |
+| GNSS reset | 13 | same circuit as before, low = reset; needs the board's 1k pull-up to keep the UM980 running through ESP32 resets |
+| I2C SDA / SCL | 15 / 4 | crypto chip U6; GPIO15 no longer resets the GNSS |
+| LED Wi-Fi | 32 | high = on; was the UM980 COM2 TX line (COM2 is configured through COM1) |
+| UM980 COM2 TX | 33 | into the ESP32, not used yet |
+| PoE sense | 36 | input, low = PoE voltage present, read by the test build only |
+| Revision ID | 35 | input, 10k/10k divider (about 1.65 V), read by the test build only |
+
+`eth_init()` holds nRST (GPIO5) low, sets GPIO2 high, waits 5 ms (the
+oscillator starts within 3 ms) and then lets the driver pulse nRST, because
+the LAN8720 needs CLKIN running during reset. The same image is safe on a
+reworked V4.0 sample: GPIO2 then only drives the unused UM980 EVENT pin or
+enables the reworked oscillator, GPIO13 lights the old blue LED or keeps the
+receiver running, GPIO32 toggles the unused COM2 line.
+
+Memory: both Ethernet sdkconfig defaults put the Wi-Fi and lwIP buffers in
+PSRAM (`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`,
+`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096`). 2.1.0 ran out of internal RAM on
+the first V4.1 hardware (tasks not created, supervisor reboot loop). Defaults
+never override an existing sdkconfig, so `board.h` fails the compile in a
+build dir from before 2.1.1: build in a fresh dir.
+
+## Board test build (hardware vendor only)
+
+`-DRTK_TEST_PAGE=1` adds `/test.html` (from `test-page/`, only in that build's
+SPIFFS image) and `/test/status`, `/test/do` (`main/board_test.c`): boot
+counters per reset reason, Ethernet and Wi-Fi state, Wi-Fi scan, UM980 version
+and a reset test proven by the PPS pause, PPS on GPIO39, button edges, PoE
+sense, revision ID, LED override, ATECC608B wake probe (only after the tester
+confirms V4.1 and the revision ID agrees, because GPIO15 is the GNSS reset on
+a reworked V4.0), heap. Never for a customer or OTA image; a non-test build
+redirects `/test.html`, and `board_test.c` fails the compile if the CMake flag
+and the sdkconfig disagree.
+
+    idf.py -B build_eth41_test -DRTK_BOARD=k_evk_v41 -DRTK_TEST_PAGE=1 build
+
 ## Behaviour
 
 Uplink:

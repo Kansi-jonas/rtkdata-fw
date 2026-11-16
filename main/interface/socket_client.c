@@ -77,8 +77,9 @@ static void socket_client_task(void *ctx) {
         ERROR_ACTION(TAG, sock == CONNECT_SOCKET_ERROR_RESOLVE, goto _error, "Could not resolve host");
         ERROR_ACTION(TAG, sock == CONNECT_SOCKET_ERROR_CONNECT, goto _error, "Could not connect to host");
 
-        int err = write(sock, connect_message, strlen(connect_message));
+        int err = connect_message ? write(sock, connect_message, strlen(connect_message)) : 0;
         free(connect_message);
+        connect_message = NULL;   // _error frees it again (double free, review B1)
         ERROR_ACTION(TAG, err < 0, goto _error, "Could not send connection message: %d %s", errno, strerror(errno));
 
         ESP_LOGI(TAG, "Successfully connected to %s:%d", host, port);
@@ -91,10 +92,21 @@ static void socket_client_task(void *ctx) {
         char *buffer = malloc(BUFFER_SIZE);
 
         int len;
-        while ((len = read(sock, buffer, BUFFER_SIZE)) >= 0) {
-            uart_write(buffer, len);
-
-            stream_stats_increment(stream_stats, len, 0);
+        // TCP: 0 is the peer's FIN, the end; it used to loop at full speed
+        // (review B4). UDP: 0 is a valid empty datagram. A receive timeout
+        // (EAGAIN) is an idle one-way link, not a disconnect.
+        while (true) {
+            len = buffer ? read(sock, buffer, BUFFER_SIZE) : -1;
+            if (len > 0) {
+                uart_write(buffer, len);
+                stream_stats_increment(stream_stats, len, 0);
+            } else if (len == 0 && socktype == SOCK_STREAM) {
+                break;
+            } else if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && buffer) {
+                continue;
+            } else if (len < 0) {
+                break;
+            }
         }
 
         free(buffer);

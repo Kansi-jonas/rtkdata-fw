@@ -41,6 +41,9 @@ bool eth_wait_link(uint32_t timeout_ms);
 
 bool eth_link_up(void);
 bool eth_has_ip(void);
+// The Ethernet DHCP client is started (asking or holding a lease). False when
+// it never started or was stopped; also false without Ethernet.
+bool eth_dhcp_client_running(void);
 
 void eth_status(eth_status_t *out);
 
@@ -48,5 +51,15 @@ void eth_status(eth_status_t *out);
 // IP -> restart the DHCP client; no link -> restart the Wi-Fi driver (the STA
 // is the fallback uplink). On a board without Ethernet: the Wi-Fi restart.
 void eth_link_recover(void);
+
+// The Wi-Fi STA gained or lost its IPv4 lease (called from wifi.c's IP event
+// handlers). The Ethernet board then re-selects the default route from the
+// uplinks that have an address, Ethernet first. No-op without Ethernet.
+void eth_uplink_note_sta_ip(bool up);
+
+// Put the selected uplink's DNS servers back if another interface's DHCP
+// start cleared lwIP's global table. Called once per supervisor tick; no-op
+// without Ethernet.
+void eth_dns_guard(void);
 
 #endif // RTKDATA_ETH_H

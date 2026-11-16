@@ -126,6 +126,40 @@ int main(void) {
     CHECK(strstr(buf, "\"upload_allowed\":true") && strstr(buf, "\"v\":1"));
     CHECK(gnss_site_json(buf, 5, &status) < 0);
     CHECK(gnss_site_canonical(buf, 5, &status) < 0);
+    /* RTCM 1005 reference point (review 13.11. L3 #2). Golden: a frame
+     * recorded from the Saarland edge box (UM980, station 1008). pyrtcm
+     * decodes it to X 4125951.0083, Y 495896.9049, Z 4822713.6169, which is
+     * 49.4393264 N 6.8534891 E, the box's known site. */
+    {
+        static const uint8_t arp[] = {0xd3,0x00,0x13,0x3e,0xd3,0xf0,0x03,0x89,0x9b,0x42,0x29,0x43,0x81,0x27,0x93,0xdc,0xd9,0x0b,0x3a,0x8f,0xb2,0xa9,0x88,0x94,0x86};
+        double lat = 0, lon = 0;
+        CHECK(gnss_site_parse_arp(arp, sizeof(arp), &lat, &lon));
+        CHECK(fabs(lat - 49.43932637) < 1e-7 && fabs(lon - 6.85348914) < 1e-7);
+        CHECK(!gnss_site_parse_arp(arp, sizeof(arp) - 1, &lat, &lon));  /* length */
+        uint8_t other[sizeof(arp)];
+        memcpy(other, arp, sizeof(arp));
+        other[4] ^= 0x10;                                               /* type 1005 -> 1004 */
+        CHECK(!gnss_site_parse_arp(other, sizeof(other), &lat, &lon));
+        memcpy(other, arp, sizeof(arp));
+        memset(other + 7, 0, 15);                                       /* ECEF zero */
+        CHECK(!gnss_site_parse_arp(other, sizeof(other), &lat, &lon));
+        other[0] = 0xD2;
+        CHECK(!gnss_site_parse_arp(other, sizeof(other), &lat, &lon));
+        /* 1006 = 1005 plus 16 bits antenna height: 21 payload bytes. A
+         * 19-byte "1006" is malformed (L4). */
+        memcpy(other, arp, sizeof(arp));
+        other[4] = (uint8_t)((other[4] & 0x0F) | 0xE0);                 /* type 1006 */
+        CHECK(!gnss_site_parse_arp(other, sizeof(other), &lat, &lon));
+        uint8_t m1006[sizeof(arp) + 2];
+        memcpy(m1006, other, 3 + 19);
+        m1006[2] = 21;
+        m1006[22] = 0x01; m1006[23] = 0x02;                             /* height */
+        memcpy(m1006 + 24, arp + 22, 3);                                /* CRC bytes (not checked here) */
+        CHECK(gnss_site_parse_arp(m1006, sizeof(m1006), &lat, &lon));
+        CHECK(fabs(lat - 49.43932637) < 1e-7 && fabs(lon - 6.85348914) < 1e-7);
+        m1006[4] = (uint8_t)((m1006[4] & 0x0F) | 0xD0);                 /* a 21-byte "1005" */
+        CHECK(!gnss_site_parse_arp(m1006, sizeof(m1006), &lat, &lon));
+    }
     printf("%d checks passed\n", checks);
     return 0;
 }

@@ -16,6 +16,40 @@ menu "RTKdata board"
         config RTK_BOARD_K_EVK_V4
             bool "K_EVK_V4.0 (Ethernet LAN8720 + optional PoE, 2.x)"
             select ETH_USE_ESP32_EMAC
+
+        config RTK_BOARD_K_EVK_V41
+            bool "K_EVK_V4.1 (schematic SCH_1013: REF_CLK In oscillator, 2.x)"
+            select ETH_USE_ESP32_EMAC
     endchoice
+
+    # Both Ethernet revisions: what they share (button, Ethernet stack, LEDs
+    # derived from state) keys on this; pins stay per revision in board.h.
+    config RTK_BOARD_K_EVK
+        bool
+        default y if RTK_BOARD_K_EVK_V4 || RTK_BOARD_K_EVK_V41
+
+    config RTK_TEST_PAGE
+        bool "Board test page (/test.html), never in a customer image"
+        depends on RTK_BOARD_K_EVK
+        default n
+        help
+            Adds /test/status and /test/do for the hardware vendor's bring-up:
+            GNSS reset, LED override, ATECC probe, restart. Do not set this by
+            hand; build with `-DRTK_TEST_PAGE=1`, which also arms the stale
+            build dir guard in board_test.c.
+
+    config RTK_SITE_LEGACY
+        bool "Legacy IE heartbeat (site-v1 upload gate off)"
+        default y
+        help
+            The production IE (13.11.2026) verifies only the legacy heartbeat
+            canon device_id|uptime|nonce. The site-v1 heartbeat of the
+            automatic site lifecycle is answered with 401, and its upload
+            gate then never opens, so a unit built without this option cannot
+            stream to the RTKdata caster at all. With this option the unit
+            behaves like the 1.1.9 fleet: legacy canon, upload open from boot,
+            the IE's converged position applied as the fixed base. Switch it
+            off only together with an IE (and Lighthouse) that serves site-v1,
+            see docs/AUTOMATIC_SITE_LIFECYCLE_2026-09-19.md.
 
 endmenu

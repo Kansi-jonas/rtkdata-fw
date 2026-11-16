@@ -1,6 +1,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 #include <freertos/timers.h>
+#include <freertos/semphr.h>
 #include <esp_wifi.h>
 #include <esp_log.h>
 #include <string.h>
@@ -16,8 +17,10 @@
 #include "wifi.h"
 #include "config.h"
 #include "supervisor.h"
+#include "eth.h"
 #include "esp_mac.h"
 #include "dns_server.h"
+#include "board.h"
 
 #define AP_AUTO_OFF_MS    (15U * 60U * 1000U)
 #define AP_AUTO_OFF_TICKS pdMS_TO_TICKS(AP_AUTO_OFF_MS)
@@ -43,7 +46,17 @@ static TaskHandle_t wifi_ctrl_task      = NULL;
 
 static int          ap_rearm_count      = 0;   // consecutive auto-off re-arms this AP session
 
-static TimerHandle_t ap_stop_timer      = NULL; 
+static TimerHandle_t ap_stop_timer      = NULL;
+/* Serializes the scan's AP -> APSTA -> AP switch against the AP auto-off. The
+ * state check in scan_restore_mode alone still raced the final expiry, which
+ * then reopened the AP with no timer left (review R6, 2026-11-06). Static:
+ * creation cannot fail. */
+static StaticSemaphore_t s_mode_mtx_buf;
+static SemaphoreHandle_t s_mode_mtx      = NULL;
+static SemaphoreHandle_t mode_mtx(void) {
+    if (s_mode_mtx == NULL) s_mode_mtx = xSemaphoreCreateMutexStatic(&s_mode_mtx_buf);
+    return s_mode_mtx;
+}
 
 static status_led_handle_t status_led_ap;
 static status_led_handle_t status_led_sta;
@@ -64,6 +77,14 @@ static bool sta_connected = false;
 // against the AP time-box, and wifi_driver_restart() keeps working.
 static volatile bool sta_suspended = false;
 
+// A STA SSID is configured. Without one the unit runs the AP alone: an APSTA
+// STA with an empty SSID kept calling esp_wifi_connect() (ESP_ERR_WIFI_SSID)
+// and the radio stayed busy, so the setup page's scan failed ("Scan failed",
+// first K_EVK_V4.1 hardware run 15.10.). A scan switches to APSTA briefly.
+static bool sta_has_ssid = false;
+
+bool wifi_sta_configured(void) { return sta_has_ssid; }
+
 static wifi_ap_record_t sta_ap_info;
 static wifi_sta_list_t  ap_sta_list;
 
@@ -79,6 +100,8 @@ static void net_init_softap(bool ap_enable);
 static void wifi_init_softap(bool ap_enable);
 
 static void wifi_ap_start_timer(void); 
+static void wifi_ap_arm_timer_if_idle(void);
+static void sta_apply_static_dns(void);
 
 /*============================= Helpers =====================================*/
 
@@ -127,22 +150,28 @@ void wifi_note_eth_ip(bool up) {
 
 /*============================= AP/STA Mode Helpers =========================*/
 
-static void wifi_ap_stop_only() {
+// Returns false when the mode change failed (Wi-Fi being stopped or
+// restarted at that moment). That used to be an ESP_ERROR_CHECK, so the AP
+// auto-off racing a driver restart aborted the station (review R7).
+static bool wifi_ap_stop_only() {
 
     if (esp_netif_ap == NULL) {
 
         ESP_LOGW(TAG, "AP stop requested but AP interface not configured, skipping");
-
-    }else{
-
-        ESP_LOGI(TAG, "Stopping only Access Point...");
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-
-        ap_active            = false;
-        dhcps_dns_propagated = false;
+        return true;
 
     }
 
+    ESP_LOGI(TAG, "Stopping only Access Point...");
+    esp_err_t e = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "AP stop failed (%s), retrying", esp_err_to_name(e));
+        return false;
+    }
+
+    ap_active            = false;
+    dhcps_dns_propagated = false;
+    return true;
 }
 
 static void wifi_ap_start_only() {
@@ -197,11 +226,21 @@ static void wifi_control_task(void *arg) {
 
         wifi_mode_t cur;
 
-        ESP_ERROR_CHECK(esp_wifi_get_mode(&cur));
+        xSemaphoreTake(mode_mtx(), portMAX_DELAY);   // never mid-scan or mid-restart
 
-        if (cur != WIFI_MODE_STA) {
+        bool stopped = true;
+        if (esp_wifi_get_mode(&cur) == ESP_OK && cur != WIFI_MODE_STA) {
 
-            wifi_ap_stop_only();
+            stopped = wifi_ap_stop_only();
+        }
+
+        xSemaphoreGive(mode_mtx());
+
+        // The AP must close in the end: a failed stop is retried shortly
+        // instead of leaving the open AP up with no timer left.
+        if (!stopped) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            xEventGroupSetBits(wifi_event_group, WIFI_AP_STOP_DUE_BIT);
         }
     }
 }
@@ -240,8 +279,9 @@ static void wifi_sta_reconnect_task(void *ctx){
 
     for (;;) {
 
-        // STA is not active, or parked behind the Ethernet uplink: do nothing
-        if (!sta_active || sta_suspended) {
+        // STA is not active, parked behind the Ethernet uplink, or only up for
+        // a scan or after the AP auto-off without any SSID: do nothing
+        if (!sta_active || sta_suspended || !sta_has_ssid) {
 
             vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -260,10 +300,10 @@ static void wifi_sta_reconnect_task(void *ctx){
 
         int attempts = retry_delay(delay_handle);
 
-        ESP_LOGI(TAG, "Station Reconnecting: %s, attempts: %d",
+        ESP_LOGI(TAG, "Station Reconnecting: %.32s, attempts: %d",
                  config_sta.sta.ssid, attempts);
 
-        uart_nmea("$PESP,WIFI,STA,RECONNECTING,%s,%d",
+        uart_nmea("$PESP,WIFI,STA,RECONNECTING,%.32s,%d",
                   config_sta.sta.ssid, attempts);
 
         esp_err_t err = esp_wifi_connect();
@@ -286,11 +326,13 @@ static void wifi_sta_reconnect_task(void *ctx){
 
             ESP_LOGE(TAG, "Too many WiFi reconnect attempts, restarting WiFi driver");
 
+            xSemaphoreTake(mode_mtx(), portMAX_DELAY);   // not while the AP auto-off runs
             esp_wifi_stop();
 
             vTaskDelay(pdMS_TO_TICKS(1000));
 
             esp_wifi_start();
+            xSemaphoreGive(mode_mtx());
 
             failed_attempts = 0;
         }
@@ -312,6 +354,11 @@ static void handle_sta_start(void *arg, esp_event_base_t base, int32_t id, void 
 
     if (sta_suspended) {
         ESP_LOGI(TAG, "STA parked (Ethernet uplink), not connecting");
+        return;
+    }
+
+    if (!sta_has_ssid) {
+        ESP_LOGI(TAG, "STA up for a scan only (no SSID configured), not connecting");
         return;
     }
 
@@ -343,7 +390,7 @@ static void handle_sta_connected(void *arg, esp_event_base_t base, int32_t id, v
     if (status_led_sta != NULL)    
         status_led_sta->flashing_mode = STATUS_LED_FADE;
 
-    wifi_ap_start_timer();
+    wifi_ap_arm_timer_if_idle();
 
 }
 
@@ -374,6 +421,7 @@ static void handle_sta_disconnected(void *arg, esp_event_base_t base, int32_t id
     sta_connected = false;
 
     xEventGroupClearBits(wifi_event_group, WIFI_STA_GOT_IPV4_BIT);
+    eth_uplink_note_sta_ip(false);
     uplink_note_supervisor();
     xEventGroupClearBits(wifi_event_group, WIFI_STA_GOT_IPV6_BIT);
 
@@ -396,7 +444,7 @@ static void handle_sta_disconnected(void *arg, esp_event_base_t base, int32_t id
     // disconnects must not keep re-opening and re-arming the open AP.
     if (!provisioned && !sta_suspended) {
         wifi_ap_start_only();
-        wifi_ap_start_timer();   // time-box even this AP-up to 15 min
+        wifi_ap_arm_timer_if_idle();   // time-box even this AP-up to 15 min, never extend
     }
 }
 
@@ -517,6 +565,8 @@ static void handle_sta_got_ip(void *arg, esp_event_base_t base, int32_t id, void
 
     xEventGroupSetBits(wifi_event_group, WIFI_STA_GOT_IPV4_BIT);
 
+    sta_apply_static_dns();         // static mode: the configured servers, not the table's
+    eth_uplink_note_sta_ip(true);   // Ethernet board: default route from leases
     uplink_note_supervisor();
 }
 
@@ -572,7 +622,11 @@ static void net_init_softap(bool ap_enable){
 
         ip_info_ap.gw           = ip_info_ap.ip;
 
-        uint8_t subnet          = config_get_u8(CONF_ITEM(KEY_CONFIG_WIFI_STA_SUBNET));
+        // The AP's own prefix (this read the STA's, so a static STA /31 or
+        // /32 left the setup hotspot's DHCP server without a pool, R6).
+        // 1..30 leaves room for clients; anything else falls back to /24.
+        uint8_t subnet          = config_get_u8(CONF_ITEM(KEY_CONFIG_WIFI_AP_SUBNET));
+        if (subnet < 1 || subnet > 30) subnet = 24;
         ip_info_ap.netmask.addr = esp_netif_htonl(0xffffffffu << (32u - subnet));
 
         // DHCP must hand clients a DNS server, or they never query us at all.
@@ -600,6 +654,28 @@ static void net_init_softap(bool ap_enable){
 
 }
 
+/* Apply the configured static DNS servers to the STA. Also called at every
+ * STA GOT_IP in static mode: the global DNS table may hold the Ethernet
+ * lease's servers by then, and the route code saves "the STA's DNS" from
+ * that table (review R6, 2026-11-06). Zeroed and typed V4; 0.0.0.0 is
+ * skipped (esp_netif_set_dns_info rejects it, and an ESP_ERROR_CHECK on it
+ * aborted every boot). */
+static void sta_apply_static_dns(void) {
+    if (esp_netif_sta == NULL || !config_get_bool1(CONF_ITEM(KEY_CONFIG_WIFI_STA_STATIC))) return;
+    esp_netif_dns_info_t dns[2];
+    memset(dns, 0, sizeof(dns));
+    dns[0].ip.type = ESP_IPADDR_TYPE_V4;
+    dns[1].ip.type = ESP_IPADDR_TYPE_V4;
+    config_get_primitive(CONF_ITEM(KEY_CONFIG_WIFI_STA_DNS_A), &dns[0].ip.u_addr.ip4.addr);
+    config_get_primitive(CONF_ITEM(KEY_CONFIG_WIFI_STA_DNS_B), &dns[1].ip.u_addr.ip4.addr);
+    const esp_netif_dns_type_t type[2] = { ESP_NETIF_DNS_MAIN, ESP_NETIF_DNS_BACKUP };
+    for (int i = 0; i < 2; i++) {
+        if (dns[i].ip.u_addr.ip4.addr == 0) continue;
+        esp_err_t e = esp_netif_set_dns_info(esp_netif_sta, type[i], &dns[i]);
+        if (e != ESP_OK) ESP_LOGE(TAG, "static IP: DNS %c: %s", 'A' + i, esp_err_to_name(e));
+    }
+}
+
 static void net_init_sta(bool sta_enable){
 
     if (sta_enable) {
@@ -617,18 +693,24 @@ static void net_init_sta(bool sta_enable){
 
             uint8_t subnet           = config_get_u8(CONF_ITEM(KEY_CONFIG_WIFI_STA_SUBNET));
 
+            // A prefix of 0 shifted by 32 (undefined) and > 32 by a negative
+            // count; fall back to /24 instead of a garbage netmask.
+            if (subnet < 1 || subnet > 32) {
+                ESP_LOGE(TAG, "stored static subnet /%u invalid, using /24", (unsigned)subnet);
+                subnet = 24;
+            }
             ip_info_sta.netmask.addr = esp_netif_htonl(0xffffffffu << (32u - subnet));
 
-            esp_netif_dns_info_t dns_info_sta_main, dns_info_sta_backup;
-
-            config_get_primitive(CONF_ITEM(KEY_CONFIG_WIFI_STA_DNS_A), &dns_info_sta_main.ip.u_addr.ip4.addr);
-
-            config_get_primitive(CONF_ITEM(KEY_CONFIG_WIFI_STA_DNS_B), &dns_info_sta_backup.ip.u_addr.ip4.addr);
-
-            ESP_ERROR_CHECK(esp_netif_dhcpc_stop(esp_netif_sta));
-            ESP_ERROR_CHECK(esp_netif_set_ip_info(esp_netif_sta, &ip_info_sta));
-            ESP_ERROR_CHECK(esp_netif_set_dns_info(esp_netif_sta, ESP_NETIF_DNS_MAIN,   &dns_info_sta_main));
-            ESP_ERROR_CHECK(esp_netif_set_dns_info(esp_netif_sta, ESP_NETIF_DNS_BACKUP, &dns_info_sta_backup));
+            // No ESP_ERROR_CHECK on stored settings: esp_netif_set_dns_info
+            // rejects 0.0.0.0, so a static setup without a second DNS server
+            // aborted on EVERY boot, a boot loop from one saved form. A bad
+            // value is logged and skipped; the unit stays reachable.
+            esp_err_t e = esp_netif_dhcpc_stop(esp_netif_sta);
+            if (e != ESP_OK && e != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED)
+                ESP_LOGE(TAG, "static IP: dhcpc_stop: %s", esp_err_to_name(e));
+            e = esp_netif_set_ip_info(esp_netif_sta, &ip_info_sta);
+            if (e != ESP_OK) ESP_LOGE(TAG, "static IP: set_ip_info: %s", esp_err_to_name(e));
+            sta_apply_static_dns();
             // IMPORTANT: do NOT start DHCP client again in static IP mode
 
         } else {
@@ -692,6 +774,16 @@ static void wifi_ap_start_timer(){
 
 }
 
+/* Arm the AP auto-off only if it is not already counting. Events that just
+ * happen while the AP is up (an STA association, an unprovisioned STA's
+ * disconnect) used to RESTART the 15-min window, so a flapping or deauthed
+ * STA kept the open setup AP alive without limit (review 2026-11-06, U3).
+ * Only the control task's bounded re-arm for a connected client extends it. */
+static void wifi_ap_arm_timer_if_idle(void) {
+    if (ap_stop_timer != NULL && xTimerIsTimerActive(ap_stop_timer) != pdFALSE) return;
+    wifi_ap_start_timer();
+}
+
 static void wifi_init_softap(bool ap_enable) {
 
     if (ap_enable) {
@@ -719,7 +811,16 @@ static void wifi_init_softap(bool ap_enable) {
             // Generate the RTKdata AP SSID from the MAC and store it
             uint8_t mac[6];
 
+#if BOARD_HAS_ETH
+            // Ethernet boards: the suffix of the station ID (Wi-Fi STA MAC),
+            // so the label, the setup AP and the router's DHCP hostname
+            // (eth.c) all read the same six characters. The AP MAC is the STA
+            // MAC + 1 and made the AP RTKdata_ACA051 next to a label ending
+            // in ACA050 (13.11.).
+            esp_read_mac(mac, ESP_MAC_WIFI_STA);
+#else
             esp_wifi_get_mac(WIFI_IF_AP, mac);
+#endif
 
             snprintf((char *)config_ap.ap.ssid, sizeof(config_ap.ap.ssid), "RTKdata_%02X%02X%02X", mac[3], mac[4], mac[5]);
 
@@ -769,31 +870,49 @@ static void wifi_init_sta(bool sta_enable) {
 
     if (sta_enable) {
 
-        size_t sta_ssid_len = sizeof(config_sta.sta.ssid);
+        // NVS stores the string WITH its terminator, so a 32-byte SSID or a
+        // 64-byte PSK needs 33 / 65 bytes: read into wider buffers and copy
+        // the payload. Reading straight into the 32 / 64-byte wifi_config_t
+        // fields failed with INVALID_LENGTH and left the unit without its
+        // saved network after a successful save (review R6, 2026-11-06).
+        char ssid_buf[sizeof(config_sta.sta.ssid) + 1] = {0};
+        size_t sta_ssid_len = sizeof(ssid_buf);
 
-        config_get_str_blob(CONF_ITEM(KEY_CONFIG_WIFI_STA_SSID), &config_sta.sta.ssid, &sta_ssid_len);
+        if (config_get_str_blob(CONF_ITEM(KEY_CONFIG_WIFI_STA_SSID), ssid_buf, &sta_ssid_len) != ESP_OK)
+            sta_ssid_len = 0;
 
-        if (sta_ssid_len > 0) 
+        if (sta_ssid_len > 0)
             sta_ssid_len--; // remove null terminator
+        memset(config_sta.sta.ssid, 0, sizeof(config_sta.sta.ssid));
+        memcpy(config_sta.sta.ssid, ssid_buf, sta_ssid_len);
 
-        if (sta_ssid_len == 0) 
-            sta_enable = false;
+        if (sta_ssid_len == 0) {
+            // Never configure the STA or start its reconnect task without an
+            // SSID; wifi_init() already chose AP-only mode for this case.
+            ESP_LOGI(TAG, "no STA SSID configured, STA stays off");
+            return;
+        }
 
-        size_t sta_password_len = sizeof(config_sta.sta.password);
+        char pass_buf[sizeof(config_sta.sta.password) + 1] = {0};
+        size_t sta_password_len = sizeof(pass_buf);
 
-        config_get_str_blob(CONF_ITEM(KEY_CONFIG_WIFI_STA_PASSWORD), &config_sta.sta.password, &sta_password_len);
+        if (config_get_str_blob(CONF_ITEM(KEY_CONFIG_WIFI_STA_PASSWORD), pass_buf, &sta_password_len) != ESP_OK)
+            sta_password_len = 0;
 
-        if (sta_password_len > 0) 
+        if (sta_password_len > 0)
             sta_password_len--; // remove null terminator
+        memset(config_sta.sta.password, 0, sizeof(config_sta.sta.password));
+        memcpy(config_sta.sta.password, pass_buf, sta_password_len);
+        memset(pass_buf, 0, sizeof(pass_buf));
 
         config_sta.sta.scan_method = config_get_bool1(CONF_ITEM(KEY_CONFIG_WIFI_STA_SCAN_MODE_ALL))
                                    ? WIFI_ALL_CHANNEL_SCAN : WIFI_FAST_SCAN;
 
-        ESP_LOGI(TAG, "WIFI_STA_CONNECTING: %s (%s), %s scan", config_sta.sta.ssid,
+        ESP_LOGI(TAG, "WIFI_STA_CONNECTING: %.32s (%s), %s scan", config_sta.sta.ssid,
                  sta_password_len == 0 ? "open" : "with password",
                  config_sta.sta.scan_method == WIFI_ALL_CHANNEL_SCAN ? "all channel" : "fast");
 
-        uart_nmea("$PESP,WIFI,STA,CONNECTING,%s,%c,%c", config_sta.sta.ssid,
+        uart_nmea("$PESP,WIFI,STA,CONNECTING,%.32s,%c,%c", config_sta.sta.ssid,
                   sta_password_len == 0 ? 'O' : 'P',
                   config_sta.sta.scan_method == WIFI_ALL_CHANNEL_SCAN ? 'A' : 'F');
 
@@ -825,6 +944,7 @@ void wifi_init(void){
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
 
     wifi_event_group = xEventGroupCreate();
+    (void)mode_mtx();   // create it here, before the control task or a scan can race to
 
     // Event handlers
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_START,           &handle_sta_start, NULL));
@@ -843,7 +963,14 @@ void wifi_init(void){
     // Reconnect backoff
     delay_handle = retry_init(true, 5, 2000, 60000);
 
-    bool sta_enable = true;//config_get_bool1(CONF_ITEM(KEY_CONFIG_WIFI_STA_ACTIVE));
+    {
+        // Same read as main.c's sta_provisioned check, so both agree.
+        char *ssid = NULL;
+        config_get_str_blob_alloc(CONF_ITEM(KEY_CONFIG_WIFI_STA_SSID), (void **)&ssid);
+        sta_has_ssid = (ssid && ssid[0]);
+        free(ssid);
+    }
+    bool sta_enable = sta_has_ssid;  //config_get_bool1(CONF_ITEM(KEY_CONFIG_WIFI_STA_ACTIVE));
     bool ap_enable  = true;//config_get_bool1(CONF_ITEM(KEY_CONFIG_WIFI_AP_ACTIVE));
     bool nat_enable = config_get_bool1(CONF_ITEM(KEY_CONFIG_WIFI_STA_AP_FORWARD));
 
@@ -909,6 +1036,7 @@ void wifi_ap_status(wifi_ap_status_t *status){
     if (ap_active){
 
         memcpy(status->ssid, config_ap.ap.ssid, sizeof(config_ap.ap.ssid));
+        status->ssid[sizeof(status->ssid) - 1] = '\0';   // a 32-byte SSID has none
         status->authmode = config_ap.ap.authmode;
 
         wifi_ap_sta_list();
@@ -933,6 +1061,7 @@ void wifi_sta_status(wifi_sta_status_t *status){
     if (!sta_connected) {
 
         memcpy(status->ssid, config_sta.sta.ssid, sizeof(config_sta.sta.ssid));
+        status->ssid[sizeof(status->ssid) - 1] = '\0';
 
     }else{
 
@@ -953,18 +1082,39 @@ void wifi_sta_status(wifi_sta_status_t *status){
 
 }
 
+/* Undo the scan's AP -> APSTA switch, but only while the AP is still wanted.
+ * The auto-off can close the AP DURING the scan (mode -> STA); restoring the
+ * pre-scan "AP" then reopened the setup AP after its time-box, with no timer
+ * left to close it (review 2026-11-06, U3). No ESP_ERROR_CHECK: a scan is a
+ * web request and must never abort the device. */
+static void scan_restore_mode(wifi_mode_t prev_mode) {
+    if (prev_mode != WIFI_MODE_AP) return;
+    wifi_mode_t cur;
+    if (esp_wifi_get_mode(&cur) != ESP_OK || cur != WIFI_MODE_APSTA || !ap_active) return;
+    esp_err_t e = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (e != ESP_OK) ESP_LOGW(TAG, "scan: restoring AP mode failed: %s", esp_err_to_name(e));
+}
+
 wifi_ap_record_t *wifi_scan(uint16_t *number){
 
     wifi_ap_record_t *ap_records = NULL;
 
     wifi_mode_t prev_mode;
 
+    xSemaphoreTake(mode_mtx(), portMAX_DELAY);   // the AP auto-off waits for us
+
     esp_wifi_get_mode(&prev_mode);
 
     // Ensure STA is enabled during scan
     if (prev_mode == WIFI_MODE_AP) {
 
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+        esp_err_t merr = esp_wifi_set_mode(WIFI_MODE_APSTA);
+        if (merr != ESP_OK) {
+            ESP_LOGW(TAG, "scan: APSTA failed: %s", esp_err_to_name(merr));
+            *number = 0;
+            xSemaphoreGive(mode_mtx());
+            return NULL;
+        }
     }
 
     wifi_scan_config_t wifi_scan_config = {
@@ -982,9 +1132,7 @@ wifi_ap_record_t *wifi_scan(uint16_t *number){
 
     if (*number == 0) {
 
-        // restore previous mode if we changed it
-        if (prev_mode == WIFI_MODE_AP) 
-            ESP_ERROR_CHECK(esp_wifi_set_mode(prev_mode));
+        scan_restore_mode(prev_mode);
 
     }else{
 
@@ -994,7 +1142,7 @@ wifi_ap_record_t *wifi_scan(uint16_t *number){
 
             ESP_LOGE(TAG, "malloc for ap_records failed");
 
-            if (prev_mode == WIFI_MODE_AP) ESP_ERROR_CHECK(esp_wifi_set_mode(prev_mode));
+            scan_restore_mode(prev_mode);
 
             *number = 0;
 
@@ -1004,14 +1152,13 @@ wifi_ap_record_t *wifi_scan(uint16_t *number){
 
             esp_wifi_scan_get_ap_records(number, ap_records);
 
-            // restore previous mode if we changed it
-            if (prev_mode == WIFI_MODE_AP) 
-
-                ESP_ERROR_CHECK(esp_wifi_set_mode(prev_mode));
+            scan_restore_mode(prev_mode);
 
         }
 
     }
+
+    xSemaphoreGive(mode_mtx());
 
     // caller must free(ap_records)
     return ap_records;
@@ -1072,14 +1219,16 @@ void wifi_sta_set_suspended(bool suspended) {
 
         retry_reset(delay_handle);
 
-        if (sta_active) esp_wifi_connect();
+        if (sta_active && sta_has_ssid) esp_wifi_connect();
     }
 }
 
 void wifi_driver_restart(void) {
     ESP_LOGW(TAG, "wifi driver restart requested");
     uart_nmea("$PESP,RTK,SUPERVISOR,WIFIRESTART");
+    xSemaphoreTake(mode_mtx(), portMAX_DELAY);   // not while the AP auto-off or a scan runs
     esp_wifi_stop();
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_wifi_start();
+    xSemaphoreGive(mode_mtx());
 }

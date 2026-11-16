@@ -260,7 +260,15 @@ typedef struct config_item {
 // FW_VERSION grep and the CMake version read stay unambiguous.
 #define FW_VERSION_ETH "2.0.0"
 
-#if CONFIG_RTK_BOARD_K_EVK_V4
+// K_EVK_V4.1 (schematic SCH_1013, -DRTK_BOARD=k_evk_v41): other pin map than
+// V4.0, so its own version line and OTA channel (ota/eth41/), never ota/eth/.
+#define FW_VERSION_ETH41 "2.1.4"
+
+#if CONFIG_RTK_BOARD_K_EVK_V41
+#undef FW_VERSION
+#define FW_VERSION FW_VERSION_ETH41
+#define UPDATE_SERVER_URL "https://raw.githubusercontent.com/Kansi-jonas/rtkdata-fw/main/ota/eth41/"
+#elif CONFIG_RTK_BOARD_K_EVK_V4
 #undef FW_VERSION
 #define FW_VERSION FW_VERSION_ETH
 // NEVER the fleet's main/ota/: the 1.x Wi-Fi units have that path baked in and

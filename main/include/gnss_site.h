@@ -96,10 +96,43 @@ void gnss_site_status(gnss_site_status_t *out);
 bool gnss_site_upload_allowed(void);
 bool gnss_site_needs_recovery(void);
 bool gnss_site_output_expected(void);
+/* Required-RTCM log repair may run: gnss_site_output_expected() with site-v1;
+ * with CONFIG_RTK_SITE_LEGACY the mode warmup plus flowing observations. */
+bool gnss_site_log_repair_expected(void);
 uint32_t gnss_site_upload_generation(void);
 bool gnss_site_get_desired(gnss_site_desired_t *out);
 bool gnss_site_legacy_allowed(void);
 void gnss_site_configured(gnss_site_mode_t mode, double lat, double lon,
                           uint32_t expected_revision, bool applied);
 bool gnss_site_apply_control(const gnss_site_control_t *control);
+
+/* Relocation guard, CONFIG_RTK_SITE_LEGACY only (no IE half exists there).
+ * The receiver's own independent position, the median of a valid and fresh
+ * BASEPOS window, judged against a coordinate with gnss_site_displaced(). */
+typedef enum {
+    GNSS_SITE_AGREEMENT_UNKNOWN = 0,   /* no valid, fresh window yet */
+    GNSS_SITE_AGREEMENT_AGREE = 1,
+    GNSS_SITE_AGREEMENT_DISAGREE = 2
+} gnss_site_agreement_t;
+/* A unit fixed on a coordinate it has left must not keep broadcasting it. */
+#define GNSS_SITE_RELOCATE_MS 300000U
+/* The receiver sends its 1005 every 10 s; older than this it is not "now". */
+#define GNSS_SITE_ARP_MAX_AGE_MS 30000U
+/* The reference point a complete, CRC-checked RTCM 1005/1006 frame
+ * (0xD3 header to CRC) broadcasts, as WGS84 latitude/longitude in degrees.
+ * Platform-neutral, host-tested against a recorded UM980 frame. */
+bool gnss_site_parse_arp(const uint8_t *frame, size_t len, double *lat, double *lon);
+/* Runtime: note a CRC-valid RTCM frame; only 1005/1006 are used (legacy). */
+void gnss_site_runtime_note_frame(const uint8_t *frame, size_t len);
+/* Legacy: an acknowledged FIXED or SURVEY MODE applied less than
+ * GNSS_SITE_SETTLE_MAX_MS ago, or a SURVEY within 330 s of its first valid
+ * position (late acquisition, L5). Its RTCM pause is deliberate and bounded;
+ * an UNKNOWN mode never qualifies (OTA confirm, review 13.11. L4 #1). */
+#define GNSS_SITE_SETTLE_MAX_MS 900000U
+bool gnss_site_mode_settling(void);
+gnss_site_agreement_t gnss_site_legacy_agreement(double lat, double lon,
+                                                 uint32_t *distance_mm);
+/* True once the receiver, fixed on its reference, has placed itself away
+ * from it in every valid window for GNSS_SITE_RELOCATE_MS. */
+bool gnss_site_legacy_relocated(uint32_t *distance_mm);
 #endif

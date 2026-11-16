@@ -29,6 +29,9 @@
 #include <util.h>
 
 #include <esp_ota_ops.h>
+#include <nvs.h>
+#include <esp_heap_caps.h>
+#include <esp_netif.h>
 //#include <esp_netif_sta_list.h> makeItCompileable
 #include <stream_stats.h>
 #include <esp32/rom/crc.h>
@@ -43,6 +46,7 @@
 #include "provisioning.h"
 #include "interface/ntrip.h"
 #include "uart.h"
+#include "board_test.h"
 
 // Max length a file path can have on storage
 #define FILE_PATH_MAX (ESP_VFS_PATH_MAX + CONFIG_SPIFFS_OBJ_NAME_LEN)
@@ -70,8 +74,10 @@ static int  firmwareUpdateProgress      = 0;
 static int  countWebHandler             = 0; 
 static int  maxWebHandlerCount          = 16;
 
+// Bounded: a name shorter than the extension used to index before the buffer.
 #define IS_FILE_EXT(filename, ext) \
-    (strcasecmp(&filename[strlen(filename) - sizeof(ext) + 1], ext) == 0)
+    (strlen(filename) >= sizeof(ext) - 1 && \
+     strcasecmp(&(filename)[strlen(filename) - sizeof(ext) + 1], ext) == 0)
 
 // OTA Update Status empfangen
 static void handle_ota_events(void *handler_arg, esp_event_base_t base, int32_t id, void *event_data) {
@@ -153,6 +159,12 @@ static esp_err_t set_content_type_from_file(httpd_req_t *req, const char *filena
         return httpd_resp_set_type(req, "text/css");
     } else if (IS_FILE_EXT(filename, ".ico")) {
         return httpd_resp_set_type(req, "image/x-icon");
+    } else if (IS_FILE_EXT(filename, ".png")) {
+        return httpd_resp_set_type(req, "image/png");
+    } else if (IS_FILE_EXT(filename, ".svg")) {
+        return httpd_resp_set_type(req, "image/svg+xml");
+    } else if (IS_FILE_EXT(filename, ".json")) {
+        return httpd_resp_set_type(req, "application/json");
     }
     /* This is a limited set only */
     /* For any other type always set as plain text */
@@ -209,48 +221,79 @@ static esp_err_t json_response(httpd_req_t *req, cJSON *root) {
     return ESP_OK;
 }
 
+/* "Basic <base64>": the scheme is case-insensitive (RFC 9110), the credential
+ * is not. The header is read into a bounded stack buffer: the old code took a
+ * missing header for a 1-byte value and compared uninitialised memory. */
 static esp_err_t basic_auth(httpd_req_t *req) {
-    int authorization_length = httpd_req_get_hdr_value_len(req, "Authorization") + 1;
-    if (authorization_length == 0) goto _auth_required;
+    char header[160];
+    size_t len = httpd_req_get_hdr_value_len(req, "Authorization");
+    bool authenticated = false;
 
-    char *authorization_header = malloc(authorization_length);
-    httpd_req_get_hdr_value_str(req, "Authorization", authorization_header, authorization_length);
-
-    bool authenticated = strcasecmp(basic_authentication, authorization_header) == 0;
-    free(authorization_header);
-
+    if (basic_authentication != NULL && len > 6 && len < sizeof(header) &&
+        httpd_req_get_hdr_value_str(req, "Authorization", header, sizeof(header)) == ESP_OK) {
+        authenticated = strncasecmp(header, "Basic ", 6) == 0 &&
+                        strcmp(header + 6, basic_authentication + 6) == 0;
+    }
     if (authenticated) return ESP_OK;
 
-    _auth_required:
     httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"RTKdata Station Config\"");
     httpd_resp_set_status(req, "401"); // Unauthorized
-    char *unauthorized = "401 Unauthorized - Incorrect or no password provided";
+    const char *unauthorized = "401 Unauthorized - Incorrect or no password provided";
     httpd_resp_send(req, unauthorized, strlen(unauthorized));
     return ESP_FAIL;
 }
 
+/* Only clients on the setup hotspot: the connection must have arrived on the
+ * AP interface, i.e. its LOCAL address is the AP address. The httpd socket is
+ * dual-stack when IPv6 is on, so an IPv4 peer shows up IPv4-mapped. This mode
+ * used to reject everyone (the check was commented out). */
 static esp_err_t hotspot_auth(httpd_req_t *req) {
     int sock = httpd_req_to_sockfd(req);
+    struct sockaddr_storage local;
+    socklen_t socklen = sizeof(local);
+    uint32_t local_ip = 0;
 
-    struct sockaddr_in6 client_addr;
-    socklen_t socklen = sizeof(client_addr);
-    getpeername(sock, (struct sockaddr *)&client_addr, &socklen);
+    if (getsockname(sock, (struct sockaddr *)&local, &socklen) == 0) {
+        if (local.ss_family == AF_INET) {
+            local_ip = ((struct sockaddr_in *)&local)->sin_addr.s_addr;
+        }
+#if CONFIG_LWIP_IPV6
+        else if (local.ss_family == AF_INET6) {
+            const uint32_t *a = ((struct sockaddr_in6 *)&local)->sin6_addr.un.u32_addr;
+            if (a[0] == 0 && a[1] == 0 && a[2] == PP_HTONL(0x0000FFFFUL)) local_ip = a[3];
+        }
+#endif
+    }
 
-    // TODO: Correctly read IPv4?
-    // ERROR_ACTION(TAG, client_addr.sin6_family != AF_INET, goto _auth_error, "IPv6 connections not supported, IP family %d", client_addr.sin6_family);
+    // The peer as well: lwIP accepts a packet for ANY local address on ANY
+    // interface, so a LAN host that routes the AP address via the station's
+    // LAN IP reached the AP address from outside (review R6, 2026-11-06).
+    // A hotspot client sits on the AP subnet; a LAN host does not.
+    struct sockaddr_storage peer;
+    socklen_t peerlen = sizeof(peer);
+    uint32_t peer_ip = 0;
+    if (getpeername(sock, (struct sockaddr *)&peer, &peerlen) == 0) {
+        if (peer.ss_family == AF_INET) {
+            peer_ip = ((struct sockaddr_in *)&peer)->sin_addr.s_addr;
+        }
+#if CONFIG_LWIP_IPV6
+        else if (peer.ss_family == AF_INET6) {
+            const uint32_t *a = ((struct sockaddr_in6 *)&peer)->sin6_addr.un.u32_addr;
+            if (a[0] == 0 && a[1] == 0 && a[2] == PP_HTONL(0x0000FFFFUL)) peer_ip = a[3];
+        }
+#endif
+    }
 
-    //wifi_sta_list_t *ap_sta_list = wifi_ap_sta_list();
-    //esp_netif_sta_list_t esp_netif_ap_sta_list; makeItCompileable
-    //esp_netif_get_sta_list(ap_sta_list, &esp_netif_ap_sta_list); makeItCompileable
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    esp_netif_ip_info_t info;
+    if (local_ip != 0 && peer_ip != 0 && ap != NULL && esp_netif_get_ip_info(ap, &info) == ESP_OK &&
+        info.ip.addr == local_ip &&
+        (peer_ip & info.netmask.addr) == (info.ip.addr & info.netmask.addr)) {
+        return ESP_OK;
+    }
 
-    // TODO: Correctly read IPv4?
-    //for (int i = 0; i < esp_netif_ap_sta_list.num; i++) { makeItCompileable
-      //  if (esp_netif_ap_sta_list.sta[i].ip.addr == client_addr.sin6_addr.un.u32_addr[3]) return ESP_OK;
-    //}
-
-    //_auth_error:
     httpd_resp_set_status(req, "401"); // Unauthorized
-    char *unauthorized = "401 Unauthorized - Configured to only accept connections from hotspot devices";
+    const char *unauthorized = "401 Unauthorized - Configured to only accept connections from hotspot devices";
     httpd_resp_send(req, unauthorized, strlen(unauthorized));
     return ESP_FAIL;
 }
@@ -338,75 +381,62 @@ static esp_err_t heap_info_get_handler(httpd_req_t *req) {
     return json_response(req, root);
 }
 
-static esp_err_t file_check_etag_hash(httpd_req_t *req, char *file_hash_path, char *etag, size_t etag_size) {
-    struct stat file_hash_stat;
-    if (stat(file_hash_path, &file_hash_stat) == -1) {
-        // Hash file not created yet
-        return ESP_ERR_NOT_FOUND;
-    }
+/* ETag = firmware build + file size. The web pages only change with a
+ * firmware (or www) update, so this is as good as a content hash, and it
+ * needs no state. The old scheme wrote a ".crc" file to flash after EVERY
+ * served file (flash wear, and each write stalls the GNSS UART interrupt),
+ * and leaked the If-None-Match buffer on every cache check. */
+static void file_etag(char *etag, size_t etag_size, long size) {
+    char sha[9];
+    esp_app_get_elf_sha256(sha, sizeof(sha));
+    snprintf(etag, etag_size, "\"%s-%ld\"", sha, size);
+}
 
-    FILE *fd_hash = fopen(file_hash_path, "r+");
-
-    // Ensure hash file was opened
-    ERROR_ACTION(TAG, fd_hash == NULL, return ESP_FAIL,
-            "Could not open hash file %s (%lu bytes) for reading/updating: %d %s", file_hash_path,
-            file_hash_stat.st_size, errno, strerror(errno));
-
-    // Read existing hash
-    uint32_t crc;
-    int read = fread(&crc, sizeof(crc), 1, fd_hash);
-    fclose(fd_hash);
-    ERROR_ACTION(TAG, read != 1, return ESP_FAIL,
-            "Could not read hash file %s: %d %s", file_hash_path,
-            errno, strerror(errno));
-
-    //snprintf(etag, etag_size, "\"%08X\"", crc); makeItCompileable
-    snprintf(etag, etag_size, "\"%08X\"", (unsigned int)crc);
-
-    // Compare to header sent by client
-    size_t if_none_match_length = httpd_req_get_hdr_value_len(req, "If-None-Match") + 1;
-    if (if_none_match_length > 1) {
-        char *if_none_match = malloc(if_none_match_length);
-        httpd_req_get_hdr_value_str(req, "If-None-Match", if_none_match, if_none_match_length);
-
-        bool header_match = strcmp(etag, if_none_match) == 0;
-
-        // Matching ETag, return not modified
-        if (header_match) {
-            return ESP_OK;
-        } else {
-            ESP_LOGW(TAG, "ETag for file %s sent by client does not match (%s != %s)", file_hash_path, etag, if_none_match);
-            return ESP_ERR_INVALID_CRC;
-        }
-
-        free(if_none_match);
-    }
-
-    return ESP_ERR_INVALID_ARG;
+static bool file_etag_matches(httpd_req_t *req, const char *etag) {
+    char inm[40];
+    size_t len = httpd_req_get_hdr_value_len(req, "If-None-Match");
+    if (len == 0 || len >= sizeof(inm)) return false;
+    if (httpd_req_get_hdr_value_str(req, "If-None-Match", inm, sizeof(inm)) != ESP_OK) return false;
+    return strcmp(inm, etag) == 0;
 }
 
 static esp_err_t file_get_handler(httpd_req_t *req) {
 
     if (check_auth(req) == ESP_FAIL) return ESP_FAIL;
 
-    char file_path[FILE_PATH_MAX - strlen(FILE_HASH_SUFFIX)];
-    char file_hash_path[FILE_PATH_MAX];
+#if !CONFIG_RTK_TEST_PAGE
+    // An app-only update keeps the www partition, so a unit that once ran the
+    // board test build may still hold test.html. Treat it as missing.
+    if (strncmp(req->uri, "/test.html", strlen("/test.html")) == 0) {
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "/");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+#endif
 
-    FILE *fd = NULL, *fd_hash = NULL;
+    char file_path[FILE_PATH_MAX];
+
+    FILE *fd = NULL;
     struct stat file_stat;
 
     // Extract filename from URL
     char *file_name = get_path_from_uri(file_path, WWW_PARTITION_PATH, req->uri, sizeof(file_path));
     ERROR_ACTION(TAG, file_name == NULL, {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Filename too long");
+        httpd_resp_send_err(req, HTTPD_414_URI_TOO_LONG, "Filename too long");
         return ESP_FAIL;
     }, "Filename too long")
 
-    // If name has trailing '/', respond with index page
-    if (file_name[strlen(file_name) - 1] == '/' && strlen(file_name) + strlen("index.html") < FILE_PATH_MAX) {
-        strcpy(&file_name[strlen(file_name)], "index.html");
-
-        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    // Trailing '/': serve the index page. The bound is the WHOLE path in
+    // file_path (base path included); checking only the part after the base
+    // let a 36-character directory URL write 8 bytes past the stack buffer.
+    size_t name_len = strlen(file_name);
+    if (name_len > 0 && file_name[name_len - 1] == '/') {
+        if (strlen(file_path) + strlen("index.html") >= sizeof(file_path)) {
+            httpd_resp_send_err(req, HTTPD_414_URI_TOO_LONG, "Filename too long");
+            return ESP_FAIL;
+        }
+        strlcat(file_path, "index.html", sizeof(file_path));
     }
 
     set_content_type_from_file(req, file_name);
@@ -428,22 +458,16 @@ static esp_err_t file_get_handler(httpd_req_t *req) {
 
     }
 
-    // Check file hash (if matches request, file is not modified)
-    strcpy(file_hash_path, file_path);
+    char etag[32];
+    file_etag(etag, sizeof(etag), (long)file_stat.st_size);
 
-    strcpy(&file_hash_path[strlen(file_hash_path)], FILE_HASH_SUFFIX);
-
-    char etag[8 + 2 + 1] = ""; // Store CRC32, quotes and \0
-
-    if (file_check_etag_hash(req, file_hash_path, etag, sizeof(etag)) == ESP_OK) {
-
+    if (file_etag_matches(req, etag)) {
         httpd_resp_set_status(req, "304 Not Modified");
         httpd_resp_send(req, NULL, 0);
-
         return ESP_OK;
     }
 
-    if (strlen(etag) > 0) httpd_resp_set_hdr(req, "ETag", etag);
+    httpd_resp_set_hdr(req, "ETag", etag);
 
     fd = fopen(file_path, "r");
 
@@ -454,9 +478,7 @@ static esp_err_t file_get_handler(httpd_req_t *req) {
 
     ESP_LOGI(TAG, "Sending file %s (%ld bytes)...", file_name, file_stat.st_size);
 
-    // Retrieve the pointer to scratch buffer for temporary storage
     size_t length;
-    uint32_t crc = 0;
     do {
         // Read file in chunks into the scratch buffer
         length = fread(buffer, 1, BUFFER_SIZE, fd);
@@ -471,23 +493,9 @@ static esp_err_t file_get_handler(httpd_req_t *req) {
             fclose(fd);
             return ESP_FAIL;
         }
-
-        // Update checksum
-        crc = crc32_le(crc, (const uint8_t *)buffer, length);
     } while (length != 0);
 
-    // Close file after sending complete
     fclose(fd);
-
-    // Store CRC hash
-    fd_hash = fopen(file_hash_path, "w");
-    if (fd_hash != NULL) {
-        fwrite(&crc, sizeof(crc), 1, fd_hash);
-        fclose(fd_hash);
-    } else {
-        ESP_LOGW(TAG, "Could not open hash file %s for writing: %d %s", file_hash_path, errno, strerror(errno));
-    }
-
     return ESP_OK;
 }
 
@@ -516,13 +524,26 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
         switch (item->type) {
             case CONFIG_ITEM_TYPE_STRING:
             case CONFIG_ITEM_TYPE_BLOB:
-                // Get length
-                ESP_ERROR_CHECK_WITHOUT_ABORT(config_get_str_blob(item, NULL, &length));
-                string = calloc(1, length + 1);
-
-                // Get value
-                ESP_ERROR_CHECK_WITHOUT_ABORT(config_get_str_blob(item, string, &length));
-                string[length] = '\0';
+                // Measure, allocate, read. Provisioning may store a longer
+                // value in between: NVS then fails with INVALID_LENGTH and
+                // REWRITES length, and the old code wrote the terminator past
+                // the allocation. Keep the capacity separate and retry.
+                for (int attempt = 0; attempt < 3 && string == NULL; attempt++) {
+                    length = 0;
+                    if (config_get_str_blob(item, NULL, &length) != ESP_OK) break;
+                    size_t cap = length;
+                    char *s = calloc(1, cap + 1);
+                    if (s == NULL) break;
+                    size_t got = cap;
+                    esp_err_t e = config_get_str_blob(item, s, &got);
+                    if (e == ESP_OK && got <= cap) {
+                        s[got] = '\0';
+                        string = s;
+                    } else {
+                        free(s);
+                        if (e != ESP_ERR_NVS_INVALID_LENGTH) break;
+                    }
+                }
                 break;
             case CONFIG_ITEM_TYPE_COLOR:
                 // Convert to hex
@@ -569,10 +590,41 @@ static esp_err_t config_get_handler(httpd_req_t *req) {
     return json_response(req, root);
 }
 
+/* cJSON parses recursively with a nesting limit of 1000; a 4 KB body of '['
+ * overflows the 4 KB httpd stack long before that. Our config bodies are one
+ * flat object (IP values are one array deep), so reject anything deeper than
+ * a few levels before cJSON sees it. Strings are skipped, escapes included. */
+#define JSON_MAX_DEPTH 4
+static bool json_depth_ok(const char *s) {
+    int depth = 0;
+    bool in_str = false;
+    for (; *s; s++) {
+        char c = *s;
+        if (in_str) {
+            if (c == '\\' && s[1] != '\0') s++;
+            else if (c == '"') in_str = false;
+        } else if (c == '"') {
+            in_str = true;
+        } else if (c == '{' || c == '[') {
+            if (++depth > JSON_MAX_DEPTH) return false;
+        } else if (c == '}' || c == ']') {
+            depth--;
+        }
+    }
+    return true;
+}
+
 static bool parse_json(cJSON **root, const char *buffer) {
+    *root = NULL;
+    if (!json_depth_ok(buffer)) {
+        ESP_LOGE(TAG, "JSON rejected: nested deeper than %d", JSON_MAX_DEPTH);
+        return false;
+    }
     *root = cJSON_Parse(buffer);
-    if (!*root) {
-        ESP_LOGE(TAG, "JSON parsing failed. Possibly malformed JSON input.");
+    if (!*root || !cJSON_IsObject(*root)) {
+        ESP_LOGE(TAG, "JSON parsing failed or root is not an object");
+        cJSON_Delete(*root);
+        *root = NULL;
         return false;
     }
     return true;
@@ -805,61 +857,170 @@ static esp_err_t apply_config_value(const config_item_t *item, const cJSON *entr
     return err;
 }
 
+/* The setup page writes only the station Wi-Fi. Everything else (backend
+ * host, device identity, station token, enroll key, casters, UART, admin
+ * access) comes from USB provisioning or the backend. Accepting every key
+ * from the open setup hotspot and from anyone on the LAN allowed redirecting
+ * the station token to a foreign host, wiping the enroll key, or storing a
+ * UART value that aborts every boot before the boot-loop guard runs. */
+static const char *const s_post_writable[] = {
+    KEY_CONFIG_WIFI_STA_ACTIVE, KEY_CONFIG_WIFI_STA_SSID, KEY_CONFIG_WIFI_STA_PASSWORD,
+    KEY_CONFIG_WIFI_STA_STATIC, KEY_CONFIG_WIFI_STA_IP, KEY_CONFIG_WIFI_STA_GATEWAY,
+    KEY_CONFIG_WIFI_STA_SUBNET, KEY_CONFIG_WIFI_STA_DNS_A, KEY_CONFIG_WIFI_STA_DNS_B,
+};
+
+static bool post_writable(const char *key) {
+    for (size_t i = 0; i < sizeof(s_post_writable) / sizeof(s_post_writable[0]); i++) {
+        if (strcmp(key, s_post_writable[i]) == 0) return true;
+    }
+    return false;
+}
+
+static bool decimal_ok(const char *s, long long lo, long long hi) {
+    if (s == NULL || *s == '\0') return false;
+    char *end = NULL;
+    errno = 0;
+    long long v = strtoll(s, &end, 10);
+    return errno == 0 && end != NULL && *end == '\0' && v >= lo && v <= hi;
+}
+
+/* Everything is checked before anything is written, so a bad field cannot
+ * leave half a configuration behind. */
+static bool post_value_valid(const config_item_t *item, const cJSON *entry) {
+    if (cJSON_IsString(entry) && entry->valuestring &&
+        strcmp(entry->valuestring, CONFIG_VALUE_UNCHANGED) == 0) {
+        return true;
+    }
+    switch (item->type) {
+        case CONFIG_ITEM_TYPE_STRING:
+        case CONFIG_ITEM_TYPE_BLOB: {
+            if (!cJSON_IsString(entry) || !entry->valuestring) return false;
+            size_t n = strlen(entry->valuestring);
+            if (strcmp(item->key, KEY_CONFIG_WIFI_STA_SSID) == 0) return n <= 32;
+            if (strcmp(item->key, KEY_CONFIG_WIFI_STA_PASSWORD) == 0) return n <= 64;
+            return n <= 128;
+        }
+        case CONFIG_ITEM_TYPE_BOOL:
+            return cJSON_IsString(entry) && decimal_ok(entry->valuestring, 0, 1);
+        case CONFIG_ITEM_TYPE_UINT8:
+            // the only writable UINT8 is the static-IP prefix length
+            return strcmp(item->key, KEY_CONFIG_WIFI_STA_SUBNET) == 0 &&
+                   cJSON_IsString(entry) && decimal_ok(entry->valuestring, 1, 32);
+        case CONFIG_ITEM_TYPE_IP: {
+            if (!cJSON_IsArray(entry) || cJSON_GetArraySize(entry) != 4) return false;
+            for (int i = 0; i < 4; i++) {
+                const cJSON *b = cJSON_GetArrayItem(entry, i);
+                if (!cJSON_IsString(b) || !decimal_ok(b->valuestring, 0, 255)) return false;
+            }
+            return true;
+        }
+        default:
+            return false;   // no other type is writable from the setup page
+    }
+}
+
+static esp_err_t config_post_reply(httpd_req_t *req, const char *status, bool success, const char *error) {
+    if (status) httpd_resp_set_status(req, status);
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "success", success);
+    if (error) cJSON_AddStringToObject(resp, "error", error);
+    return json_response(req, resp);
+}
+
+#define POST_BODY_DEADLINE_US (10LL * 1000 * 1000)
+
 static esp_err_t config_post_handler(httpd_req_t *req) {
 
     if (check_auth(req) == ESP_FAIL) return ESP_FAIL;
 
-    int ret = httpd_req_recv(req, buffer, BUFFER_SIZE - 1);
-
-    if (ret <= 0) {
-
-        if (ret == HTTPD_SOCK_ERR_TIMEOUT) httpd_resp_send_408(req);
-
-        return ESP_FAIL;
+    // Only application/json: a cross-site form or text/plain POST (no CORS
+    // preflight) from any web page the user has open must not reconfigure it.
+    char ctype[48];
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", ctype, sizeof(ctype)) != ESP_OK ||
+        strncasecmp(ctype, "application/json", strlen("application/json")) != 0) {
+        return config_post_reply(req, "415 Unsupported Media Type", false, "content type must be application/json");
     }
 
-    buffer[ret] = '\0';
+    // Read the WHOLE body: TCP may deliver it in several pieces.
+    size_t total = req->content_len;
+    if (total == 0 || total > BUFFER_SIZE - 1) {
+        return config_post_reply(req, "413 Payload Too Large", false, "body empty or too large");
+    }
+    // One absolute deadline for the whole body: the server has a single
+    // task, and a client sending a byte every few seconds held it for hours
+    // with per-read timeouts only (review R6, 2026-11-06).
+    size_t got = 0;
+    int timeouts = 0;
+    int64_t body_t0 = esp_timer_get_time();
+    while (got < total) {
+        if (esp_timer_get_time() - body_t0 > POST_BODY_DEADLINE_US) {
+            httpd_resp_send_408(req);
+            return ESP_FAIL;
+        }
+        int r = httpd_req_recv(req, buffer + got, total - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 3) continue;
+        if (r <= 0) {
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) httpd_resp_send_408(req);
+            return ESP_FAIL;
+        }
+        got += (size_t)r;
+    }
+    buffer[got] = '\0';
 
     cJSON *root = NULL;
-
-    if (!parse_json(&root, buffer)) return ESP_FAIL;
-
-    int     config_item_count       = 0;
-
-    const   config_item_t *config_items = config_items_get(&config_item_count);
-
-    for (int i = 0; i < config_item_count; i++) {
-
-        
-        const config_item_t *item = &config_items[i];
-
-        cJSON *entry = NULL;
-
-        if (!parse_json_entry(root, item->key, &entry)) continue;
-
-        esp_err_t err = apply_config_value(item, entry);
-
-        if (err != ESP_OK) {
-
-            ESP_LOGE(TAG, "Error applying key=%s: err=%d (%s)", item->key, err, esp_err_to_name(err));
-
-        } else {
-
-            ESP_LOGI(TAG, "Applied config key=%s successfully", item->key);
-
-        }
+    if (!parse_json(&root, buffer)) {
+        return config_post_reply(req, "400 Bad Request", false, "malformed JSON");
     }
 
+    int config_item_count = 0;
+    const config_item_t *config_items = config_items_get(&config_item_count);
+
+    // Pass 1: validate every field that names a config item.
+    int writable = 0;
+    for (int i = 0; i < config_item_count; i++) {
+        const config_item_t *item = &config_items[i];
+        cJSON *entry = NULL;
+        if (!parse_json_entry(root, item->key, &entry)) continue;
+        if (!post_writable(item->key)) {
+            ESP_LOGW(TAG, "config POST: key %s is not writable here", item->key);
+            cJSON_Delete(root);
+            return config_post_reply(req, "403 Forbidden", false, "key not writable");
+        }
+        if (!post_value_valid(item, entry)) {
+            ESP_LOGW(TAG, "config POST: invalid value for %s", item->key);
+            cJSON_Delete(root);
+            return config_post_reply(req, "400 Bad Request", false, "invalid value");
+        }
+        writable++;
+    }
+    if (writable == 0) {
+        cJSON_Delete(root);
+        return config_post_reply(req, "400 Bad Request", false, "nothing to change");
+    }
+
+    // Pass 2: write.
+    bool ok = true;
+    for (int i = 0; i < config_item_count; i++) {
+        const config_item_t *item = &config_items[i];
+        cJSON *entry = NULL;
+        if (!parse_json_entry(root, item->key, &entry)) continue;
+        esp_err_t err = apply_config_value(item, entry);
+        if (err != ESP_OK) {
+            ok = false;
+            ESP_LOGE(TAG, "Error applying key=%s: err=%d (%s)", item->key, err, esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Applied config key=%s successfully", item->key);
+        }
+    }
     cJSON_Delete(root);
-    config_commit();
 
-    cJSON *resp = cJSON_CreateObject();
-    cJSON_AddBoolToObject(resp, "success", true);
+    if (config_commit() != ESP_OK) ok = false;
+    if (!ok) {
+        return config_post_reply(req, "500 Internal Server Error", false, "could not store the configuration");
+    }
 
-    esp_err_t result =  json_response(req, resp);
-
+    esp_err_t result = config_post_reply(req, NULL, true, NULL);
     config_restart();
-
     return result;
 }
 
@@ -1045,6 +1206,8 @@ static esp_err_t wifi_scan_get_handler(httpd_req_t *req) {
 }
 
 static esp_err_t rtk_status_get_handler(httpd_req_t *req) {
+    // Carries the station coordinate and identity: same access rule as /config.
+    if (check_auth(req) == ESP_FAIL) return ESP_FAIL;
     cJSON *root = cJSON_CreateObject();
     provisioning_fill_status(root);
     return json_response(req, root);
@@ -1073,6 +1236,8 @@ static esp_err_t ntrip_tx_stats_get_handler(httpd_req_t *req) {
     cJSON_AddNumberToObject(ingest, "ring_cum_bytes", (double)ing.ring_cum_bytes);
     cJSON_AddNumberToObject(ingest, "uart_event_post_drops", uart_event_post_drops());
     cJSON_AddNumberToObject(ingest, "uart_read_errors", uart_read_errors());
+    cJSON_AddNumberToObject(ingest, "uart_rx_overflows", uart_rx_overflows());
+    cJSON_AddNumberToObject(ingest, "uart_rx_line_errors", uart_rx_line_errors());
 
     // Required-set freshness: which production messages the receiver is
     // actually producing right now, per type. "any CRC-valid frame" is not
@@ -1115,6 +1280,18 @@ static esp_err_t ntrip_tx_stats_get_handler(httpd_req_t *req) {
     return json_response(req, root);
 }
 
+#if CONFIG_RTK_TEST_PAGE
+static esp_err_t test_status_get_handler(httpd_req_t *req) {
+    if (check_auth(req) == ESP_FAIL) return ESP_FAIL;
+    return board_test_status_handler(req);
+}
+
+static esp_err_t test_do_get_handler(httpd_req_t *req) {
+    if (check_auth(req) == ESP_FAIL) return ESP_FAIL;
+    return board_test_do_handler(req);
+}
+#endif
+
 static esp_err_t register_uri_handler(httpd_handle_t server, const char *path, httpd_method_t method, esp_err_t (*handler)(httpd_req_t *r)) {
     httpd_uri_t uri_config_get = {
             .uri        = path,
@@ -1141,10 +1318,30 @@ static httpd_handle_t web_server_start(void)
 
     httpd_handle_t server = NULL;
 
+    // The shared response buffer must exist BEFORE httpd runs a handler: it
+    // used to be allocated after httpd_start(), so an early request (or a
+    // failed allocation) used a NULL buffer. PSRAM when there is one: it is
+    // only used for file reads and JSON output, and internal RAM is the
+    // scarce pool on the Ethernet board.
+    if (buffer == NULL) {
+        buffer = heap_caps_malloc_prefer(BUFFER_SIZE, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT);
+    }
+    if (buffer == NULL) {
+        ESP_LOGE(TAG, "no memory for the response buffer, web server not started");
+        return NULL;
+    }
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
     config.uri_match_fn     = httpd_uri_match_wildcard;
     config.max_uri_handlers = maxWebHandlerCount;
+    // lwIP has 10 sockets and the web server keeps two of its own. The
+    // default 7 client slots let one browser with keep-alive connections take
+    // the sockets the caster upload, the IE heartbeat and OTA need (review
+    // 13.11. L1, R6). Four slots, the least recently used one is closed when
+    // a fifth client connects, so a page load never locks the uplink out.
+    config.max_open_sockets = 4;
+    config.lru_purge_enable = true;
 
     // Start the http server
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
@@ -1178,6 +1375,15 @@ static httpd_handle_t web_server_start(void)
         register_uri_handler(server, "/ntrip/tx_stats", HTTP_GET, ntrip_tx_stats_get_handler);
         countWebHandler++;
 
+#if CONFIG_RTK_TEST_PAGE
+        // Board test build only (-DRTK_TEST_PAGE=1), before the wildcard.
+        register_uri_handler(server, "/test/status", HTTP_GET, test_status_get_handler);
+        countWebHandler++;
+
+        register_uri_handler(server, "/test/do", HTTP_GET, test_do_get_handler);
+        countWebHandler++;
+#endif
+
         register_uri_handler(server, "/*", HTTP_GET, file_get_handler);
         countWebHandler++;
 
@@ -1187,12 +1393,6 @@ static httpd_handle_t web_server_start(void)
         ESP_LOGE(TAG, "Could not start server");
         return NULL;
     }
-
-    buffer = malloc(BUFFER_SIZE);
-    if (buffer == NULL) {
-        ESP_LOGE(TAG, "malloc buffer failed,Could not start server");
-        return NULL;
-    }        
     return server;
 }
 

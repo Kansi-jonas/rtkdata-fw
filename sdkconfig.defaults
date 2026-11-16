@@ -30,6 +30,14 @@ CONFIG_LWIP_IPV4_NAPT=y
 # the app, not the bootloader -- so existing field units are not retro-protected.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
+# GNSS UART receive must survive flash writes. A flash write or erase (NVS
+# commit, OTA, SPIFFS) disables the cache, and a UART ISR in flash is held off
+# for the whole operation: the 128-byte RX FIFO overflows after ~11 ms at
+# 115200 baud and RTCM bytes are lost. With this the driver ISR and its
+# buffers live in IRAM/internal RAM and keep receiving. uart.c counts any
+# remaining overflow (/ntrip/tx_stats ingest.uart_rx_overflows).
+CONFIG_UART_ISR_IN_IRAM=y
+
 # App runtime tuning (match the validated local build)
 CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
 CONFIG_FREERTOS_HZ=100

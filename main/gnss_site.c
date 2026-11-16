@@ -184,6 +184,46 @@ uint32_t gnss_site_horizontal_mm(double lat1, double lon1, double lat2, double l
     return mm >= UINT32_MAX ? UINT32_MAX : (uint32_t)ceil(mm);
 }
 
+static uint64_t rtcm_bits(const uint8_t *p, unsigned pos, unsigned n) {
+    uint64_t v = 0;
+    for (unsigned i = pos; i < pos + n; ++i) v = (v << 1) | ((p[i >> 3] >> (7 - (i & 7))) & 1u);
+    return v;
+}
+
+static int64_t rtcm_sbits(const uint8_t *p, unsigned pos, unsigned n) {
+    uint64_t v = rtcm_bits(p, pos, n);
+    return (v >> (n - 1)) ? (int64_t)(v - (UINT64_C(1) << n)) : (int64_t)v;
+}
+
+/* RTCM 10403.3 message 1005/1006: DF002 type (12), DF003 station (12),
+ * DF021 ITRF year (6), DF022-DF024 and DF141 (4 x 1), DF025 X (38, 0.1 mm),
+ * DF142, DF001 (2 x 1), DF026 Y (38), DF364 (2), DF027 Z (38): 152 bits. */
+bool gnss_site_parse_arp(const uint8_t *frame, size_t len, double *lat, double *lon) {
+    if (!frame || !lat || !lon || len < 6 || frame[0] != 0xD3) return false;
+    size_t payload = ((size_t)(frame[1] & 0x03) << 8) | frame[2];
+    if (payload + 6 != len || payload < 19) return false;
+    const uint8_t *p = frame + 3;
+    unsigned type = (unsigned)rtcm_bits(p, 0, 12);
+    /* 1005 is 152 bits, 1006 adds the 16-bit antenna height (L4) */
+    if (!(type == 1005 && payload == 19) && !(type == 1006 && payload == 21)) return false;
+    double x = rtcm_sbits(p, 34, 38) * 1e-4;
+    double y = rtcm_sbits(p, 74, 38) * 1e-4;
+    double z = rtcm_sbits(p, 114, 38) * 1e-4;
+    double r = sqrt(x*x + y*y + z*z);
+    if (r < 6300000.0 || r > 6400000.0) return false;   /* not on the Earth's surface */
+    const double a = 6378137.0, e2 = 6.69437999014e-3;   /* WGS84 */
+    double horizontal = hypot(x, y);
+    double phi = atan2(z, horizontal * (1 - e2));
+    for (int i = 0; i < 6; ++i) {
+        double s = sin(phi), n = a / sqrt(1 - e2 * s * s);
+        double h = horizontal > 1.0 ? horizontal / cos(phi) - n : fabs(z) - n * (1 - e2);
+        phi = atan2(z, horizontal * (1 - e2 * n / (n + h)));
+    }
+    *lat = phi * 57.29577951308232;
+    *lon = atan2(y, x) * 57.29577951308232;
+    return isfinite(*lat) && isfinite(*lon);
+}
+
 bool gnss_site_displaced(double lat, double lon, uint32_t sigma,
                          double ref_lat, double ref_lon) {
     uint32_t threshold = sigma > UINT32_MAX / 5 ? UINT32_MAX : sigma * 5;

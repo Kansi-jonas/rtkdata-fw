@@ -29,8 +29,8 @@ Cross-references: docs/enroll-per-device-key.md (security), docs/fw-correction-f
    `python tools/provision_device.py --port COM4 --flash`
    - reads the chip MAC, derives `enroll_key = HMAC(master, "rtkdata-enroll-key-v1:"+chip_id)`,
      writes NVS `rtk_enr_key` (64-hex) + `rtk_key_ver=1`. (Do this AFTER the full flash.)
-4. Record for inventory: device_id = `rtk-<12hexmac>`, mountpoint = `RTK_<12HEXMAC>`,
-     AP SSID = `RTKdata_<last 3 mac bytes>`. (NO secret recorded; the key stays on-device.)
+4. Record for inventory: device_id = `rtk-<12hexmac>`, mountpoint = `RTK_RTK<12HEXMAC>`,
+     AP SSID = `RTKdata_<last 3 STA mac bytes>` (Ethernet boards from 2.1.4; older images and the Wi-Fi fleet use the AP MAC, one higher). (NO secret recorded; the key stays on-device.)
 
 ## 2. First boot + WiFi onboarding (installer at site)
 

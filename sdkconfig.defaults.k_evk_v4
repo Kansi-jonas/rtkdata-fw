@@ -18,3 +18,27 @@ CONFIG_ETH_RMII_CLK_IN_GPIO=0
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_IGNORE_NOTFOUND=y
 CONFIG_SPIRAM_USE_MALLOC=y
+
+# Same internal RAM budget fix as V4.1 (see sdkconfig.defaults.k_evk_v41).
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+
+# mbedTLS through the normal heap (2026-11-13). The IDF default pins every
+# mbedTLS allocation to internal RAM; the 16 KB record buffer plus the
+# handshake then needed more than the ~40 KB internal RAM left after start-up,
+# and the first enroll on the bench failed with mbedtls_ssl_setup -0x7F00
+# (ALLOC_FAILED). With the default allocator the big buffers go to PSRAM
+# (above SPIRAM_MALLOC_ALWAYSINTERNAL) and fall back to internal RAM on a
+# board without PSRAM; EXTERNAL_MEM_ALLOC would break TLS there.
+# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set
+CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
+
+# IRAM budget (2026-11-06). The UART ISR moved into IRAM (sdkconfig.defaults,
+# GNSS bytes survive flash writes) and overflowed iram0 by 2432 bytes on this
+# board: the PSRAM cache workaround already places much of newlib in IRAM.
+# The Wi-Fi RX fast path is the cheapest place to take it from (Espressif:
+# about 17 KB): on this board Wi-Fi is fallback and setup only, and the
+# station moves a few KB/s. The OnoLink build keeps it (Wi-Fi is its uplink).
+# Alternative with more headroom: CONFIG_ESP32_REV_MIN_3 drops the PSRAM
+# workaround (the samples are v3.1), but then no older chip can boot it.
+# CONFIG_ESP_WIFI_RX_IRAM_OPT is not set

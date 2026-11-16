@@ -20,9 +20,19 @@ Two tests the sample boards have to pass before a field unit ships:
             AP is up at the same time (Wi-Fi + Ethernet coexistence).
             PASS = no failed fetch, no link flap, no symbol error.
 
+  soak   -- long run while the unit streams to a caster. Polls /status and
+            /ntrip/tx_stats once a minute, writes a CSV row per poll and
+            counts reboots (uptime falls), link flaps, symbol errors, caster
+            reconnects, RTCM CRC errors, UART overflows and polls where the
+            receiver did not produce the full message set.
+            PASS = 0 reboots, 0 flaps, 0 symbol/CRC/overflow errors, at most
+            2 caster reconnects per started day, at most 1 % of polls not
+            fresh or unreachable.
+
 Usage:
   python tools/eth_bench.py reset --port COM7 --cycles 100
   python tools/eth_bench.py net --ip 192.168.1.50 --minutes 10
+  python tools/eth_bench.py soak --ip 192.168.1.50 --hours 72 --csv soak_unit1.csv
 """
 import argparse
 import json
@@ -129,6 +139,139 @@ def cmd_net(args):
     return 0 if ok else 1
 
 
+def _get_json(ip, path, auth):
+    req = urllib.request.Request(f"http://{ip}{path}")
+    if auth:
+        req.add_header("Authorization", "Basic " + auth)
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.loads(r.read().decode())
+
+
+def cmd_soak(args):
+    """Long soak while the unit streams to a caster: poll /status and
+    /ntrip/tx_stats, write one CSV row per poll, judge at the end.
+
+    Counters are per boot, so every delta is taken against the previous poll
+    and a falling uptime counts as a reboot (the counters restart there)."""
+    import base64
+    import csv
+    import math
+
+    auth = None
+    if args.user:
+        auth = base64.b64encode(f"{args.user}:{args.password or ''}".encode()).decode()
+
+    fields = ["utc", "uptime_s", "eth_link", "eth_speed", "eth_ip", "sta_parked",
+              "link_ups", "symbol_errors", "caster_connected", "reconnects",
+              "crc_errors", "uart_rx_overflows", "required_all_fresh",
+              "bytes_out", "heap_free", "error"]
+    out = open(args.csv, "a", newline="")
+    w = csv.DictWriter(out, fieldnames=fields)
+    if out.tell() == 0:
+        w.writeheader()
+
+    tot = {"reboots": 0, "link_flaps": 0, "symbol_errors": 0, "reconnects": 0,
+           "crc_errors": 0, "uart_rx_overflows": 0, "not_fresh": 0,
+           "polls": 0, "unreachable": 0, "disconnected": 0, "stalled": 0}
+    prev = None
+    bytes_out_total = 0
+    end = time.time() + args.hours * 3600
+    while True:
+        row = {"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        tot["polls"] += 1
+        try:
+            st = _get_json(args.ip, "/status", auth)
+            tx = _get_json(args.ip, "/ntrip/tx_stats", auth)
+        except Exception as e:  # noqa: BLE001
+            tot["unreachable"] += 1
+            row["error"] = str(e)[:120]
+            w.writerow(row)
+            out.flush()
+            print(f"{row['utc']}  unreachable: {row['error']}", flush=True)
+        else:
+            eth = st.get("eth") or {}
+            ing = tx.get("ingest") or {}
+            inst = tx.get("instances") or []
+            cur = {
+                "uptime_s": st.get("uptime", 0),
+                "link_ups": eth.get("link_ups", 0),
+                "symbol_errors": eth.get("symbol_errors", 0),
+                "reconnects": sum(i.get("reconnects", 0) for i in inst),
+                "crc_errors": ing.get("crc_errors", 0),
+                "uart_rx_overflows": ing.get("uart_rx_overflows", 0),
+                # /status has one entry per stream (ntrip_server_0, uart, ...),
+                # no "total" key: the upload is the sum of the NTRIP servers.
+                "bytes_out": sum(((v or {}).get("total") or {}).get("out", 0)
+                                 for k, v in (st.get("streams") or {}).items()
+                                 if k.startswith("ntrip_server")),
+            }
+            row.update(cur)
+            row.update({
+                "eth_link": eth.get("link"), "eth_speed": eth.get("speed"),
+                "eth_ip": eth.get("ip4"),
+                "sta_parked": ((st.get("wifi") or {}).get("sta") or {}).get("parked"),
+                "caster_connected": any(i.get("connected") for i in inst),
+                "required_all_fresh": ing.get("required_all_fresh"),
+                "heap_free": (st.get("heap") or {}).get("free"),
+            })
+            if not ing.get("required_all_fresh", False):
+                tot["not_fresh"] += 1
+            if not row["caster_connected"]:
+                tot["disconnected"] += 1
+            if prev is not None:
+                if cur["uptime_s"] < prev["uptime_s"]:
+                    tot["reboots"] += 1
+                    print(f"{row['utc']}  REBOOT (uptime {prev['uptime_s']} -> {cur['uptime_s']})", flush=True)
+                    # The new boot's first link-up and connect are normal; the
+                    # reboot already fails the run, so restart the baseline.
+                    base = dict(cur, bytes_out=0)
+                else:
+                    base = prev
+                for k, t in (("link_ups", "link_flaps"), ("symbol_errors", "symbol_errors"),
+                             ("reconnects", "reconnects"), ("crc_errors", "crc_errors"),
+                             ("uart_rx_overflows", "uart_rx_overflows")):
+                    d = cur[k] - base[k]
+                    if d > 0:
+                        tot[t] += d
+                        print(f"{row['utc']}  {t} +{d}", flush=True)
+                d_out = max(0, cur["bytes_out"] - base["bytes_out"])
+                bytes_out_total += d_out
+                # A poll interval without new upload bytes: fresh local RTCM
+                # alone is not streaming (review 13.11. L3 #5).
+                if d_out == 0:
+                    tot["stalled"] += 1
+            prev = cur
+            w.writerow(row)
+            out.flush()
+        if time.time() >= end:
+            break
+        time.sleep(args.interval)
+    out.close()
+
+    days = max(1, math.ceil(args.hours / 24))
+    max_rec = 2 * days
+    max_not_fresh = max(1, tot["polls"] // 100)
+    max_unreach = max(1, tot["polls"] // 100)
+    print(f"\n{tot['polls']} polls over {args.hours} h, CSV: {args.csv}")
+    print(f"reboots {tot['reboots']} (max 0), link flaps {tot['link_flaps']} (max 0), "
+          f"symbol errors {tot['symbol_errors']} (max 0)")
+    print(f"caster reconnects {tot['reconnects']} (max {max_rec}), RTCM CRC errors {tot['crc_errors']} (max 0), "
+          f"UART overflows {tot['uart_rx_overflows']} (max 0)")
+    print(f"polls without the full message set {tot['not_fresh']} (max {max_not_fresh}), "
+          f"unreachable {tot['unreachable']} (max {max_unreach})")
+    print(f"uploaded {bytes_out_total / 1e6:.1f} MB = {bytes_out_total / 1e6 / max(args.hours, 1e-6) * 24:.0f} MB/day")
+    print(f"polls with the caster disconnected {tot['disconnected']} (max {max_not_fresh}), "
+          f"poll intervals without upload {tot['stalled']} (max {max_not_fresh})")
+    ok = (tot["reboots"] == 0 and tot["link_flaps"] == 0 and tot["symbol_errors"] == 0
+          and tot["reconnects"] <= max_rec and tot["crc_errors"] == 0
+          and tot["uart_rx_overflows"] == 0 and tot["not_fresh"] <= max_not_fresh
+          and tot["unreachable"] <= max_unreach
+          and tot["disconnected"] <= max_not_fresh and tot["stalled"] <= max_not_fresh
+          and bytes_out_total > 0)
+    print("PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -140,8 +283,15 @@ def main():
     n = sub.add_parser("net", help="LAN soak against the device's web server")
     n.add_argument("--ip", required=True)
     n.add_argument("--minutes", type=float, default=10)
+    s = sub.add_parser("soak", help="long soak while streaming: poll /status + /ntrip/tx_stats, CSV log")
+    s.add_argument("--ip", required=True)
+    s.add_argument("--hours", type=float, default=72)
+    s.add_argument("--interval", type=float, default=60, help="seconds between polls")
+    s.add_argument("--csv", default="soak.csv")
+    s.add_argument("--user", help="web UI user, only if basic auth is on")
+    s.add_argument("--password")
     args = ap.parse_args()
-    sys.exit(cmd_reset(args) if args.cmd == "reset" else cmd_net(args))
+    sys.exit({"reset": cmd_reset, "net": cmd_net, "soak": cmd_soak}[args.cmd](args))
 
 
 if __name__ == "__main__":

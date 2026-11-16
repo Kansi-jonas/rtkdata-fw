@@ -65,15 +65,26 @@ void stream_stats_init() {
     xTaskCreate(stream_stats_task, "stream_stats_task", 2048, NULL, TASK_PRIORITY_STATS, NULL);
 }
 
+// Uploader tasks create their stats concurrently at boot: the insert is a
+// short critical section so two of them cannot lose an entry. Readers walk
+// the list unlocked; an entry is fully built before it becomes reachable.
+static portMUX_TYPE s_list_mux = portMUX_INITIALIZER_UNLOCKED;
+
 stream_stats_handle_t stream_stats_new(const char *name) {
     stream_stats_handle_t new = calloc(1, sizeof(struct stream_stats));
+    // OOM must reach the caller as NULL (they check it), not as a NULL
+    // dereference right here (review 2026-11-06, N6)
+    if (new == NULL) return NULL;
     new->name = name;
+    portENTER_CRITICAL(&s_list_mux);
     SLIST_INSERT_HEAD(&stream_stats_list, new, next);
+    portEXIT_CRITICAL(&s_list_mux);
 
     return new;
 }
 
 void stream_stats_increment(stream_stats_handle_t stats, uint32_t in, uint32_t out) {
+    if (stats == NULL) return;   // stats are optional; their absence is not a fault
     stats->total_in += in;
     stats->total_out += out;
     stats->rate_in_period_count += in;

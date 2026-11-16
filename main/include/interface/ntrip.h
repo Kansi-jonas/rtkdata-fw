@@ -18,7 +18,24 @@
 #define NEWLINE_LENGTH 2
 
 void ntrip_server_init();
+
+// Configuration changed (new credentials or caster from provisioning): every
+// instance drops its connection, also one still being set up, and skips any
+// remaining backoff so the new settings apply at once.
 void ntrip_server_reconnect_all(void);
+
+// Watchdog request (supervisor, no caster progress): an ESTABLISHED session
+// that has moved no data for a while is closed. An attempt that is still
+// dialling or waiting for the caster's reply is left alone; cancelling those
+// every 15 s meant a slow but working caster could never be reached again
+// (SOTA review 2026-11-06, N2).
+void ntrip_server_kick_stalled(void);
+
+// Start every configured uploader that is not running: one whose task could
+// not be created at boot (memory pressure) or one activated at runtime by
+// provisioning. Cheap when nothing is missing; called by the supervisor.
+void ntrip_server_ensure_instances(void);
+
 void ntrip_server_site_flush(void);
 
 // Bring up the RTCM parser + frame ring. Call right after uart_init(), BEFORE
@@ -115,7 +132,8 @@ typedef struct {
     uint64_t eagain_count;
     uint32_t reconnects;
     uint32_t max_queue_age_ms;      // max across instances
-    uint32_t instances;
+    uint32_t instances;             // uploaders RUNNING
+    uint32_t configured;            // uploaders configured active in NVS
     uint32_t connected;
     bool     req_fresh;             // every required RTCM type within budget
     uint32_t req_missing;           // how many required types are stale/unseen

@@ -9,7 +9,7 @@
 #include <wifi.h>
 #include <tasks.h>
 #include <status_led.h>
-#include <retry.h>
+#include <esp_random.h>
 #include <stream_stats.h>
 #include <freertos/event_groups.h>
 #include <freertos/task.h> 
@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include "interface/ntrip.h"
 #include "interface/ntrip_tx_core.h"
+#include "interface/ntrip_conn.h"
 #include "config.h"
 #include "util.h"
 #include "uart.h"
@@ -41,6 +42,15 @@ static const char *TAG = "NTRIP_SERVER";
 static const int CASTER_READY_BIT = BIT0;
 static const int DATA_READY_BIT   = BIT1;
 static const int DATA_SENT_BIT    = BIT2;
+// Configuration changed: ends a backoff wait early (ntrip_server_reconnect_all)
+static const int RECONFIG_BIT     = BIT3;
+
+// A watchdog kick closes a session only if it has moved no data for this long:
+// a session that is delivering right now is not the one the supervisor means
+// (its view is the aggregate over all uploaders).
+#define NTRIP_KICK_IDLE_MS 10000
+// Absolute bound for the caster's reply to SOURCE, across all reads.
+#define NTRIP_REPLY_DEADLINE_MS 10000
 
 typedef struct {
 
@@ -51,7 +61,7 @@ typedef struct {
     TaskHandle_t            task_sleep;      // Sleep/KeepAlive Task
     status_led_handle_t     led;             // LED Handle
     stream_stats_handle_t   stats;           // Stream-Stats
-    retry_delay_handle_t    retry;           // Retry-Backoff
+    uint32_t                attempt;         // backoff position, see ntrip_conn.h
     int                     sock;            // Socket for this instance
     int                     data_keep_alive; // KeepAlive counter
     ntrip_tx_t              tx;              // sender state + counters (tx core)
@@ -59,6 +69,10 @@ typedef struct {
     // request that arrives during DNS/handshake must survive until the drain
     // loop can honor it (review 2026-08-01).
     volatile uint32_t       reconnect_gen;
+    // Watchdog requests (supervisor) are a separate generation: they may end
+    // an established session that moves no data, never an attempt in
+    // progress (see ntrip_server_kick_stalled).
+    volatile uint32_t       kick_gen;
     uint32_t                site_generation;
 
 } ntrip_instance_t;
@@ -68,6 +82,10 @@ typedef struct {
 static ntrip_instance_t *g_instances[MAX_NTRIP_SERVERS] = {0};
 static size_t            g_instance_count               = 0;
 static SemaphoreHandle_t g_instances_mutex              = NULL;
+static StaticSemaphore_t g_instances_mutex_buf;   // static: creation cannot fail
+static StaticSemaphore_t g_ring_mutex_buf;
+static volatile uint32_t g_configured                   = 0;   // active in NVS
+static bool              g_started                      = false;
 
 // Shared RTCM ingest: one parser (single GNSS UART source) feeding one frame
 // ring, all statically allocated. Only CRC-valid complete frames enter the
@@ -98,6 +116,14 @@ static inline uint32_t ntrip_now_ms(void) {
 static inline void build_key(char *dst, size_t dstsz, const char *base, const char *suffix) {
     // base "ntr_srv_host", suffix "" or "_3"
     snprintf(dst, dstsz, "%s%s", base, suffix);
+}
+
+// The firmware version for the Source-Agent header. It skipped the first
+// character, a leftover from "v1.2.3" git-describe versions: since the app
+// version comes from config.h ("1.1.10") casters saw ".1.10".
+static const char *ntrip_agent_version(void) {
+    const char *v = esp_app_get_description()->version;
+    return v[0] == 'v' ? v + 1 : v;
 }
 
 // -----------------------------------------------------------NTRIP-----------------------------------------------------------------//
@@ -368,28 +394,35 @@ static void ntrip_server_init_task_context(ntrip_instance_t *inst, char *key,siz
         ESP_LOGW(TAG, "[%d] Failed to create stream stats", inst->index);
     }
 
-    // Retry
-    inst->retry = retry_init(true, 5, 2000, 0);
-
-    if (!inst->retry) {
-
-        ESP_LOGE(TAG, "[%d] Failed to init retry, falling back to fixed 2s delay", inst->index);
-    }
+    // Backoff: the first attempt after boot goes out at once
+    inst->attempt = 0;
 }
 
-// Waiting phase before connection establishment: Retry delay, waiting for UART data,
-// Sleep-Task start, auf IP warten
+// Waiting phase before connection establishment: backoff, waiting for UART
+// data, sleep task start, waiting for an IP.
 static void ntrip_server_wait_for_start(ntrip_instance_t *inst){
 
-    // Retry / Fallback-Delay
-    if (inst->retry) {
+    // Backoff, interruptible by a configuration change: new credentials from
+    // provisioning used to wait out a backoff of up to an hour.
+    uint32_t delay_ms = ntrip_backoff_ms(inst->attempt, esp_random());
 
-        retry_delay(inst->retry);
+    if (delay_ms > 0) {
+
+        ESP_LOGI(TAG, "[%d] reconnect in %lu ms (attempt %lu)", inst->index,
+                 (unsigned long)delay_ms, (unsigned long)inst->attempt);
+
+        EventBits_t woke = xEventGroupWaitBits(inst->ev, RECONFIG_BIT, pdTRUE, pdFALSE,
+                                               pdMS_TO_TICKS(delay_ms));
+
+        if (woke & RECONFIG_BIT) {
+
+            ESP_LOGI(TAG, "[%d] configuration changed, connecting now", inst->index);
+            inst->attempt = 1;   // failures from here on start at the floor again
+        }
 
     } else {
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
-
+        xEventGroupClearBits(inst->ev, RECONFIG_BIT);
     }
 
     // wait for first UART data
@@ -629,16 +662,22 @@ static void ntrip_server_task(void *ctx){
 
         uint16_t port = 2101;
 
+        // Set when this session delivered data for NTRIP_BACKOFF_HEALTHY_MS:
+        // only then does the backoff start over (N1, review 2026-11-06).
+        bool healthy_session = false;
+
         ntrip_server_wait_for_start(inst);
         while (!gnss_site_upload_allowed()) vTaskDelay(pdMS_TO_TICKS(200));
         inst->site_generation = gnss_site_upload_generation();
 
-        ntrip_server_load_config_from_storage(inst, key, sizeof(key), &host, &port, &pwd, &mp);
-
-        // Snapshot the reconnect generation BEFORE dialing: a request that
-        // arrives during DNS/handshake ends the new connection promptly
-        // instead of being lost (the old boolean was cleared unconditionally).
+        // Snapshot the reconnect generation BEFORE the credentials are read
+        // and before dialing: a configuration change that lands while we
+        // load, resolve or handshake ends this connection promptly. Taken
+        // after loading, new credentials written in between were never used
+        // while the old caster kept accepting (review R6, 2026-11-06).
         uint32_t conn_gen = inst->reconnect_gen;
+
+        ntrip_server_load_config_from_storage(inst, key, sizeof(key), &host, &port, &pwd, &mp);
 
         ESP_LOGI(TAG, "[%d] Connecting to %s:%u/%s", inst->index, host ? host : "", port, mp ? mp : "");
 
@@ -663,7 +702,7 @@ static void ntrip_server_task(void *ctx){
 
         snprintf(txbuf, BUFFER_SIZE, "SOURCE %s /%s" NEWLINE "Source-Agent: NTRIP %s/%s" NEWLINE NEWLINE,
                 (pwd ? pwd : ""), (mp ? mp : ""), NTRIP_SERVER_NAME,
-                 &esp_app_get_description()->version[1]);
+                 ntrip_agent_version());
 
         // The request must go out completely; a short write here would desync
         // the handshake exactly like it desynced RTCM frames on the data path.
@@ -681,18 +720,48 @@ static void ntrip_server_task(void *ctx){
 
         ERROR_ACTION(TAG, req_off != req_len, goto _error, "Send request failed: %d %s", errno, strerror(errno));
 
-        int len = read(inst->sock, txbuf, BUFFER_SIZE - 1);
+        // Read the caster's reply until its status line is complete, under
+        // one absolute deadline. A status line split across TCP segments used
+        // to fail the connect (one read() was taken as the whole reply).
+        size_t rlen = 0;
+        ntrip_reply_t reply = NTRIP_REPLY_INCOMPLETE;
+        uint32_t reply_t0 = ntrip_now_ms();
 
-        ERROR_ACTION(TAG, len <= 0, goto _error, "Recv resp failed: %d %s", errno, strerror(errno));
+        while (reply == NTRIP_REPLY_INCOMPLETE) {
 
-        txbuf[len] = '\0';
+            uint32_t spent = ntrip_now_ms() - reply_t0;
 
-        char *status = extract_http_header(txbuf, "");
+            if (spent >= NTRIP_REPLY_DEADLINE_MS) break;
 
-        ERROR_ACTION(TAG, status == NULL || !ntrip_response_ok(status), free(status); goto _error,
-                    "Mountpoint connect error: %s", status == NULL ? "HTTP malformed" : status);
+            uint32_t left = NTRIP_REPLY_DEADLINE_MS - spent;
+            struct timeval rtv = { .tv_sec = left / 1000, .tv_usec = (left % 1000) * 1000 };
+            setsockopt(inst->sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
 
-        free(status);
+            int n = read(inst->sock, txbuf + rlen, BUFFER_SIZE - 1 - rlen);
+
+            if (n <= 0) break;
+
+            rlen += (size_t)n;
+            reply = ntrip_reply_parse(txbuf, rlen, BUFFER_SIZE - 1);
+        }
+
+        if (reply != NTRIP_REPLY_OK) {
+
+            char line[64];
+            ntrip_reply_status_line(txbuf, rlen, line, sizeof(line));
+
+            if (reply == NTRIP_REPLY_REJECTED) {
+                ESP_LOGE(TAG, "[%d] caster rejected the upload: \"%s\"", inst->index, line);
+                uart_nmea("$PESP,NTRIP,SRV,REJECTED,%d,%s", inst->index, line);
+            } else if (reply == NTRIP_REPLY_OVERFLOW) {
+                ESP_LOGE(TAG, "[%d] caster reply without a line end in %u bytes", inst->index,
+                         (unsigned)rlen);
+            } else {
+                ESP_LOGE(TAG, "[%d] no complete caster reply within %d ms (%u bytes, errno %d)",
+                         inst->index, NTRIP_REPLY_DEADLINE_MS, (unsigned)rlen, errno);
+            }
+            goto _error;
+        }
 
         ERROR_ACTION(TAG, !ntrip_server_make_nonblocking(inst), goto _error,
                      "Could not switch socket to non-blocking");
@@ -718,10 +787,10 @@ static void ntrip_server_task(void *ctx){
             inst->led->active = true;
         }
 
-        // Arm the caster watchdog from the handshake on; the backoff reset
-        // deliberately waits for the first ACCEPTED bytes (a handshake that
-        // dies right after must keep backing off, or the fleet hammers a
-        // struggling caster in lockstep).
+        // Arm the caster watchdog from the handshake on. The backoff resets
+        // only after a session that stayed healthy for a minute (below): a
+        // caster that accepts and drops at once must keep backing off, or the
+        // fleet hammers a struggling caster in lockstep.
         supervisor_note_caster_tx(0);
 
         // Monitoring after connected
@@ -733,8 +802,13 @@ static void ntrip_server_task(void *ctx){
         // probe (recv) keeps detecting a half-open socket like before (the
         // stock bug: a GNSS stall meant no send ever failed, so a dead caster
         // socket was never noticed -> the station went dark).
+        uint32_t connected_ms = ntrip_now_ms();
+        uint32_t last_progress_ms = connected_ms;
+        uint32_t last_probe_ms = connected_ms;
+        uint32_t first_progress_ms = 0;
         bool made_progress = false;
-        uint32_t last_probe_ms = ntrip_now_ms();
+        // Kicks from before this session existed are not about it.
+        uint32_t seen_kick = inst->kick_gen;
 
         while (inst->reconnect_gen == conn_gen && gnss_site_upload_allowed() &&
                inst->site_generation == gnss_site_upload_generation()) {
@@ -742,6 +816,17 @@ static void ntrip_server_task(void *ctx){
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(NTRIP_DRAIN_WAIT_MS));
 
             uint32_t now = ntrip_now_ms();
+
+            if (inst->kick_gen != seen_kick) {
+
+                seen_kick = inst->kick_gen;
+
+                if ((uint32_t)(now - last_progress_ms) >= NTRIP_KICK_IDLE_MS) {
+                    ESP_LOGW(TAG, "[%d] watchdog: no data moved for %lu ms, reconnecting",
+                             inst->index, (unsigned long)(now - last_progress_ms));
+                    break;
+                }
+            }
 
             // Drain until the ring is empty or the socket pushes back. The
             // spin cap only bounds one wake-up; the outer loop continues.
@@ -761,17 +846,23 @@ static void ntrip_server_task(void *ctx){
                                    NTRIP_TX_STALE_DROP_MS,
                                    ntrip_server_sock_send, inst);
 
-                if (inst->tx.accepted_to_lwip > before && !made_progress) {
+                if (inst->tx.accepted_to_lwip > before) {
 
-                    // First accepted bytes on this connection: NOW the retry
-                    // backoff may reset (not at handshake, see above).
-                    made_progress = true;
+                    last_progress_ms = now;
 
-                    if (inst->retry) {
-                        retry_reset(inst->retry);
+                    if (!made_progress) {
+                        made_progress = true;
+                        first_progress_ms = now;
                     }
                 }
             } while (pr == NTRIP_TX_POLL_PROGRESS && ++spins < NTRIP_DRAIN_MAX_SPINS);
+
+            // Healthy = data has been flowing for a minute and is flowing now.
+            if (!healthy_session && made_progress &&
+                (uint32_t)(now - first_progress_ms) >= NTRIP_BACKOFF_HEALTHY_MS &&
+                (uint32_t)(now - last_progress_ms) < NTRIP_KICK_IDLE_MS) {
+                healthy_session = true;
+            }
 
             if (pr == NTRIP_TX_POLL_ERROR) {
                 ESP_LOGW(TAG, "[%d] send error (%d: %s), closing connection",
@@ -819,6 +910,8 @@ static void ntrip_server_task(void *ctx){
         ntrip_server_log_disconnect_monitoring(inst);
 
     _error:
+
+        inst->attempt = ntrip_backoff_next_attempt(inst->attempt, healthy_session);
 
         ntrip_server_cleanup_iteration(inst, txbuf, host, mp, pwd);
     }
@@ -878,7 +971,6 @@ void ntrip_server_msg_freshness(ntrip_msg_freshness_t *out) {
 
     if (!out) return;
 
-    uint32_t now = ntrip_now_ms();
     uint32_t epoch = s_epoch;           // snapshot once for a coherent verdict
     uint32_t since = s_epoch_started_ms;
     out->all_fresh = true;
@@ -890,11 +982,16 @@ void ntrip_server_msg_freshness(ntrip_msg_freshness_t *out) {
         // rejected.
         uint32_t last = s_msg_last_ms[i];
         uint32_t tag  = s_msg_epoch[i];
+        uint32_t now  = ntrip_now_ms();   // after `last`, so last <= now
 
-        // Both conditions: the sample must belong to the current epoch AND be
-        // newer than that epoch's start. The tag alone is forgeable by a
-        // pre-reset frame processed after the bump; the timestamp is not.
-        bool in_epoch = (tag == epoch) && ((int32_t)(last - since) > 0);
+        // Both conditions: the sample must belong to the current epoch AND
+        // lie between that epoch's start and now. The tag alone is forgeable
+        // by a pre-reset frame processed after the bump; the timestamp is not.
+        // Unsigned offsets from `since`: the signed (int32_t)(last - since)
+        // turned false once an epoch was 2^31 ms (24.9 days) old, and every
+        // fresh message then read as stale.
+        bool in_epoch = (tag == epoch) && (uint32_t)(last - since) <= (uint32_t)(now - since) &&
+                        last != since;
 
         if (!in_epoch) {
             out->age_ms[i] = UINT32_MAX;
@@ -949,6 +1046,9 @@ static void ntrip_server_on_frame(void *ctx, const uint8_t *frame, uint16_t len,
     // is the first 12 bits of the payload (frame[3..4]).
     if (len >= 6) {
         uint16_t mtype = (uint16_t)(((uint16_t)frame[3] << 4) | (frame[4] >> 4));
+        // The reference point the receiver broadcasts: the relocation guard
+        // judges a survey against it (legacy IE build, gnss_site_runtime.c).
+        if (mtype == 1005 || mtype == 1006) gnss_site_runtime_note_frame(frame, len);
         for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
             if (ntrip_required_msgs[i] == mtype) {
                 // Timestamp first, epoch tag last: a reader that catches this
@@ -1047,7 +1147,9 @@ void ntrip_server_ingest_init(void) {
 
     if (g_ring_mutex) return;
 
-    SemaphoreHandle_t mtx = xSemaphoreCreateMutex();
+    // Static: a failed allocation here used to disable RTCM ingest and every
+    // uploader for the whole boot (review R6, 2026-11-06).
+    SemaphoreHandle_t mtx = xSemaphoreCreateMutexStatic(&g_ring_mutex_buf);
 
     if (!mtx) {
 
@@ -1074,19 +1176,38 @@ void ntrip_server_ingest_init(void) {
              RTCM_RING_SLOTS);
 }
 
+// Which uploaders are configured active in NVS, and how many. Independent of
+// whether any of them could be started: the OTA check must never take a
+// configured unit for an unprovisioned spare (review R6, 2026-11-06).
+static uint32_t read_configured(bool active[MAX_NTRIP_SERVERS]) {
+
+    uint32_t configured = 0;
+
+    for (int i = 0; i < MAX_NTRIP_SERVERS; i++) {
+
+        char suffix[4] = "";
+
+        if (i > 0) snprintf(suffix, sizeof(suffix), "_%d", i);
+
+        char key[64];
+        build_key(key, sizeof(key), "ntr_srv_actv", suffix);
+
+        active[i] = config_get_bool1(CONF_ITEM(key));
+
+        if (active[i]) configured++;
+    }
+
+    return configured;
+}
+
 void ntrip_server_init() {
 
-    if (!g_instances_mutex){
+    bool active[MAX_NTRIP_SERVERS];
+    g_configured = read_configured(active);
 
-        g_instances_mutex = xSemaphoreCreateMutex();
+    if (!g_instances_mutex) {
 
-        if (!g_instances_mutex) {
-
-            ESP_LOGE(TAG, "Failed to create g_instances_mutex");
-
-            return;
-        }
-
+        g_instances_mutex = xSemaphoreCreateMutexStatic(&g_instances_mutex_buf);
     }
 
     // Normally already done right after uart_init(); harmless if not.
@@ -1094,87 +1215,110 @@ void ntrip_server_init() {
 
     if (!g_ring_mutex) return;   // ingest init failed; no instances without it
 
+    g_started = true;
+    ntrip_server_ensure_instances();
+}
+
+// True if an instance with this index is registered (running or starting).
+// Caller holds g_instances_mutex.
+static bool instance_running_locked(int index) {
+    for (size_t k = 0; k < g_instance_count; ++k) {
+        if (g_instances[k] && g_instances[k]->index == index) return true;
+    }
+    return false;
+}
+
+// Create and register one uploader; false on allocation or task failure (the
+// next ntrip_server_ensure_instances() call tries again). Caller holds
+// g_instances_mutex, so ensure calls from different tasks cannot race and
+// the ingest path never sees a half-built instance.
+static bool start_instance_locked(int i, const char *suffix) {
+
+    if (g_instance_count >= MAX_NTRIP_SERVERS) return false;
+
+    ntrip_instance_t *inst = calloc(1, sizeof(*inst));
+
+    if (!inst) return false;
+
+    strlcpy(inst->suffix, suffix, sizeof(inst->suffix));
+    inst->index = i;
+    inst->sock  = -1;
+
+    g_instances[g_instance_count++] = inst;
+
+    char task_name[32];
+    snprintf(task_name, sizeof(task_name), "ntrip_server_task_%d", i);
+
+    ESP_LOGI(TAG, "Starting NTRIP server task for index %d (suffix '%s')", i, inst->suffix);
+
+    if (xTaskCreate(ntrip_server_task, task_name, 4096, inst,
+                    TASK_PRIORITY_INTERFACE, &inst->task_server) != pdPASS) {
+
+        g_instances[--g_instance_count] = NULL;   // it is the last entry
+        free(inst);
+        return false;
+    }
+
+    return true;
+}
+
+// A configured uploader that is not running used to stay missing until the
+// next reboot: allocation or task creation failing once at boot under memory
+// pressure, or an uploader activated at runtime. With zero instances the OTA
+// health check even took the unit for an unprovisioned spare and confirmed
+// the image (review 2026-11-06, N3). Idempotent; cheap when nothing is
+// missing.
+void ntrip_server_ensure_instances(void) {
+
+    if (!g_started || !g_instances_mutex || !g_ring_mutex) return;
+
+    // NVS reads outside the lock: the UART ingest path takes it per frame.
+    bool active[MAX_NTRIP_SERVERS];
+    uint32_t configured = read_configured(active);
+
+    xSemaphoreTake(g_instances_mutex, portMAX_DELAY);
+
     for (int i = 0; i < MAX_NTRIP_SERVERS; i++) {
+
+        if (!active[i] || instance_running_locked(i)) continue;
 
         char suffix[4] = "";
 
-        if (i > 0) {
+        if (i > 0) snprintf(suffix, sizeof(suffix), "_%d", i);
 
-            snprintf(suffix, sizeof(suffix), "_%d", i);
-        }
-
-        char key[64];
-
-        build_key(key, sizeof(key), "ntr_srv_actv", suffix);
-
-        if (config_get_bool1(CONF_ITEM(key))) {
-
-            // create instance
-            ntrip_instance_t *inst = calloc(1, sizeof(*inst));
-
-            if (!inst) continue;
-
-            strncpy(inst->suffix, suffix, sizeof(inst->suffix));
-
-            inst->suffix[sizeof(inst->suffix) - 1] = '\0';
-            inst->index = i;
-            inst->sock  = -1;
-
-            bool registered = false;
-
-            // register
-            xSemaphoreTake(g_instances_mutex, portMAX_DELAY);
-
-            if (g_instance_count < MAX_NTRIP_SERVERS) {
-
-                g_instances[g_instance_count++] = inst;
-
-                registered = true;
-            }
-
-            xSemaphoreGive(g_instances_mutex);
-
-            if (!registered) {
-
-                ESP_LOGE(TAG, "Max NTRIP instances reached, skipping index %d", i);
-
-                free(inst);
-
-                continue;
-            }
-            
-
-            // start task
-            char task_name[32];
-
-            if (i == 0) snprintf(task_name, sizeof(task_name), "ntrip_server_task_0");
-            else        snprintf(task_name, sizeof(task_name), "ntrip_server_task_%d", i);
-
-            ESP_LOGI(TAG, "Starting NTRIP server task for index %d (suffix '%s')", i, inst->suffix);
-
-            BaseType_t res = xTaskCreate(ntrip_server_task, task_name, 4096, inst, 
-                TASK_PRIORITY_INTERFACE, &inst->task_server);
-
-            if (res != pdPASS) {
-
-                    ESP_LOGE(TAG, "Failed to create NTRIP server task for index %d", i);
-
-                    ntrip_server_deregister_instance(inst);
-
-                    free(inst);
-            }
+        if (!start_instance_locked(i, suffix)) {
+            ESP_LOGE(TAG, "Could not start NTRIP uploader %d (free heap %u), retrying later",
+                     i, (unsigned)esp_get_free_heap_size());
         }
     }
+
+    g_configured = configured;
+
+    xSemaphoreGive(g_instances_mutex);
 }
 
-// RTKdata: ask every NTRIP instance to drop its socket and reconnect (picks up
-// new credentials from provisioning, and is the supervisor's caster recovery).
+// Configuration changed (provisioning): every instance drops its socket, also
+// one still dialling, and a backoff wait ends at once.
 void ntrip_server_reconnect_all(void) {
     if (!g_instances_mutex) return;
     xSemaphoreTake(g_instances_mutex, portMAX_DELAY);
     for (size_t k = 0; k < g_instance_count; ++k) {
         ntrip_instance_t *inst = g_instances[k];
-        if (inst) inst->reconnect_gen++;   // requests survive DNS/handshake
+        if (!inst) continue;
+        inst->reconnect_gen++;   // requests survive DNS/handshake
+        if (inst->ev) xEventGroupSetBits(inst->ev, RECONFIG_BIT);
+    }
+    xSemaphoreGive(g_instances_mutex);
+}
+
+// The supervisor's caster recovery: close established sessions that move no
+// data. Never cancels an attempt in progress and never shortens a backoff.
+void ntrip_server_kick_stalled(void) {
+    if (!g_instances_mutex) return;
+    xSemaphoreTake(g_instances_mutex, portMAX_DELAY);
+    for (size_t k = 0; k < g_instance_count; ++k) {
+        ntrip_instance_t *inst = g_instances[k];
+        if (inst) inst->kick_gen++;
     }
     xSemaphoreGive(g_instances_mutex);
 }
@@ -1247,6 +1391,8 @@ void ntrip_server_tx_totals(ntrip_tx_totals_t *out) {
     for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
         if (!fresh.fresh[i]) out->req_missing++;
     }
+
+    out->configured = g_configured;
 
     if (!g_instances_mutex) return;
 

@@ -105,7 +105,7 @@ gnss_ack_verdict_t gnss_ack_scan(const char *buf, size_t n, const char *cmd) {
             /* Measured on the device (UM980 R4.10Build11833, 2026-08-03): the
              * command is echoed between "$command," and ",response:" in BOTH
              * outcomes, and only the verdict text after it differs:
-             *   $command,rtcm1077,com1,1,response: OK*7a
+             *   $command,rtcm1077,com1,1,response: OK*36
              *   $command,rtcm1230,com1,10,response: PARSING FAILD NO MATCHING FUNC  RTCM1230*11
              * The repo's research note claims the failure form omits the echo
              * and carries the command at the end instead; the hardware does

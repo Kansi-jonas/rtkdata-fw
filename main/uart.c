@@ -17,6 +17,7 @@
 
 #include <driver/uart.h>
 #include <driver/gpio.h>
+#include <soc/uart_reg.h>
 #include <esp_event.h>
 #include <esp_log.h>
 #include <string.h>
@@ -32,6 +33,15 @@
 #include "util.h"
 
 #define RX_BUFF_SIZE (1024 * 4)
+// Console UART0 receive ring. Nothing reads console input (the callback is a
+// no-op), and with CONFIG_UART_ISR_IN_IRAM every UART ring lives in INTERNAL
+// RAM: three 4 KB rings cost 12 KB of the Ethernet board's internal heap,
+// which then dipped to 12 KB at boot (bench 2026-11-06). 256 is the driver's
+// minimum above the 128-byte hardware FIFO.
+#define USBC_RX_BUFF_SIZE 256
+// GNSS transmit ring: commands are under 100 bytes; uart_write_bytes waits for
+// room when a larger write comes, it never drops.
+#define GNSS_TX_BUFF_SIZE 1024
 #define TX_BUFF_SIZE (1024)
 
 #define USBC_PORT UART_NUM_0
@@ -76,9 +86,32 @@ static int uart_port = -1;
 static bool uart_log_forward = false;
 static volatile uint32_t s_event_post_drops = 0;
 static volatile uint32_t s_read_errors = 0;
+static volatile uint32_t s_rx_overflows = 0;
+static volatile uint32_t s_rx_line_errors = 0;
+
+// Driver event queue of the GNSS UART. Only used to COUNT receive faults:
+// uart_task drains it without blocking on every pass. UART_DATA events make
+// up nearly all of it (one per FIFO threshold or idle timeout, about 20 per
+// 50 ms pass at 921600 baud), so 32 entries never fill in normal operation;
+// if uart_task is stalled long enough to fill it, the driver drops events
+// silently and only the counters undercount.
+#define UART_EVQ_LEN 32
+
+#if CONFIG_UART_ISR_IN_IRAM
+#define UART_INTR_FLAGS ESP_INTR_FLAG_IRAM
+#else
+#define UART_INTR_FLAGS 0
+#endif
+
+// Set once the console UART driver is installed; only then may log lines be
+// copied to it (drv_uart_usbc_send).
+static volatile bool s_usbc_ready = false;
+static QueueHandle_t s_uart_evq = NULL;
 
 uint32_t uart_event_post_drops(void) { return s_event_post_drops; }
 uint32_t uart_read_errors(void) { return s_read_errors; }
+uint32_t uart_rx_overflows(void) { return s_rx_overflows; }
+uint32_t uart_rx_line_errors(void) { return s_rx_line_errors; }
 
 static stream_stats_handle_t stream_stats;
 
@@ -138,6 +171,24 @@ void uart_init() {
             .stop_bits = config_get_u8(CONF_ITEM(KEY_CONFIG_UART_STOP_BITS)),
             .flow_ctrl = flow_ctrl
     };
+    // Stored values are not trusted: one invalid enum used to make
+    // uart_param_config() fail inside ESP_ERROR_CHECK on EVERY boot, before
+    // the boot-loop guard and the reset button exist (unrecoverable without
+    // USB). Fall back to the UM980 COM1 default, 115200 8N1.
+    bool uart_cfg_ok =
+        uart_config.baud_rate >= 9600 && uart_config.baud_rate <= 921600 &&
+        uart_config.data_bits >= UART_DATA_5_BITS && uart_config.data_bits <= UART_DATA_8_BITS &&
+        (uart_config.parity == UART_PARITY_DISABLE || uart_config.parity == UART_PARITY_EVEN ||
+         uart_config.parity == UART_PARITY_ODD) &&
+        uart_config.stop_bits >= UART_STOP_BITS_1 && uart_config.stop_bits <= UART_STOP_BITS_2;
+    if (!uart_cfg_ok) {
+        ESP_LOGE(TAG, "stored UART settings invalid (%d baud, data %d, parity %d, stop %d): using 115200 8N1",
+                 uart_config.baud_rate, uart_config.data_bits, uart_config.parity, uart_config.stop_bits);
+        uart_config.baud_rate = 115200;
+        uart_config.data_bits = UART_DATA_8_BITS;
+        uart_config.parity    = UART_PARITY_DISABLE;
+        uart_config.stop_bits = UART_STOP_BITS_1;
+    }
     ESP_ERROR_CHECK(uart_param_config(uart_port, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(
             uart_port,
@@ -148,14 +199,36 @@ void uart_init() {
             GNSS_TXD_PIN,GNSS_RXD_PIN,
             UART_PIN_NO_CHANGE,UART_PIN_NO_CHANGE
     ));
-    ESP_ERROR_CHECK(uart_driver_install(uart_port, UART_BUFFER_SIZE, UART_BUFFER_SIZE, 0, NULL, 0));
+    // CONFIG_UART_ISR_IN_IRAM (sdkconfig.defaults) makes the driver place its
+    // ISR in IRAM and allocate with ESP_INTR_FLAG_IRAM, so receiving continues
+    // while flash writes (NVS commit, OTA, SPIFFS) have the cache disabled.
+    // Before, the ISR was deferred for the whole flash operation and the
+    // 128-byte RX FIFO overflowed after ~11 ms at 115200 baud; a sector erase
+    // takes tens of ms, so every one of them cut RTCM frames.
+    ESP_ERROR_CHECK(uart_driver_install(uart_port, UART_BUFFER_SIZE, GNSS_TX_BUFF_SIZE,
+                                        UART_EVQ_LEN, &s_uart_evq, UART_INTR_FLAGS));
+    // IDF's default interrupt mask has break and parity but not framing
+    // errors, so UART_FRAME_ERR never reached the line-error counter (R6).
+    // (UART_INTR_FRAM_ERR lives in the private hal/uart_ll.h; same bit 3)
+    uart_enable_intr_mask(uart_port, UART_FRM_ERR_INT_ENA_M);
     
     stream_stats = stream_stats_new("uart");
     gnss_mutex_send = app_mutex_create();
     // Xtensa own-frame accounting of UART -> BASEPOS parsing is ~5744 bytes
     // including this task's 4 KiB receive buffer, before newlib/RTOS calls.
     // Keep another 2 KiB of margin; real stack high-water still needs HIL.
-    xTaskCreate(uart_task, "uart_task", 10240, NULL, TASK_PRIORITY_UART, NULL);
+    // The only reader of the GNSS UART: without it nothing streams and no
+    // supervisor rung can notice, because GNSS liveness comes from this task.
+    // A clean restart beats running on as a silent station.
+    bool uart_task_ok = false;
+    for (int attempt = 0; attempt < 3 && !uart_task_ok; attempt++) {
+        uart_task_ok = xTaskCreate(uart_task, "uart_task", 10240, NULL, TASK_PRIORITY_UART, NULL) == pdPASS;
+        if (!uart_task_ok) vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (!uart_task_ok) {
+        ESP_LOGE(TAG, "uart_task could not be created: restarting");
+        esp_restart();
+    }
     drv_uart_usbc_init();
     // drv_uart_gnss_init();
     drv_uart_usbc_read_set_cb(handle_usbc_received_data);
@@ -166,10 +239,39 @@ void set_gnss_cmd_mode(bool flag)
 {
     gnss_cmd_mode = flag;
 }
+// Count receive faults reported by the driver. Overflow (hardware FIFO or the
+// driver ring buffer) means bytes were lost; the RTCM framer then reports CRC
+// errors with no hint why. Line errors include the break the UM980 drives
+// while it is held in reset, so a few per reset pulse are expected.
+static void uart_drain_events(void) {
+    if (s_uart_evq == NULL) return;
+    uart_event_t ev;
+    while (xQueueReceive(s_uart_evq, &ev, 0) == pdTRUE) {
+        switch (ev.type) {
+        case UART_FIFO_OVF:
+        case UART_BUFFER_FULL:
+            s_rx_overflows++;
+            if (s_rx_overflows == 1 || (s_rx_overflows % 100) == 0) {
+                ESP_LOGW(TAG, "GNSS UART receive overflow, bytes lost (%lu total)",
+                         (unsigned long)s_rx_overflows);
+            }
+            break;
+        case UART_FRAME_ERR:
+        case UART_PARITY_ERR:
+        case UART_BREAK:
+            s_rx_line_errors++;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 static void uart_task(void *ctx) {
     uint8_t buffer[UART_BUFFER_SIZE];
 
     while (true) {
+        uart_drain_events();
         // sizeof(buffer) - 1: the '\0' below lands one past the read on a
         // full buffer otherwise (stack smash)
         int32_t len = uart_read_bytes(uart_port, buffer, sizeof(buffer) - 1, pdMS_TO_TICKS(50));
@@ -584,7 +686,16 @@ esp_err_t drv_uart_usbc_init(void)
         };
     usbc_mutex_send = app_mutex_create();
     /*init usb-console port*/
-    uart_driver_install(USBC_PORT, RX_BUFF_SIZE, 0, UART_QUEUE_NUM, &usbcQueue, 0);
+    // The console copy of the log opens only AFTER a successful install. The
+    // mutex used to be the "ready" signal, but it exists before the driver:
+    // a log line in between (uart_driver_install itself logs with the IRAM
+    // ISR enabled) reached uart_write_bytes on the uninstalled port, whose
+    // error log re-entered here and waited on the mutex this task already
+    // held. Every boot hung before the banner (QEMU smoke, 2026-11-06).
+    if (uart_driver_install(USBC_PORT, USBC_RX_BUFF_SIZE, 0, UART_QUEUE_NUM, &usbcQueue,
+                            UART_INTR_FLAGS) == ESP_OK) {
+        s_usbc_ready = true;
+    }
     uart_param_config(USBC_PORT, &usbc_config);
     uart_set_pin(USBC_PORT, USBC_TXD_PIN, USBC_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_set_rx_full_threshold(USBC_PORT, USBC_UART_RX_THRES);
@@ -665,7 +776,11 @@ int drv_uart_usbc_send(const uint8_t *data, const uint16_t len)
     // copy until the port is up; log.c has already captured the line in the
     // web-log ring buffer, so nothing is lost (v1.1.2 audit 2026-08-01: the
     // ingest-before-uart reorder made this path reachable on every boot).
-    if (usbc_mutex_send == NULL) return 0;
+    if (!s_usbc_ready || usbc_mutex_send == NULL) return 0;
+
+    // Re-entry from a log line emitted inside uart_write_bytes below: drop it
+    // instead of waiting on the mutex this task holds.
+    if (xSemaphoreGetMutexHolder(usbc_mutex_send) == xTaskGetCurrentTaskHandle()) return 0;
 
     app_mutex_take(usbc_mutex_send, portMAX_DELAY);
     const int txBytes = uart_write_bytes(USBC_PORT, (const char *)data, len);

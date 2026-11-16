@@ -24,6 +24,7 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #include <esp_log.h>
 #include <esp_event.h>
 #include <esp_timer.h>
@@ -33,6 +34,7 @@
 #include "board.h"
 #include "gnss.h"
 #include "gnss_ack.h"
+#include "gnss_capture.h"
 #include "uart.h"
 #include "supervisor.h"
 #include "interface/ntrip.h"
@@ -44,15 +46,19 @@
 #define ACK_TIMEOUT_MS     900   // UM980 usually replies within ~100-300 ms
 #define ACK_POLL_MS        20
 #define ACK_RETRIES        3
+#define MODE_ACK_TIMEOUT_MS 3000  // MODE is disruptive: wait long, resend once
+#define MODE_RETRIES       1
 
 /* ---- UM980 command response capture -----------------------------------
- * A registered UART_EVENT_READ handler appends the receiver's bytes to a small
- * buffer while we are configuring. Coexists with the NTRIP forward handler (the
- * ESP event loop supports multiple handlers on the same event).
+ * uart_task feeds every UART chunk in while we are configuring. The capture
+ * (gnss_capture.c) keeps only complete '$'/'#' ASCII lines: the old buffer
+ * took the raw stream and cleared itself whenever a chunk did not fit, so with
+ * satellites tracked an MSM7 burst wiped the ACK before the 20 ms poll read
+ * it. Every command then failed its first attempt and "mode base" was re-sent,
+ * which stalls RTCM for seconds (bench, 2026-11-06).
  */
-#define CAP_SZ 1024
-static char s_cap[CAP_SZ];
-static volatile size_t s_cap_len = 0;
+#define CAP_SZ GNSS_CAP_SZ
+static gnss_cap_t s_cap_state;
 static volatile bool s_capturing = false;
 static portMUX_TYPE s_cap_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -67,15 +73,13 @@ void gnss_ingest_uart(const uint8_t *data, size_t len) {
     gnss_site_runtime_ingest(data, len);
     if (!s_capturing || data == NULL || len == 0) return;
     portENTER_CRITICAL(&s_cap_mux);
-    if (s_cap_len + len >= CAP_SZ) s_cap_len = 0;   // keep the newest
-    for (size_t i = 0; i < len && s_cap_len < CAP_SZ - 1; i++) s_cap[s_cap_len++] = (char)data[i];
-    s_cap[s_cap_len] = '\0';
+    gnss_cap_feed(&s_cap_state, data, len);
     portEXIT_CRITICAL(&s_cap_mux);
 }
 
 static void cap_reset(void) {
     portENTER_CRITICAL(&s_cap_mux);
-    s_cap_len = 0; s_cap[0] = '\0';
+    gnss_cap_reset(&s_cap_state);
     portEXIT_CRITICAL(&s_cap_mux);
 }
 
@@ -96,8 +100,8 @@ static int cap_find_from(const char *hay, size_t n, size_t from, const char *nee
 
 static size_t cap_snapshot(char *dst) {
     portENTER_CRITICAL(&s_cap_mux);
-    size_t n = s_cap_len;
-    memcpy(dst, s_cap, n);
+    size_t n = s_cap_state.len;
+    memcpy(dst, s_cap_state.buf, n);
     portEXIT_CRITICAL(&s_cap_mux);
     return n;
 }
@@ -127,6 +131,11 @@ static gnss_ack_verdict_t cap_verdict_for(const char *cmd_trimmed) {
  * gnss_recover -> config_gnss_base nests. The full command-echo correlation
  * and a dedicated GNSS control task remain tracked architectural work; this
  * lock removes the cross-task interleaving today. */
+/* Statically allocated, so creation cannot fail and leave every transaction
+ * unserialized (review 2026-11-06, G5). Created first thing in gnss_init();
+ * a caller that runs before that (the K_EVK button task starts earlier)
+ * must check s_txn and defer, see gnss_after_external_reset(). */
+static StaticSemaphore_t s_txn_buf;
 static SemaphoreHandle_t s_txn = NULL;
 static void txn_take(void) { if (s_txn) xSemaphoreTakeRecursive(s_txn, portMAX_DELAY); }
 static void txn_give(void) { if (s_txn) xSemaphoreGiveRecursive(s_txn); }
@@ -144,11 +153,20 @@ static bool send_cmd_acked(const char *cmd, int retries) {
     memcpy(echo, cmd, (size_t)elen);
     echo[elen] = '\0';
 
+    // "mode base ..." restarts the receiver's base engine and pauses RTCM
+    // output each time it is APPLIED. A retry after a late or lost ACK applies
+    // it again, so MODE gets a long window and one retry, never four sends
+    // (review 2026-11-06, G1). Bench 2026-11-06: every ACK, MODE included,
+    // arrived within ~100 ms, so the normal window is ample for the rest.
+    bool disruptive = strncmp(cmd, "mode ", 5) == 0;
+    int timeout_ms = disruptive ? MODE_ACK_TIMEOUT_MS : ACK_TIMEOUT_MS;
+    if (disruptive && retries > MODE_RETRIES) retries = MODE_RETRIES;
+
     for (int attempt = 0; attempt <= retries; attempt++) {
         cap_reset();
         drv_uart_gnss_send((uint8_t *)cmd, strlen(cmd));
 
-        for (int waited = 0; waited < ACK_TIMEOUT_MS; waited += ACK_POLL_MS) {
+        for (int waited = 0; waited < timeout_ms; waited += ACK_POLL_MS) {
             vTaskDelay(pdMS_TO_TICKS(ACK_POLL_MS));
 
             gnss_ack_verdict_t verdict = cap_verdict_for(echo);
@@ -243,6 +261,16 @@ static void gnss_base_ack_invalidate(void) {
     s_base_saved = false;
 }
 
+/* The same truth latch for a survey (review 2026-11-06, G2): the site
+ * revision whose "mode base time" THIS receiver epoch acknowledged. A survey
+ * whose saveconfig failed counted as not applied, and the next identical
+ * request re-sent MODE and restarted the 300 s survey, every time the save
+ * failed. Now that request retries saveconfig alone. Cleared by a receiver
+ * reset and by any fixed MODE. */
+static bool     s_survey_acked = false;
+static uint32_t s_survey_rev = 0;
+static bool     s_survey_mode_acked_now = false;   // out-param of gnss_start_site_survey
+
 /* Bounded retry: a receiver that keeps failing the apply must not be re-poked
  * on every heartbeat reply (a SUCCESSFUL redundant "mode base" stalls RTCM for
  * ~18 s, and even NACK storms are UART noise during configuration). One
@@ -252,6 +280,17 @@ static void gnss_base_ack_invalidate(void) {
 static int64_t s_base_fail_us = 0;
 static gnss_base_fix_t s_base_fail_coord;
 
+#ifdef CONFIG_RTK_SITE_LEGACY
+/* Relocation guard (atomic): the distance that last refused an IE
+ * coordinate or dropped the fixed one, 0 while the unit is where its
+ * coordinate says. Reported in the heartbeat health as moved_m. */
+static uint32_t s_legacy_moved_mm = 0;
+/* Relocation drop still to finish (under txn): the NVS erase and the survey
+ * MODE are retried separately, and a correct coordinate accepted in between
+ * cancels both (review 13.11. L2 #3). */
+static bool s_drop_erase_pending = false, s_drop_mode_pending = false;
+#endif
+
 /* Everything we believe about the RUNNING receiver, dropped at once: the
  * ACKed-coordinate latch (else the idempotence gate skips a needed re-apply),
  * the failure cooldown (a fresh epoch deserves an immediate attempt), and the
@@ -259,6 +298,7 @@ static gnss_base_fix_t s_base_fail_coord;
  * the production set before anything calls it healthy). */
 static void gnss_receiver_epoch_invalidate(void) {
     gnss_base_ack_invalidate();
+    s_survey_acked = false;
     s_base_fail_us = 0;
     ntrip_server_msg_epoch_reset();
     gnss_site_receiver_reset();
@@ -369,6 +409,12 @@ void config_gnss_base(void) {
     uint32_t revision = managed ? desired.revision : 0;
     bool fixed = managed ? desired.mode == GNSS_SITE_FIXED :
         (gnss_site_legacy_allowed() && gnss_load_fixed_base(&lat, &lon, &h));
+#ifdef CONFIG_RTK_SITE_LEGACY
+    // A relocation drop whose NVS erase has not gone through yet: that
+    // coordinate is the place the unit left. A receiver recovery or the reset
+    // button must not put it back (review 13.11. L3 #1); survey instead.
+    if (!managed && s_drop_erase_pending) fixed = false;
+#endif
     if (managed && fixed) {
         lat = desired.lat_e9 / 1e9;
         lon = desired.lon_e9 / 1e9;
@@ -382,6 +428,7 @@ void config_gnss_base(void) {
         snprintf(cmd, sizeof(cmd), "mode base %.9f %.9f %.4f\r\n", lat, lon, h);
         // A MODE ACK alone cannot prove ellipsoidal height: the receiver may
         // still add its geoid separation if UNDULATION was rejected or lost.
+        s_survey_acked = false;   // a fixed MODE ends any survey, acked or not
         if (undulation_acked && send_cmd_acked(cmd, ACK_RETRIES)) {
             mode_acked = true;
             ok++;
@@ -409,9 +456,12 @@ void config_gnss_base(void) {
         gnss_base_ack_invalidate();
         // The second argument is SAVED-POSITION REUSE DISTANCE, not sigma.
         // Zero forces a fresh survey rather than resurrecting factory position.
+        s_survey_acked = false;
         if (undulation_acked && send_cmd_acked("mode base time 300 0\r\n", ACK_RETRIES)) {
             mode_acked = true;
             ok++;
+            s_survey_acked = true;
+            s_survey_rev = revision;
             ESP_LOGI(TAG, "no persisted fixed base -> provisional survey-in");
             uart_nmea("$PESP,RTK,GNSS,BASEMODE,SURVEYIN");
         } else {
@@ -422,7 +472,15 @@ void config_gnss_base(void) {
     bool saved = send_cmd_acked("saveconfig\r\n", ACK_RETRIES);
     if (saved) ok++;
     s_base_saved = mode_acked && fixed && saved;
+#ifdef CONFIG_RTK_SITE_LEGACY
+    // Legacy: no revision to acknowledge, only the running receiver mode. A
+    // failed SAVE must not leave it UNKNOWN: the later SAVE-only retry in
+    // gnss_set_fixed_base never reports again, and observation supervision
+    // stayed off for the whole boot (review 13.11., P2).
+    gnss_site_configured(mode, lat, lon, revision, mode_acked);
+#else
     gnss_site_configured(mode, lat, lon, revision, mode_acked && saved);
+#endif
 
     s_capturing = false;
     ESP_LOGI(TAG, "UM980 base config: %d/%d commands acked", ok, total);
@@ -463,6 +521,20 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
         // Debug level: with the once-per-boot latch in provisioning removed,
         // this is the steady-state path on every heartbeat reply.
         ESP_LOGD(TAG, "fixed base unchanged and receiver-acked, skipping re-apply");
+        // NVS may still be stale if a previous saveconfig failed; refresh it so
+        // the next boot restores this coordinate instead of re-surveying. Cheap
+        // (NVS only rewrites on a real change) and touches no UART. Done BEFORE
+        // the SAVE retry: the receiver runs on this ACKed coordinate whatever
+        // its own SAVE does, and an early return on a failed retry left the
+        // MCU restoring the old one at the next boot (review 13.11. R3, P1;
+        // 1.1.9 refreshed NVS here unconditionally).
+        double nv_lat, nv_lon, nv_h;
+        if (!gnss_load_fixed_base(&nv_lat, &nv_lon, &nv_h) ||
+            fabs(nv_lat - lat_deg) >= 1e-9 ||
+            fabs(nv_lon - lon_deg) >= 1e-9 ||
+            fabs(nv_h - height_m) >= 5e-4) {
+            gnss_save_fixed_base(lat_deg, lon_deg, height_m);
+        }
         // A previous MODE ACK with failed SAVE proves only volatile state.
         // Retry SAVE alone; do not falsely acknowledge durable application or
         // interrupt RTCM with another unchanged MODE command.
@@ -471,16 +543,6 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
             s_base_saved = send_cmd_acked("saveconfig\r\n", ACK_RETRIES);
             s_capturing = false;
             if (!s_base_saved) { txn_give(); return false; }
-        }
-        // NVS may still be stale if a previous saveconfig failed; refresh it so
-        // the next boot restores this coordinate instead of re-surveying. Cheap
-        // (NVS only rewrites on a real change) and touches no UART.
-        double nv_lat, nv_lon, nv_h;
-        if (!gnss_load_fixed_base(&nv_lat, &nv_lon, &nv_h) ||
-            fabs(nv_lat - lat_deg) >= 1e-9 ||
-            fabs(nv_lon - lon_deg) >= 1e-9 ||
-            fabs(nv_h - height_m) >= 5e-4) {
-            gnss_save_fixed_base(lat_deg, lon_deg, height_m);
         }
         txn_give();
         return true;
@@ -497,6 +559,39 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
         return false;
     }
 
+#ifdef CONFIG_RTK_SITE_LEGACY
+    // Relocation guard (review 13.11. L1, R1). The legacy IE pushes the
+    // station's coordinate by identity, wherever the unit is now: a unit
+    // that got its coordinate at our office, or in the customer's garden
+    // before it went on the roof, would broadcast that place. Beyond 300 m
+    // the UM980 then suppresses RTCM, closer it sends wrong corrections. A NEW
+    // coordinate is applied only when the receiver's own position (median of
+    // a valid BASEPOS window, typically 1 to 3 m) agrees with it within
+    // max(10 m, 5 sigma). No window yet: wait, the next reply asks again.
+    {
+        static gnss_site_agreement_t s_last_verdict = GNSS_SITE_AGREEMENT_AGREE;
+        uint32_t away_mm = 0;
+        gnss_site_agreement_t verdict = gnss_site_legacy_agreement(lat_deg, lon_deg, &away_mm);
+        if (verdict != s_last_verdict) {
+            if (verdict == GNSS_SITE_AGREEMENT_DISAGREE) {
+                ESP_LOGE(TAG, "IE coordinate %.9f %.9f is %u m from the receiver's own position: "
+                         "not applied (unit moved?)", lat_deg, lon_deg, (unsigned)(away_mm / 1000));
+                uart_nmea("$PESP,RTK,GNSS,FIXEDBASE,REFUSED,%u", (unsigned)(away_mm / 1000));
+            } else if (verdict == GNSS_SITE_AGREEMENT_UNKNOWN) {
+                ESP_LOGI(TAG, "IE coordinate waits for a valid own position");
+            }
+            s_last_verdict = verdict;
+        }
+        if (verdict == GNSS_SITE_AGREEMENT_DISAGREE)
+            __atomic_store_n(&s_legacy_moved_mm, away_mm ? away_mm : 1, __ATOMIC_RELAXED);
+        if (verdict != GNSS_SITE_AGREEMENT_AGREE) {
+            txn_give();
+            return false;
+        }
+        __atomic_store_n(&s_legacy_moved_mm, 0, __ATOMIC_RELAXED);
+    }
+#endif
+
     char cmd[96];
     // UM980: "mode base <lat> <lon> <height>" - degrees / metres, ITRF2020 from the IE
     snprintf(cmd, sizeof(cmd), "mode base %.9f %.9f %.4f\r\n", lat_deg, lon_deg, height_m);
@@ -509,7 +604,16 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
     // gate above keeps it off the UART in steady state. Without it the height
     // is taken as MSL and the base sits N metres too high; see config_gnss_base.
     bool undulation_acked = send_cmd_acked("CONFIG UNDULATION 0.0\r\n", ACK_RETRIES);
+    if (undulation_acked) s_survey_acked = false;   // MODE goes out: no survey any more
     bool acked = undulation_acked && send_cmd_acked(cmd, ACK_RETRIES);
+    // Persist the moment the receiver runs it, BEFORE its SAVECONFIG (review
+    // 13.11. L1, R5): saved only after a successful SAVECONFIG, a power cut in
+    // between, or a failed SAVECONFIG plus a cut before the next identical
+    // reply, restored the previous coordinate (or a survey) at the next boot.
+    // Not before the MODE: a rejected MODE must never become the coordinate
+    // the next boot restores. A failed write does not stop the apply; the
+    // unchanged-coordinate branch above rewrites NVS on the next reply.
+    if (acked) gnss_save_fixed_base(lat_deg, lon_deg, height_m);
     bool ok = acked;
     if (ok) ok = send_cmd_acked("saveconfig\r\n", ACK_RETRIES);
     s_capturing = false;
@@ -521,6 +625,15 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
     if (acked) {
         s_base_acked_valid = true;
         s_base_acked_coord = (gnss_base_fix_t){ lat_deg, lon_deg, height_m };
+#ifdef CONFIG_RTK_SITE_LEGACY
+        // Legacy IE: this push is the only fixed-mode command, so it must also
+        // tell the site runtime, or the observation check keeps the survey
+        // clock and expects RTCM through the ~18 s stall of the new MODE.
+        gnss_site_configured(GNSS_SITE_FIXED, lat_deg, lon_deg, 0, true);
+        // A coordinate that passed the agreement gate is where the unit is
+        // now: an unfinished drop of the old one must not erase it.
+        s_drop_erase_pending = s_drop_mode_pending = false;
+#endif
     } else {
         s_base_acked_valid = false;
     }
@@ -531,9 +644,6 @@ bool gnss_set_fixed_base(double lat_deg, double lon_deg, double height_m) {
     } else {
         s_base_fail_us = 0;
     }
-
-    // Persist so a reboot/recovery re-applies this fixed coord instead of re-surveying.
-    if (ok) gnss_save_fixed_base(lat_deg, lon_deg, height_m);
 
     ESP_LOGI(TAG, "fixed base %.9f %.9f %.4f -> %s", lat_deg, lon_deg, height_m, ok ? "OK" : "FAILED");
     uart_nmea("$PESP,RTK,GNSS,FIXEDBASE,%d", ok ? 1 : 0);
@@ -547,20 +657,145 @@ bool gnss_start_site_survey(void) {
     gnss_base_ack_invalidate();
     s_base_fail_us = 0;
     ntrip_server_msg_epoch_reset();
-    bool ok = send_cmd_acked("CONFIG UNDULATION 0.0\r\n", ACK_RETRIES) &&
-              send_cmd_acked("mode base time 300 0\r\n", ACK_RETRIES) &&
-              send_cmd_acked("saveconfig\r\n", ACK_RETRIES);
+    s_survey_acked = false;
+    bool mode_acked = send_cmd_acked("CONFIG UNDULATION 0.0\r\n", ACK_RETRIES) &&
+                      send_cmd_acked("mode base time 300 0\r\n", ACK_RETRIES);
+    s_survey_mode_acked_now = mode_acked;
+    bool ok = mode_acked && send_cmd_acked("saveconfig\r\n", ACK_RETRIES);
     s_capturing = false;
     txn_give();
     return ok;
 }
 
+#ifdef CONFIG_RTK_SITE_LEGACY
+uint32_t gnss_legacy_moved_m(void) {
+    return __atomic_load_n(&s_legacy_moved_mm, __ATOMIC_RELAXED) / 1000;
+}
+
+static bool gnss_forget_fixed_base(void) {
+    nvs_handle_t nh;
+    if (nvs_open(GNSS_NVS_NS, NVS_READWRITE, &nh) != ESP_OK) return false;
+    esp_err_t err = nvs_erase_key(nh, GNSS_KEY_BASE);
+    if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+    if (err == ESP_OK) err = nvs_commit(nh);
+    nvs_close(nh);
+    return err == ESP_OK;
+}
+
+/* Called by the provisioning task every poll (about 30 s), IE reachable or
+ * not. Two jobs, both without the IE:
+ * 1. Relocation (review 13.11. L1, R1): fixed on a coordinate the receiver
+ *    has left for five minutes -> forget it, survey-in here. Forgotten in
+ *    NVS first, so a power cut after this point cannot bring it back. The
+ *    IE keeps pushing it; gnss_set_fixed_base refuses it until the IE's own
+ *    re-survey (its move detection compares our survey 1005) catches up.
+ * 2. Unknown mode (review 13.11. L1, R4): a boot or recovery whose MODE
+ *    went unacknowledged leaves the mode UNKNOWN, which switches observation
+ *    supervision and log repair off while BASEPOS keeps the receiver
+ *    "alive". Reconfigure after 5 min, backing off to an hour. */
+void gnss_legacy_tick(void) {
+    static int64_t s_drop_try_us = 0;
+    static int64_t s_unknown_since_us = 0, s_unknown_wait_us = 0;
+    int64_t now = esp_timer_get_time();
+    uint32_t mm = 0;
+    gnss_site_status_t site;
+
+    bool retry_due = (s_drop_erase_pending || s_drop_mode_pending) &&
+        now - s_drop_try_us >= GNSS_BASE_RETRY_COOLDOWN_US;
+    if (gnss_site_legacy_relocated(&mm) || retry_due) {
+        txn_take();
+        if (gnss_site_legacy_relocated(&mm)) {   // recheck under the receiver lock
+            ESP_LOGE(TAG, "receiver %u m away from its reference for %u s: unit moved, "
+                     "coordinate forgotten, survey-in here", (unsigned)(mm / 1000),
+                     (unsigned)(GNSS_SITE_RELOCATE_MS / 1000));
+            uart_nmea("$PESP,RTK,GNSS,RELOCATED,%u", (unsigned)(mm / 1000));
+            __atomic_store_n(&s_legacy_moved_mm, mm ? mm : 1, __ATOMIC_RELAXED);
+            s_drop_erase_pending = s_drop_mode_pending = true;
+        }
+        if (s_drop_erase_pending || s_drop_mode_pending) {   // a correct coordinate cancels
+            s_drop_try_us = now;
+            // Forgotten first: a power cut after this cannot restore the old
+            // place. Retried alone: no UART, no survey restart.
+            if (s_drop_erase_pending) {
+                s_drop_erase_pending = !gnss_forget_fixed_base();
+                if (s_drop_erase_pending) uart_nmea("$PESP,RTK,GNSS,PERSISTFAIL");
+            }
+            // A survey that is running (acked now, or restored by a receiver
+            // recovery in between) is the goal; MODE again would restart it.
+            gnss_site_status(&site);
+            if (s_drop_mode_pending && site.mode == GNSS_SITE_SURVEY &&
+                !gnss_site_legacy_relocated(&mm)) {
+                s_drop_mode_pending = false;
+            }
+            if (s_drop_mode_pending) {
+                s_survey_mode_acked_now = false;
+                gnss_start_site_survey();
+                bool acked = s_survey_mode_acked_now;
+                if (acked) {
+                    s_survey_acked = true;
+                    s_survey_rev = 0;
+                }
+                s_base_saved = false;
+                gnss_site_configured(GNSS_SITE_SURVEY, 0, 0, 0, acked);
+                // A NACK leaves the mode UNKNOWN, which also ends the run that
+                // triggered this: the retry is driven from here, every 60 s.
+                s_drop_mode_pending = !acked;
+            }
+        }
+        txn_give();
+    }
+
+    gnss_site_status(&site);
+    supervisor_health_t health;
+    supervisor_health(&health);
+    if (site.mode != GNSS_SITE_UNKNOWN) s_unknown_wait_us = 0;   // recovered: next episode starts at 5 min
+    if (site.mode != GNSS_SITE_UNKNOWN || !health.gnss_ok || s_drop_mode_pending) {
+        s_unknown_since_us = 0;     // a known mode, or a receiver the supervisor owns
+        return;
+    }
+    if (s_unknown_since_us == 0) {
+        s_unknown_since_us = now;
+        if (s_unknown_wait_us == 0) s_unknown_wait_us = 5LL * 60 * 1000 * 1000;
+        return;
+    }
+    if (now - s_unknown_since_us < s_unknown_wait_us) return;
+    txn_take();
+    gnss_site_status(&site);
+    if (site.mode == GNSS_SITE_UNKNOWN) {
+        ESP_LOGW(TAG, "receiver mode unknown for %u s: reset + reconfigure",
+                 (unsigned)((now - s_unknown_since_us) / 1000000));
+        uart_nmea("$PESP,RTK,GNSS,MODEUNKNOWN");
+        gnss_reset_pulse();
+        config_gnss_base();
+        s_unknown_wait_us *= 2;
+        if (s_unknown_wait_us > 60LL * 60 * 1000 * 1000) s_unknown_wait_us = 60LL * 60 * 1000 * 1000;
+    }
+    s_unknown_since_us = 0;
+    txn_give();
+}
+#endif
+
 bool gnss_apply_site_revision(const gnss_site_desired_t *desired) {
     if (!gnss_site_desired_valid(desired)) return false;
     txn_take();
-    bool applied = desired->mode == GNSS_SITE_FIXED ?
-        gnss_set_fixed_base(desired->lat_e9 / 1e9, desired->lon_e9 / 1e9,
-                            desired->h_mm / 1000.0) : gnss_start_site_survey();
+    bool applied;
+    if (desired->mode == GNSS_SITE_FIXED) {
+        applied = gnss_set_fixed_base(desired->lat_e9 / 1e9, desired->lon_e9 / 1e9,
+                                      desired->h_mm / 1000.0);
+    } else if (s_survey_acked && s_survey_rev == desired->revision) {
+        /* This survey is already running on this receiver epoch; only its
+         * saveconfig failed. Retry that alone: MODE again would restart it. */
+        s_capturing = true;
+        applied = send_cmd_acked("saveconfig\r\n", ACK_RETRIES);
+        s_capturing = false;
+    } else {
+        s_survey_mode_acked_now = false;
+        applied = gnss_start_site_survey();
+        if (s_survey_mode_acked_now) {
+            s_survey_acked = true;
+            s_survey_rev = desired->revision;
+        }
+    }
     /* Keep the receiver transaction lock through the revision ACK, so a
      * watchdog reset cannot intervene between MODE completion and this ACK. */
     gnss_site_configured((gnss_site_mode_t)desired->mode, desired->lat_e9 / 1e9,
@@ -584,7 +819,45 @@ void gnss_recover(void) {
     txn_give();
 }
 
+/* Re-enable required RTCM messages the receiver is not producing, without
+ * MODE and without a reset (review 2026-11-06, G4). A log enable that failed
+ * during configuration (a transient UART loss) was never retried: advancing
+ * MSM plus BASEPOS kept the station "healthy" without, say, its 1005. Called
+ * by the supervisor once the stream is expected and a required type stayed
+ * stale. Each command is a plain log enable: it does not pause the stream. */
+void gnss_repair_required_logs(void) {
+    if (s_txn == NULL) return;
+    txn_take();
+    ntrip_msg_freshness_t fresh;
+    ntrip_server_msg_freshness(&fresh);   // re-read under the lock
+    if (!fresh.all_fresh && gnss_site_log_repair_expected()) {
+        s_capturing = true;
+        for (int i = 0; i < NTRIP_REQUIRED_MSG_COUNT; i++) {
+            if (fresh.fresh[i]) continue;
+            unsigned type = fresh.type[i];
+            // same rates as config_gnss_base: MSM 1 Hz, 1005/1033 every 10 s
+            unsigned period = (type == 1005 || type == 1033) ? 10 : 1;
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "rtcm%u,com1,%u\r\n", type, period);
+            bool ok = send_cmd_acked(cmd, ACK_RETRIES);
+            ESP_LOGW(TAG, "required RTCM %u not produced: re-enabled -> %s", type,
+                     ok ? "ack" : "FAILED");
+            uart_nmea("$PESP,RTK,GNSS,LOGREPAIR,%u,%d", type, ok ? 1 : 0);
+        }
+        s_capturing = false;
+    }
+    txn_give();
+}
+
 void gnss_after_external_reset(void) {
+    /* A press before gnss_init() needs no action: gnss_init() resets and
+     * configures the receiver anyway. Running config here without the lock
+     * raced the boot configuration on the shared capture (G5). A press
+     * during gnss_init() waits on the lock and reconfigures after it. */
+    if (s_txn == NULL) {
+        ESP_LOGI(TAG, "GNSS reset by the button before GNSS init: boot config covers it");
+        return;
+    }
     txn_take();
     ESP_LOGW(TAG, "GNSS reset by the button: reconfigure");
     uart_nmea("$PESP,RTK,GNSS,BUTTONRESET");
@@ -605,33 +878,86 @@ void gnss_after_external_reset(void) {
  * which we need for inventory + partner config questions (which UM980 fw is on
  * the station). VERSIONA is a one-shot query, so it still answers after the
  * "unlog com1" in config_gnss_base. */
-void gnss_log_version(void) {
+/* body starts just past "#VERSIONA,". The record is printable ASCII up to
+ * '*', then exactly 8 hex digits (CRC32) and the line end, all on one line.
+ * Returns the offset past the CRC, 0 while incomplete or malformed. */
+static int version_record_end(const char *hay, size_t n, size_t body) {
+    size_t i = body;
+    while (i < n && hay[i] != '*') {
+        if (hay[i] < 0x20 || hay[i] > 0x7e) return 0;   // CR/LF or binary: not one record
+        i++;
+    }
+    if (i + 10 > n) return 0;                            // CRC or line end not here yet
+    for (size_t k = i + 1; k < i + 9; k++) {
+        char c = hay[k];
+        bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) return 0;
+    }
+    if (hay[i + 9] != '\r' && hay[i + 9] != '\n') return 0;
+    return (int)(i + 9);
+}
+
+/* Only a complete "#VERSIONA,...*<8 hex>" record counts: the command echo
+ * ("$command,VERSIONA,response: OK") and the RTCM stream share the capture
+ * buffer, and neither is a version answer. */
+size_t gnss_query_version(char *out, size_t out_sz) {
+    static char tmp[CAP_SZ];
+    int start = -1, end = -1;
     txn_take();
     s_capturing = true;
     cap_reset();
     drv_uart_gnss_send((uint8_t *)"VERSIONA\r\n", 10);
     for (int waited = 0; waited < 2000; waited += ACK_POLL_MS) {
         vTaskDelay(pdMS_TO_TICKS(ACK_POLL_MS));
-        if (cap_contains("VERSION")) break;     // got the #VERSIONA line
+        size_t n = cap_snapshot(tmp);
+        for (int p = cap_find_from(tmp, n, 0, "#VERSIONA,"); p >= 0;
+             p = cap_find_from(tmp, n, (size_t)p, "#VERSIONA,")) {
+            int rec_end = version_record_end(tmp, n, (size_t)p);
+            if (rec_end > 0) {
+                start = p - 10;     // back to the '#'
+                end = rec_end;      // past the CRC32
+                break;
+            }
+        }
+        if (start >= 0) break;
     }
-    static char tmp[CAP_SZ];
-    portENTER_CRITICAL(&s_cap_mux);
-    size_t n = s_cap_len;
-    memcpy(tmp, s_cap, n + 1);
-    portEXIT_CRITICAL(&s_cap_mux);
     s_capturing = false;
-    for (size_t i = 0; i < n; i++) if (tmp[i] == '\r' || tmp[i] == '\n') tmp[i] = ' ';
-    ESP_LOGI(TAG, "UM980 VERSIONA: %s", n ? tmp : "(no response)");
-    uart_nmea("$PESP,RTK,GNSS,VER,%s", n ? tmp : "none");
+    txn_give();
+    if (out && out_sz) out[0] = '\0';
+    if (start < 0) return 0;
+    size_t len = (size_t)(end - start);
+    if (out && out_sz) {
+        size_t c = len < out_sz - 1 ? len : out_sz - 1;
+        for (size_t i = 0; i < c; i++) {
+            char ch = tmp[start + i];
+            out[i] = (ch >= 0x20 && ch < 0x7f) ? ch : ' ';
+        }
+        out[c] = '\0';
+    }
+    return len;
+}
+
+void gnss_log_version(void) {
+    static char ver[CAP_SZ];
+    size_t n = gnss_query_version(ver, sizeof(ver));
+    ESP_LOGI(TAG, "UM980 VERSIONA: %s", n ? ver : "(no response)");
+    uart_nmea("$PESP,RTK,GNSS,VER,%s", n ? ver : "none");
+}
+
+void gnss_test_reset(void) {
+    txn_take();
+    ESP_LOGW(TAG, "GNSS reset requested by the board test page");
+    uart_nmea("$PESP,RTK,GNSS,TESTRESET");
+    gnss_reset_pulse();
+    config_gnss_base();
     txn_give();
 }
 
 void gnss_init(void) {
     // The transaction lock exists before anything can race for the receiver
     // (supervisor and provisioning start later, but order must not matter).
-    s_txn = xSemaphoreCreateRecursiveMutex();
+    s_txn = xSemaphoreCreateRecursiveMutexStatic(&s_txn_buf);
     gnss_site_runtime_init();
-    if (!s_txn) ESP_LOGE(TAG, "gnss txn mutex creation failed; transactions unserialized");
 
     // No event-bus registration: uart_task calls gnss_ingest_uart() directly,
     // so ACK capture cannot be dropped by a saturated event queue.

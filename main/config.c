@@ -729,6 +729,10 @@ esp_err_t config_reset() {
     nvs_erase_key(config_handle, KEY_CONFIG_WIFI_STA_SSID);
     nvs_erase_key(config_handle, KEY_CONFIG_WIFI_STA_PASSWORD);
     nvs_erase_key(config_handle, KEY_CONFIG_WIFI_STA_ACTIVE);
+    // Static addressing belongs to the old WLAN too: the setup page only sends
+    // SSID and password, so a kept static IP made the next network unusable
+    // after a successful setup (review 13.11. L1, R8). Back to DHCP.
+    nvs_erase_key(config_handle, KEY_CONFIG_WIFI_STA_STATIC);
 
     return config_commit();
 }

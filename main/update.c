@@ -20,6 +20,7 @@
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "supervisor.h"
 #include "gnss_site.h"
 #include "interface/ntrip.h"
@@ -29,7 +30,6 @@
 #include "wifi.h"
 
 static const char *TAG              = "OTA";
-static       bool checkUpdates      = true;
              int  total_file_size   = 0;
              int  total_file_write  = 0;
 
@@ -60,6 +60,67 @@ void send_update_completed() {
 // keep running) instead of crashing.
 #define MIN_OTA_HEAP (110 * 1024)
 
+// Internal RAM is what TLS, lwIP and the flash driver actually run out of. On
+// the Ethernet board the total above includes 2 MB of PSRAM, so it always
+// passed and guarded nothing (review 2026-11-06, O8). On OnoLink (no PSRAM)
+// total and internal are the same number and nothing changes.
+#define MIN_OTA_INTERNAL_HEAP (32 * 1024)
+
+// One file download may take at most this long. esp_http_client's 10 s
+// timeout is per read, so a server that keeps sending a little held the boot
+// OTA, and with it the whole station, for hours (review 2026-11-06, O4).
+// 1.3 MB at 10 KB/s takes about 2 min.
+#define OTA_DOWNLOAD_DEADLINE_US (10LL * 60 * 1000 * 1000)
+
+static bool ota_heap_sufficient(void) {
+    return esp_get_free_heap_size() >= MIN_OTA_HEAP &&
+           heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= MIN_OTA_INTERNAL_HEAP;
+}
+
+/* Read up to len body bytes, never past the deadline. esp_http_client_read
+ * loops internally until its buffer is full, waiting up to the client timeout
+ * for EVERY transport read, so a peer (or a path) that trickles one byte at a
+ * time held a single call for hours and the deadline check between calls
+ * never ran (review R7). Small requests and a 1 s poll timeout make the
+ * deadline bite on any normal or slow link. They are NOT a hard bound: the
+ * TLS socket keeps esp-tls' own receive timeout and mbedTLS assembles a whole
+ * record inside one call, so a peer or path that trickles a record byte by
+ * byte can still hold a call (review R9). The hard bound is the boot OTA's
+ * OTA_BOOT_HARD_LIMIT_MS. A read that times out with nothing is retried while
+ * time is left: a pause on a slow link is not a failure. Returns bytes read,
+ * 0 at the end of the body, -1 on error or when the deadline passed with
+ * nothing read. */
+#define OTA_READ_PIECE 64
+#define OTA_READ_TIMEOUT_MS 1000
+
+static int ota_read_bounded(esp_http_client_handle_t c, char *buf, int len, int64_t deadline_us) {
+    int got = 0;
+    while (got < len) {
+        int64_t left_ms = (deadline_us - esp_timer_get_time()) / 1000;
+        if (left_ms <= 0) return got > 0 ? got : -1;
+        int to = left_ms > OTA_READ_TIMEOUT_MS ? OTA_READ_TIMEOUT_MS : (left_ms < 50 ? 50 : (int)left_ms);
+        esp_http_client_set_timeout_ms(c, to);
+        int want = len - got;
+        if (want > OTA_READ_PIECE) want = OTA_READ_PIECE;
+        int r = esp_http_client_read(c, buf + got, want);
+        if (r == -ESP_ERR_HTTP_EAGAIN) continue;   // nothing within 1 s: wait on, deadline permitting
+        if (r <= 0) return got > 0 ? got : (r == 0 ? 0 : -1);
+        got += r;
+        if (r < want) break;   // end of body, or a timeout with partial data
+    }
+    return got;
+}
+
+static bool ota_heap_ok(const char *what) {
+    size_t total = esp_get_free_heap_size();
+    size_t internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (total >= MIN_OTA_HEAP && internal >= MIN_OTA_INTERNAL_HEAP) return true;
+    ESP_LOGE(TAG, "%s: free heap %u (internal %u) < %u (%u) needed -> deferring (no crash)",
+             what, (unsigned)total, (unsigned)internal, (unsigned)MIN_OTA_HEAP,
+             (unsigned)MIN_OTA_INTERNAL_HEAP);
+    return false;
+}
+
 /* ---- anti-brick OTA state (NVS) ---------------------------------------
  * Two counters in NVS namespace "ota" guarantee a bad update can never leave the
  * device stuck in a crash-loop (the v1.0.1-era failure mode):
@@ -77,6 +138,16 @@ void send_update_completed() {
 #define OTA_KEY_FAILCNT  "fail_cnt"
 #define OTA_KEY_BOOTLOOP "bootloop"
 #define OTA_KEY_PLANNED  "planned_rb"   /* the next SW reset was intentional */
+#define OTA_KEY_SKIPBOOT "skip_boot"    /* the last boot OTA hit its hard limit */
+#define OTA_KEY_QUARANT  "quarantine"   /* version that crash-looped into factory */
+
+/* The boot OTA blocks app_main (NTRIP, supervisor) until it is done. The read
+ * deadlines bound the body; the header phase and the manifest fetch still
+ * wait up to the client timeout per read, and a peer or path that trickles
+ * bytes can stretch them (review R8). This is the backstop for all of it:
+ * past the limit the unit restarts and skips the boot OTA once, so streaming
+ * resumes; the daily check arms it again. At most one stall per day. */
+#define OTA_BOOT_HARD_LIMIT_MS (14 * 60 * 1000)
 #define MAX_OTA_ATTEMPTS 3
 #define MAX_BOOT_LOOPS   5
 
@@ -104,6 +175,9 @@ void send_update_completed() {
 #define OTA_CONFIRM_MIN_BYTE_DELTA  2048ULL      /* new bytes accepted / 10 s */
 #define OTA_CONFIRM_UNPROV_MS     (10 * 60 * 1000)
 #define OTA_CONFIRM_MIN_HEAP_B    20480
+/* Pending image that may give way to a newer release (rescue, review 13.11.
+ * L1 R3): unconfirmed for this long since its boot. */
+#define OTA_RESCUE_PENDING_US     (6LL * 3600 * 1000 * 1000)
 /* "did not crash" is a separate question from "data plane works". Long enough
  * that a deterministic late crash cannot keep resetting the counter. */
 #define OTA_BOOTLOOP_CLEAR_MS     (45 * 60 * 1000)
@@ -128,7 +202,28 @@ static bool ota_version_is_newer(const char *cand, const char *cur) {
 // when the version has failed fewer than MAX_OTA_ATTEMPTS times; false once it is
 // exhausted, so the caller boots the current FW instead of re-trying forever.
 // Fail-OPEN on any NVS error: never let a storage hiccup block a real update.
+/* A release that crash-looped this unit into the factory app is never
+ * installed again. Before, the factory app reinstalled it from the channel,
+ * it confirmed (clearing its attempt counter), crashed again five boots
+ * later, fell back, and the cycle repeated without end (review R10, O1). The
+ * mark is cleared only by a different version being offered: a fixed release
+ * always carries a new version number. */
+static bool ota_version_quarantined(const char *version) {
+    nvs_handle_t h;
+    if (nvs_open(OTA_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    char q[24] = {0};
+    size_t len = sizeof(q);
+    bool hit = nvs_get_str(h, OTA_KEY_QUARANT, q, &len) == ESP_OK && strcmp(q, version) == 0;
+    nvs_close(h);
+    return hit;
+}
+
 static bool ota_attempt_allowed(const char *version) {
+    if (ota_version_quarantined(version)) {
+        ESP_LOGE(TAG, "version %s crash-looped this unit before -> quarantined, not installing", version);
+        uart_nmea("$PESP,OTA,QUARANTINED,%s", version);
+        return false;
+    }
     nvs_handle_t h;
     if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
         ESP_LOGW(TAG, "ota nvs unavailable -> allowing attempt (fail-open)");
@@ -165,6 +260,7 @@ static bool ota_attempt_allowed(const char *version) {
 // (found 2026-08-10). Fail-OPEN like its twin: an NVS hiccup must not block a
 // real update.
 static bool ota_attempts_exhausted(const char *version) {
+    if (ota_version_quarantined(version)) return true;
     nvs_handle_t h;
     if (nvs_open(OTA_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
     char    stored[24] = {0};
@@ -177,18 +273,20 @@ static bool ota_attempts_exhausted(const char *version) {
     return cnt >= MAX_OTA_ATTEMPTS;
 }
 
+/* The version the manifest announced for the image being installed. The
+ * identity gate refuses an image whose app descriptor says otherwise: a
+ * manifest bumped without replacing the .bin installed the old image, booted
+ * it, saw the newer manifest again and reinstalled it every day until the
+ * attempt budget ran out (review 2026-11-06, O2). Empty = no check. */
+static char s_expected_version[32];
+
 esp_err_t ota_update_firmware(const char *url) {
 
     esp_err_t err = ESP_FAIL;
 
     ESP_LOGI(TAG, "Beginn update file from url: %s", url);
 
-    size_t free_heap = esp_get_free_heap_size();
-    if (free_heap < MIN_OTA_HEAP) {
-        ESP_LOGE(TAG, "free heap %u < %u needed for OTA -> deferring (no crash)",
-                 (unsigned)free_heap, (unsigned)MIN_OTA_HEAP);
-        return ESP_FAIL;
-    }
+    if (!ota_heap_ok("firmware OTA")) return ESP_FAIL;
 
     // start http client
     esp_http_client_config_t http_config = {
@@ -206,6 +304,7 @@ esp_err_t ota_update_firmware(const char *url) {
 
     }else{
 
+        int64_t dl_deadline = esp_timer_get_time() + OTA_DOWNLOAD_DEADLINE_US;
         err = esp_http_client_open(http_client, 0);
 
         if (err != ESP_OK) {
@@ -262,9 +361,16 @@ esp_err_t ota_update_firmware(const char *url) {
                         char    buffer[1024];
                         bool    downloadBreak = false;
                         bool    identity_checked = false;
-
                         //download the firmware
-                        while ((data_read = esp_http_client_read(http_client, buffer, sizeof(buffer))) > 0) {
+                        while ((data_read = ota_read_bounded(http_client, buffer, sizeof(buffer), dl_deadline)) > 0) {
+
+                            if (esp_timer_get_time() > dl_deadline) {
+                                ESP_LOGE(TAG, "firmware download exceeded %lld s -> aborted",
+                                         OTA_DOWNLOAD_DEADLINE_US / 1000000);
+                                uart_nmea("$PESP,OTA,TIMEOUT");
+                                downloadBreak = true;
+                                break;
+                            }
 
                             //write the firmware to the flash
                             err = esp_ota_write(ota_handle, (const void *)buffer, data_read);
@@ -309,6 +415,18 @@ esp_err_t ota_update_firmware(const char *url) {
                                     ESP_LOGE(TAG, "OTA image is for project '%s', this is '%s' -> refused",
                                              incoming.project_name, running->project_name);
                                     uart_nmea("$PESP,OTA,WRONGIMAGE,%s", incoming.project_name);
+                                    downloadBreak = true;
+                                    break;
+                                }
+
+                                incoming.version[sizeof(incoming.version) - 1] = '\0';
+                                if (s_expected_version[0] &&
+                                    strcmp(incoming.version, s_expected_version) != 0) {
+
+                                    ESP_LOGE(TAG, "OTA image is version '%s', the manifest announced '%s' -> refused",
+                                             incoming.version, s_expected_version);
+                                    uart_nmea("$PESP,OTA,WRONGVERSION,%s,%s", incoming.version,
+                                              s_expected_version);
                                     downloadBreak = true;
                                     break;
                                 }
@@ -394,8 +512,33 @@ esp_err_t ota_update_firmware(const char *url) {
  
 }
 
+// Set while the LIVE www partition is erased and rewritten: the boot OTA's
+// hard limit must not restart the unit in the middle of that copy, or the
+// web UI is left half written with no later repair (review R9).
+static volatile bool s_www_promoting = false;
+// Once the hard limit decided to restart, no new promotion may begin; one
+// already admitted is waited for. Both decisions under one lock (review R10).
+static volatile bool s_restart_chosen = false;
+static portMUX_TYPE s_promote_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static esp_err_t copy_file_to_www_partition_impl(void);
+
 // Function to copy the file from SPIFFS to the WWW partition
 static esp_err_t copy_file_to_www_partition(void) {
+    portENTER_CRITICAL(&s_promote_mux);
+    bool admitted = !s_restart_chosen;
+    if (admitted) s_www_promoting = true;
+    portEXIT_CRITICAL(&s_promote_mux);
+    if (!admitted) {
+        ESP_LOGW(TAG, "restart pending -> live www left untouched");
+        return ESP_FAIL;
+    }
+    esp_err_t err = copy_file_to_www_partition_impl();
+    s_www_promoting = false;
+    return err;
+}
+
+static esp_err_t copy_file_to_www_partition_impl(void) {
 
     esp_err_t   err         =   ESP_FAIL;
 
@@ -472,12 +615,7 @@ esp_err_t update_SPIFFS(const char *url) {
 
     esp_err_t err = ESP_FAIL;
 
-    size_t free_heap = esp_get_free_heap_size();
-    if (free_heap < MIN_OTA_HEAP) {
-        ESP_LOGE(TAG, "free heap %u < %u needed for SPIFFS OTA -> deferring (no crash)",
-                 (unsigned)free_heap, (unsigned)MIN_OTA_HEAP);
-        return ESP_FAIL;
-    }
+    if (!ota_heap_ok("SPIFFS OTA")) return ESP_FAIL;
 
     // start http client
     esp_http_client_config_t http_config = {
@@ -494,6 +632,7 @@ esp_err_t update_SPIFFS(const char *url) {
 
     }else{
 
+        int64_t dl_deadline = esp_timer_get_time() + OTA_DOWNLOAD_DEADLINE_US;
         err = esp_http_client_open(http_client, 0);
 
         if (err != ESP_OK) {
@@ -549,7 +688,14 @@ esp_err_t update_SPIFFS(const char *url) {
 
                             ESP_LOGI(TAG, "Partition '%s' was successfull erase.", SPIFFS_PARTITION_LABEL);
 
-                            while ((data_read = esp_http_client_read(http_client, buffer, sizeof(buffer))) > 0) {
+                            while ((data_read = ota_read_bounded(http_client, buffer, sizeof(buffer), dl_deadline)) > 0) {
+
+                                if (esp_timer_get_time() > dl_deadline) {
+                                    ESP_LOGE(TAG, "www download exceeded %lld s -> aborted",
+                                             OTA_DOWNLOAD_DEADLINE_US / 1000000);
+                                    data_read = -1;
+                                    break;
+                                }
 
                                 err = esp_partition_write(partition, offset, buffer, data_read);
 
@@ -710,9 +856,24 @@ void calculate_total_file_size(cJSON *files_json) {
 // (The old version called esp_restart() unconditionally -> a failed download
 // rebooted -> re-attempted the same download -> crash loop. Now: reboot only on
 // success, so a failed install just falls through to the current, working FW.)
-esp_err_t updateFirmware(cJSON *files_json) {
+esp_err_t updateFirmware(cJSON *files_json, const char *expected_version) {
 
     ESP_LOGI(TAG, "Starting RTKdata OTA update...");
+
+    // Every file must come over TLS: the certificate bundle authenticates the
+    // server, plain HTTP would let anyone on the path supply the image
+    // (review 2026-11-06, O6). Checked for ALL files before the first byte is
+    // written, so a mixed manifest cannot install half an update.
+    cJSON *u;
+    cJSON_ArrayForEach(u, files_json) {
+        if (!cJSON_IsString(u) || strncmp(u->valuestring, "https://", 8) != 0) {
+            ESP_LOGE(TAG, "manifest file URL is not HTTPS -> update refused");
+            uart_nmea("$PESP,OTA,NOTHTTPS");
+            return ESP_FAIL;
+        }
+    }
+    strlcpy(s_expected_version, expected_version ? expected_version : "",
+            sizeof(s_expected_version));
 
     send_update_started();
 
@@ -894,16 +1055,20 @@ void ota_boot_check(void) {
             // Wi-Fi control task to close the AP now; it declines while a client
             // is mid-onboarding, which is the correct trade and just means we
             // defer once more.
-            if (esp_get_free_heap_size() < MIN_OTA_HEAP) {
-                ESP_LOGW(TAG, "free heap %u < %u -> closing the config AP to make room",
-                         (unsigned)esp_get_free_heap_size(), (unsigned)MIN_OTA_HEAP);
+            // The same predicate as the admission below (total AND internal):
+            // with PSRAM the total alone always passed, the AP stayed up and
+            // the internal check then deferred on every boot (review R7).
+            if (!ota_heap_sufficient()) {
+                ESP_LOGW(TAG, "free heap %u (internal %u) too low -> closing the config AP to make room",
+                         (unsigned)esp_get_free_heap_size(),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
                 wifi_ap_stop_now();
 
                 // POLL, do not sleep a fixed span: the teardown is asynchronous
                 // (control task -> esp_wifi_set_mode -> DHCP/DNS teardown) and a
                 // guessed delay is either too short (fix silently useless) or
                 // wasted boot time on every device that is already fine.
-                for (int i = 0; i < 30 && esp_get_free_heap_size() < MIN_OTA_HEAP; i++) {
+                for (int i = 0; i < 30 && !ota_heap_sufficient(); i++) {
                     vTaskDelay(pdMS_TO_TICKS(100));
                 }
 
@@ -929,7 +1094,8 @@ void ota_boot_check(void) {
             // not an attempt; retry on the next boot instead.
             {
                 size_t heap_now = esp_get_free_heap_size();
-                if (heap_now < MIN_OTA_HEAP) {
+                size_t internal_now = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                if (heap_now < MIN_OTA_HEAP || internal_now < MIN_OTA_INTERNAL_HEAP) {
                     ESP_LOGW(TAG, "deferring %s: free heap %u < %u, no attempt booked, retry next boot",
                              new_version, (unsigned)heap_now, (unsigned)MIN_OTA_HEAP);
                     uart_nmea("$PESP,OTA,DEFER,%s,%u", new_version, (unsigned)heap_now);
@@ -945,7 +1111,7 @@ void ota_boot_check(void) {
                 return;
             }
             ESP_LOGI(TAG, "newer version %s > %s -> installing at boot (full heap)", new_version, FW_VERSION);
-            esp_err_t up = updateFirmware(files_json);   // reboots on success; returns on failure
+            esp_err_t up = updateFirmware(files_json, new_version);   // reboots on success; returns on failure
             ESP_LOGE(TAG, "boot OTA install did not succeed (%s) -> continuing on current FW %s",
                      esp_err_to_name(up), FW_VERSION);
         } else {
@@ -975,7 +1141,48 @@ static void ota_boot_check_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+static bool ota_skip_boot_flag(bool clear) {
+    nvs_handle_t h;
+    uint8_t v = 0;
+    if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    nvs_get_u8(h, OTA_KEY_SKIPBOOT, &v);
+    if (v && clear) {
+        nvs_erase_key(h, OTA_KEY_SKIPBOOT);
+        nvs_commit(h);
+    }
+    nvs_close(h);
+    return v != 0;
+}
+
+static void ota_set_skip_boot(void) {
+    nvs_handle_t h;
+    if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, OTA_KEY_SKIPBOOT, 1);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 void ota_boot_check_blocking(void) {
+    // A freshly installed image that is still PENDING_VERIFY must reach its
+    // health confirmation first. Running the boot OTA on it and hitting the
+    // hard limit restarts the unit before confirmation, and the bootloader
+    // then rolls a healthy image back because the OTA server was slow
+    // (review R9). It has just installed the newest version anyway.
+    {
+        const esp_partition_t *run = esp_ota_get_running_partition();
+        esp_ota_img_states_t st;
+        if (run && esp_ota_get_state_partition(run, &st) == ESP_OK &&
+            st == ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGI(TAG, "running image is pending verification -> boot OTA check skipped");
+            return;
+        }
+    }
+    if (ota_skip_boot_flag(true)) {
+        ESP_LOGW(TAG, "previous boot OTA hit its %d min limit -> skipping it once",
+                 OTA_BOOT_HARD_LIMIT_MS / 60000);
+        uart_nmea("$PESP,OTA,BOOTSKIP");
+        return;
+    }
     s_ota_boot_done = xSemaphoreCreateBinary();
     if (!s_ota_boot_done) {
         ESP_LOGE(TAG, "no mem for OTA sync -> skipping boot OTA (device stays usable)");
@@ -987,7 +1194,27 @@ void ota_boot_check_blocking(void) {
         s_ota_boot_done = NULL;
         return;
     }
-    xSemaphoreTake(s_ota_boot_done, portMAX_DELAY);   // the task reboots if it installs
+    // the task reboots if it installs
+    bool done = xSemaphoreTake(s_ota_boot_done, pdMS_TO_TICKS(OTA_BOOT_HARD_LIMIT_MS)) == pdTRUE;
+    if (!done) {
+        // Decide to restart and close the door to a new promotion in one
+        // step; a copy already running is let finish.
+        portENTER_CRITICAL(&s_promote_mux);
+        s_restart_chosen = true;
+        portEXIT_CRITICAL(&s_promote_mux);
+        while (!done && s_www_promoting) {
+            done = xSemaphoreTake(s_ota_boot_done, pdMS_TO_TICKS(1000)) == pdTRUE;
+        }
+    }
+    if (!done) {
+        ESP_LOGE(TAG, "boot OTA exceeded %d min -> restart, next boot skips it",
+                 OTA_BOOT_HARD_LIMIT_MS / 60000);
+        uart_nmea("$PESP,OTA,BOOTLIMIT");
+        ota_set_skip_boot();
+        ota_note_planned_reboot();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+    }
     vSemaphoreDelete(s_ota_boot_done);
     s_ota_boot_done = NULL;
 }
@@ -1041,9 +1268,13 @@ void ota_boot_loop_guard(void) {
     bool just_installed = run && esp_ota_get_state_partition(run, &rst) == ESP_OK &&
                           rst == ESP_OTA_IMG_PENDING_VERIFY;
 
+    // A brownout is the supply, not the image: a weak PoE injector or a long
+    // cable can brown out any firmware, factory included, and counting it
+    // made five sags in 45 minutes quarantine a healthy release for good
+    // (review 13.11. L1, R7). Not counted, the streak is left as it is.
     bool crash_like = (rr == ESP_RST_PANIC) || (rr == ESP_RST_INT_WDT) ||
                       (rr == ESP_RST_TASK_WDT) || (rr == ESP_RST_WDT) ||
-                      (rr == ESP_RST_BROWNOUT) || (rr == ESP_RST_UNKNOWN) ||
+                      (rr == ESP_RST_UNKNOWN) ||
                       (rr == ESP_RST_SW && !planned && !just_installed);
 
     uint8_t boots = 0;
@@ -1095,6 +1326,9 @@ void ota_boot_loop_guard(void) {
 
     if (nvs_open(OTA_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {   // clean slate for factory
         nvs_set_u8(h, OTA_KEY_BOOTLOOP, 0);
+        // This running image is the one that keeps crashing (the guard
+        // returns early on the factory app): never reinstall this version.
+        nvs_set_str(h, OTA_KEY_QUARANT, FW_VERSION);
         nvs_commit(h);
         nvs_close(h);
     }
@@ -1159,7 +1393,10 @@ void ota_mark_valid_task(void *pvParameter) {
         // Explicit exception: no uploader configured (bench/spare unit). It can
         // never satisfy the caster leg; after a long stable-uptime window with
         // sane heap it confirms so it does not oscillate between images.
-        if (t.instances == 0 && elapsed_ms >= OTA_CONFIRM_UNPROV_MS &&
+        // "No uploader" must mean none CONFIGURED: zero RUNNING with one
+        // configured is a fault (tasks failed to start), and confirming then
+        // kept a broken image (review 2026-11-06, N3).
+        if (t.configured == 0 && t.instances == 0 && elapsed_ms >= OTA_CONFIRM_UNPROV_MS &&
             esp_get_free_heap_size() > OTA_CONFIRM_MIN_HEAP_B) {
             healthy = true;
             path = "unprovisioned";
@@ -1191,6 +1428,16 @@ void ota_mark_valid_task(void *pvParameter) {
              * because that deliberate hold looks like missing RTCM. This is
              * only a wait exception, never an OTA confirmation. */
             bool verified_site_hold = !site.upload_allowed && site.valid;
+#ifdef CONFIG_RTK_SITE_LEGACY
+            /* A survey started by the relocation guard (or any MODE in its
+             * warmup) has no RTCM for about five minutes by design, while
+             * the receiver reports valid positions. Not a broken image
+             * (review 13.11. L3 #4). Only an ACKNOWLEDGED mode, and only for
+             * GNSS_SITE_SETTLE_MAX_MS after it: an UNKNOWN mode (failed
+             * MODE, the case rollback exists for) never qualifies (L4 #1). */
+            verified_site_hold = verified_site_hold ||
+                (site.valid && gnss_site_mode_settling());
+#endif
             bool local_fault = !fresh_final.all_fresh && !verified_site_hold;
 
             if (!local_fault) {
@@ -1299,60 +1546,6 @@ void ota_bootloop_clear_task(void *pvParameter) {
     vTaskDelete(NULL);
 }
 
-void ota_check_newupdate(void *pvParameter) {
-
-    while (true) {
-
-        if(checkUpdates){
-
-            ESP_LOGI(TAG, "chek for new updates");
-
-            // read version and update files url from json
-            cJSON *jsonFile = ota_fetch_json_from_url();
-
-            if(jsonFile){
-
-                cJSON *version_json     = cJSON_GetObjectItem(jsonFile, "version");
-                cJSON *files_json       = cJSON_GetObjectItem(jsonFile, "update_files_urls");
-
-                if (cJSON_IsString(version_json) && cJSON_IsArray(files_json)) {
-
-                    const char *new_version = version_json->valuestring;
-
-                    // compare the versions
-                    if (strcmp(new_version, FW_VERSION) == 0) {
-
-                        ESP_LOGI(TAG, "No new update available. Current version: %s", FW_VERSION);
-
-                    } else {
-
-                        ESP_LOGI(TAG, "New version available. Starting OTA update from current Version: %s to new: %s", FW_VERSION, new_version);
-
-                        //start the update
-                        updateFirmware(files_json);
-
-                    }
-
-                } else {
-
-                    ESP_LOGE(TAG, "Invalid JSON format: Missing 'version' or 'update_url'");
-                }
-
-                cJSON_Delete(jsonFile);
-
-            }else{
-                
-                ESP_LOGE(TAG, "No JSON file received from server");
-            }
-
-            checkUpdates = false;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
-}
-
 // Daily OTA poll. Does a LIGHTWEIGHT manifest fetch only (one small ~1 KB HTTPS
 // GET, which runs fine even with the data plane up); it reboots ONLY when a
 // strictly newer version is actually published, so the heavy download then runs
@@ -1389,10 +1582,42 @@ void ota_schedule_check_newupdate(void *pvParameter){
                                  v->valuestring);
                         newer = false;
                     }
+                    // A restart now would make the bootloader roll this still
+                    // unconfirmed image back, healthy or not (review R10).
+                    // Unless it has stayed unconfirmed for OTA_RESCUE_PENDING_US:
+                    // GNSS healthy but no upload keeps an image pending for
+                    // ever, and refusing every newer release then also refused
+                    // the fix for that very upload (review 13.11. L1, R3).
+                    // Back to the previous image, which installs the newer
+                    // release with its own boot check.
+                    bool rescue = false;
+                    if (newer) {
+                        const esp_partition_t *run = esp_ota_get_running_partition();
+                        esp_ota_img_states_t st;
+                        if (run && esp_ota_get_state_partition(run, &st) == ESP_OK &&
+                            st == ESP_OTA_IMG_PENDING_VERIFY) {
+                            if (esp_timer_get_time() >= OTA_RESCUE_PENDING_US) {
+                                ESP_LOGW(TAG, "newer version %s available, this image unconfirmed for %u h -> "
+                                         "back to the previous image, which installs it",
+                                         v->valuestring, (unsigned)(esp_timer_get_time() / 3600000000LL));
+                                uart_nmea("$PESP,OTA,RESCUE,%s", v->valuestring);
+                                rescue = true;
+                            } else {
+                                ESP_LOGW(TAG, "newer version %s available, but this image is not confirmed yet -> not rebooting today",
+                                         v->valuestring);
+                            }
+                            newer = false;
+                        }
+                    }
                     if (newer) {
                         ESP_LOGI(TAG, "newer version %s available -> restart to install at boot (full heap)", v->valuestring);
                     }
                     cJSON_Delete(jsonFile);
+                    if (rescue) {
+                        vTaskDelay(pdMS_TO_TICKS(300));   // let the NMEA flush
+                        esp_err_t rb = esp_ota_mark_app_invalid_rollback_and_reboot();
+                        ESP_LOGE(TAG, "rescue rollback did not happen: %s", esp_err_to_name(rb));
+                    }
                     if (newer) {
                         ota_note_planned_reboot();
                         vTaskDelay(pdMS_TO_TICKS(300));

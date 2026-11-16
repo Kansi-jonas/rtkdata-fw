@@ -18,7 +18,6 @@ void ota_bootloop_clear_task(void *pvParameter);
 // not count it as a crash. A FAULT-driven restart (supervisor recovery) must
 // NOT call this: those are exactly the loops the guard has to catch.
 void ota_note_planned_reboot(void);  // health-confirm task (cancels rollback)
-void ota_check_newupdate(void *pvParameter);
 void ota_schedule_check_newupdate(void *pvParameter);
 
 

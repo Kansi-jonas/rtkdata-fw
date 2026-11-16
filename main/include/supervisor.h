@@ -49,6 +49,11 @@ void supervisor_set_recovery(supervisor_recovery_fn gnss_reset,
                              supervisor_recovery_fn caster_reconnect,
                              supervisor_recovery_fn wifi_restart);
 
+// Optional: re-enable required RTCM messages that stayed stale while the
+// stream is expected (gnss_repair_required_logs). Without it the supervisor
+// only reports the gap.
+void supervisor_set_log_repair(supervisor_recovery_fn repair_logs);
+
 // Snapshot for the provisioning heartbeat / local status endpoint.
 void supervisor_health(supervisor_health_t *out);
 

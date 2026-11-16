@@ -60,6 +60,10 @@ void wifi_ap_status(wifi_ap_status_t *status);
 
 void wifi_sta_status(wifi_sta_status_t *status);
 
+// A STA SSID is configured (read once at wifi_init; a new SSID takes effect
+// after the restart that saving the config triggers).
+bool wifi_sta_configured(void);
+
 bool wait_for_ip(uint32_t timeout_ms);   // bounded; true if STA or Ethernet has an IP, false on timeout (0 = forever)
 
 // Ethernet board (eth.c): report the Ethernet IPv4 up/down so wait_for_ip()
